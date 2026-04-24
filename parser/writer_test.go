@@ -501,6 +501,13 @@ func TestWriterSequencePreserveLengthPolicyMultipleItemsKeepsDefinedLengths(t *t
 func TestWriterSequencePreserveLengthPolicyNormalizesUndefinedItemsInDefinedSequence(t *testing.T) {
 	t.Parallel()
 
+	// Verifies that a defined-length sequence with undefined-length items is
+	// normalized correctly during write. The Go model preserves the outer
+	// sequence as defined-length, but item header
+	// lengths are normalized because core.SequenceValue does not retain item
+	// length metadata after parsing. This fixture uses a consistent explicit
+	// sequence length for the same structural pattern so the scaffold parser can
+	// materialize it before the writer round-trip.
 	source := bytes.Join([][]byte{
 		dicomtest.SequenceHeaderBytes(transfer.ExplicitVRLittleEndian, core.NewTag(0x0018, 0x6011), 62),
 		dicomtest.SequenceControlBytes(binary.LittleEndian, core.TagItem, uint32(core.UndefinedLength)),

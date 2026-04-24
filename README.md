@@ -1,71 +1,232 @@
 # dicom-go
 
-A Go DICOM toolkit.
+A pure Go implementation of the DICOM medical imaging standard.
 
-This repository is intentionally small at this stage. It establishes package boundaries, public interfaces, and a minimal Part 10 reader path for uncompressed transfer syntaxes. It is not yet a complete DICOM implementation.
+`dicom-go` uses idiomatic Go packages, concrete value types and explicit
+registries. The `v0.1.0` release provides a practical subset
+for reading and writing Part 10 files, converting datasets to/from DICOM JSON,
+extracting pixel data, and running minimal C-ECHO/C-STORE workflows.
 
-## Package layout
+This project does not claim full DICOM conformance. See
+[docs/CONFORMANCE.md](./docs/CONFORMANCE.md) for the exact `v0.1.0` capability
+scope and limitations.
 
-- `core`: DICOM base types: tag, VR, length, element, value.
-- `dictionary`: dictionary interfaces and entries.
-- `dictionary/std`: generated standard dictionary built from the versioned `internal/standard/dicom.dic` source.
-- `encoding`: endian-aware primitive readers/writers.
-- `transfer`: transfer syntax registry and built-in syntaxes.
-- `parser`: token/data set reader layer.
-- `object`: high-level DICOM object and Part 10 file reader.
-- `pixeldata`: pixel data extraction/codec extension point.
-- `dicomjson`: DICOM JSON extension point.
-- `net/ul`: DICOM Upper Layer networking extension point.
-- `cmd/dcmdump`: first CLI built on the library.
+## Installation
 
-See `docs/ARCHITECTURE.md` for the full design.
+Requirements:
 
-## Defensive parsing
+- Go 1.22 or newer.
 
-The parser and file reader expose optional defensive limits for untrusted
-input:
+Install in a Go module:
 
-- `parser.ReaderOptions.MaxSequenceDepth`
-- `parser.ReaderOptions.MaxElements`
-- `parser.ReaderOptions.MaxFragments`
-- `parser.ReaderOptions.MaxElementBytes`
-- `parser.ReaderOptions.MaxTotalBytes`
-- `object.ReadFileOptions` exposes the same limits for Part 10 file reading
-
-All limit fields default to `0`, which means unlimited.
-
-Recommended starting points for untrusted input:
-
-- `MaxSequenceDepth: 32`
-- `MaxElements: 100000`
-- `MaxFragments: 10000`
-- `MaxElementBytes: 16 << 20`
-- `MaxTotalBytes: 128 << 20`
-
-Example:
-
-```go
-file, err := object.ReadFileWithOptions(r, object.ReadFileOptions{
-	MaxSequenceDepth: 32,
-	MaxElements:      100000,
-	MaxFragments:     10000,
-	MaxElementBytes:  16 << 20,
-	MaxTotalBytes:    128 << 20,
-})
+```sh
+go get github.com/ThalesMMS/dicom-go
 ```
 
-Use stricter limits for highly constrained services, and larger limits for
-trusted bulk-processing workloads.
+## Quick Start
 
-## Getting Started
+Open a Part 10 file and read Patient Name:
 
-Pré-requisito:
+```go
+package main
 
-- Go 1.22 ou superior instalado.
+import (
+	"fmt"
+
+	"github.com/ThalesMMS/dicom-go"
+	"github.com/ThalesMMS/dicom-go/core"
+)
+
+func main() {
+	file, err := dicom.OpenFile("image.dcm")
+	if err != nil {
+		panic(err)
+	}
+
+	name, ok := file.GetString(core.NewTag(0x0010, 0x0010))
+	if ok {
+		fmt.Println(name)
+	}
+}
+```
+
+Runnable example:
+
+```sh
+go run ./examples/readfile -- image.dcm
+```
+
+## Usage
+
+### File Reading
+
+Use the root `dicom` package for common read paths, or use `object` directly
+when you need lower-level options:
+
+Option 1, default Part 10 reader:
+
+```go
+file, err := dicom.OpenFile("image.dcm")
+if err != nil {
+	panic(err)
+}
+```
+
+Option 2, Part 10 reader with defensive limits:
+
+```go
+limitedFile, err := object.OpenFileWithOptions("image.dcm", object.ReadFileOptions{
+	MaxElementBytes: 16 << 20,
+	MaxTotalBytes:   128 << 20,
+})
+if err != nil {
+	panic(err)
+}
+_ = limitedFile
+```
+
+Example: [`examples/readfile`](./examples/readfile).
+
+### File Writing
+
+Writing is provided by the `object` package. Build or modify an `object.File`,
+then write it with `object.WriteFile`:
+
+```go
+out, err := os.Create("out.dcm")
+if err != nil {
+	panic(err)
+}
+defer out.Close()
+
+if err := object.WriteFile(out, file); err != nil {
+	panic(err)
+}
+```
+
+Example: [`examples/writefile`](./examples/writefile).
+
+### JSON Conversion
+
+Use `dicomjson` for DICOM JSON model conversion:
+
+```go
+data, err := dicomjson.MarshalPretty(file.Dataset)
+if err != nil {
+	panic(err)
+}
+obj, err := dicomjson.Unmarshal(data, std.Dictionary)
+if err != nil {
+	panic(err)
+}
+_ = obj
+```
+
+`dicomjson.Options.BulkDataURIFunc` can replace large binary values with
+`BulkDataURI`. Unmarshal preserves `BulkDataURI` references but does not fetch
+external bulk data.
+
+Example: [`examples/json`](./examples/json).
+
+### Pixel Data
+
+Native uncompressed frame extraction:
+
+```go
+frames, err := pixeldata.ExtractNativeFrames(file.Dataset)
+```
+
+RLE Lossless decoding is available as an optional codec and must be registered:
+
+```go
+if err := rle.RegisterDefault(); err != nil {
+	panic(err)
+}
+pixels, err := pixeldata.Extract(file.Dataset)
+if err != nil {
+	panic(err)
+}
+frames, err := pixeldata.DecodeFrames(file.TransferSyntax.UID, pixels, file.Dataset)
+if err != nil {
+	panic(err)
+}
+_ = frames
+```
+
+Example: [`examples/pixeldata`](./examples/pixeldata).
+
+### CLI Tools
+
+Inspect files:
+
+```sh
+go run ./cmd/dcmdump -- image.dcm
+go run ./cmd/dcmdump -- -json image.dcm
+```
+
+Verification:
+
+```sh
+go run ./cmd/echoscp -- -port 11112 -single
+go run ./cmd/echoscu -- -host 127.0.0.1 -port 11112
+```
+
+Storage:
+
+```sh
+go run ./cmd/storescp -- -address 127.0.0.1:11112 -output ./received
+go run ./cmd/storescu -- 127.0.0.1:11112 image.dcm
+```
+
+Network examples: [`examples/echo`](./examples/echo) and
+[`examples/store`](./examples/store).
+
+## Features
+
+- DICOM Part 10 read/write.
+- Native transfer syntaxes: Implicit VR Little Endian, Explicit VR Little
+  Endian, Explicit VR Big Endian.
+- Encapsulated Pixel Data preservation for supported fragment-only workflows.
+- DICOM JSON marshal/unmarshal.
+- Native pixel data extraction.
+- Optional RLE Lossless pixel codec.
+- DICOM UL association negotiation over plain TCP.
+- Minimal DIMSE C-ECHO and C-STORE.
+- CLI tools for dump, echo, store and UID generation.
+
+## Limitations
+
+`v0.1.0` is intentionally limited. Compressed JPEG/JPEG-LS/JPEG 2000/MPEG/HEVC
+pixel codecs, deflated transfer syntaxes, TLS, Query/Retrieve and formal SOP
+Class conformance validation are not implemented.
+
+Read [docs/CONFORMANCE.md](./docs/CONFORMANCE.md) before using this module with
+untrusted files, large studies or production network peers.
+
+## Package Layout
+
+| Package | Status in v0.1.0 |
+|---|---|
+| `dicom` | Read-focused convenience facade for common `object` APIs. |
+| `core` | Tags, VRs, lengths, elements, primitive values, sequences and fragments. |
+| `dictionary` | Dictionary interfaces and entries. |
+| `dictionary/std` | Generated standard tag dictionary. |
+| `dictionary/uid` | Generated standard UID registry. |
+| `encoding` | Endian-aware primitive and text helpers. |
+| `transfer` | Transfer syntax registry and built-in syntax definitions. |
+| `parser` | Dataset token reader/writer. |
+| `object` | High-level object model and Part 10 file read/write APIs. |
+| `dicomjson` | DICOM JSON marshal/unmarshal helpers. |
+| `pixeldata` | Pixel metadata, native frame extraction and codec registry. |
+| `pixeldata/rle` | Optional pure Go RLE Lossless decoder. |
+| `net/ul` | DICOM Upper Layer PDU codec and association negotiation. |
+| `net/dimse` | Minimal C-ECHO and C-STORE command/data helpers. |
+| `cmd/*` | Runnable command line tools. |
+| `examples/*` | Runnable examples by feature area. |
 
 ## Development
 
-Use Go 1.22 e os comandos padronizados do repositório:
+Use the repository Makefile:
 
 ```sh
 make fmt
@@ -75,66 +236,10 @@ make build
 make check
 ```
 
-`make check` é o fluxo principal antes de abrir um PR. Ele executa formatação, `go vet` e `go test ./...` em sequência.
+`make check` runs formatting, `go vet`, `go test ./...` and `go build ./...`.
 
-Para buildar todos os pacotes:
-
-```sh
-make build
-```
-
-ou
-
-```sh
-go build ./...
-```
-
-Para executar a suíte de testes:
-
-```sh
-make test
-```
-
-ou
-
-```sh
-go test ./...
-```
-
-Para regenerar o dicionário padrão:
+Regenerate the standard dictionary:
 
 ```sh
 go generate ./dictionary/std
-```
-
-Para rodar a baseline completa de qualidade:
-
-```sh
-make check
-```
-
-## Executando o `dcmdump`
-
-Para inspecionar um arquivo Part 10 com o CLI atual:
-
-```sh
-go run ./cmd/dcmdump <file.dcm>
-```
-
-Saída esperada, no estágio atual do scaffold:
-
-- Transfer Syntax UID e nome.
-- Elementos do File Meta.
-- Elementos do dataset em ordem de tag.
-
-O comando também pode ser compilado com:
-
-```sh
-go build ./cmd/dcmdump
-```
-
-Para instalar o binário localmente:
-
-```sh
-go install ./cmd/dcmdump
 ```

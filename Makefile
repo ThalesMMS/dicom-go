@@ -20,4 +20,4 @@ test:
 build:
 	go build ./...
 
-check: fmt vet test
+check: fmt vet test build

@@ -3,6 +3,10 @@
 // Source file: internal/standard/dicom.dic
 // Source URL: https://raw.githubusercontent.com/DCMTK/dcmtk/master/dcmdata/data/dicom.dic
 // Generated at: 2026-03-28T10:26:30Z
+// Design notes:
+// - repeating tag ranges are expanded to concrete tags (exact-tag lookup only)
+// - context-dependent VRs are relaxed as xs->US, ox/lt/px->OW, up->UL
+// - Entry.Name is derived from the DICOM keyword because dicom.dic does not provide the long display name
 
 package std
 

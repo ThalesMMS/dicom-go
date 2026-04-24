@@ -10,6 +10,12 @@ Source:
 - Vendored on: April 22, 2026
 - File header at vendoring time: generated from `DICOM PS 3.6-2026b` and `PS 3.7-2026b` on `2026-03-28`
 
+UID source:
+
+- Table: `DICOM PS 3.6` table `A-1`
+- Vendored file: `internal/standard/uids.tsv`
+- Derived from DICOM PS 3.6 table A-1 on April 23, 2026
+
 Why this file is committed:
 
 - dictionary generation stays reproducible without network access
@@ -26,3 +32,11 @@ Update procedure:
 5. Run `go generate ./dictionary/uid`.
 6. Re-run `go generate ./dictionary/std` and `go generate ./dictionary/uid`, then confirm the outputs are byte-identical.
 7. Run `go test ./...`.
+
+Design choices in the Go generator:
+
+- Repeating tag ranges are expanded to concrete tags because `dicom-go` currently exposes exact-tag lookup only.
+- Context-dependent VRs are relaxed to exact Go VRs: `xs -> US`, `ox -> OW`, `px -> OW`, `lt -> OW`, `up -> UL`.
+- Human-readable `Entry.Name` values are derived from the DICOM keyword because `dicom.dic` does not carry the long display name field used by `dicom-go`.
+- The UID source is committed as TSV instead of fetching the PS3.6 DocBook XML during generation.
+- Keyword lookup in the Go UID registry is case-insensitive to match the existing `dictionary` package contract.

@@ -6,15 +6,22 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/ThalesMMS/dicom-go/core"
 	"github.com/ThalesMMS/dicom-go/object"
+	"github.com/ThalesMMS/dicom-go/transfer"
 )
 
 var (
 	ErrPixelDataNotFound         = errors.New("dicom: pixel data element not found")
 	ErrMissingMetadata           = errors.New("dicom: missing required pixel data metadata")
 	ErrInvalidMetadata           = errors.New("dicom: invalid pixel data metadata")
+	ErrCodecNotFound             = errors.New("dicom: no pixel data codec registered for transfer syntax")
+	ErrCodecRegistryNil          = errors.New("dicom: pixel data codec registry is nil")
+	ErrCodecNil                  = errors.New("dicom: pixel data codec is nil")
+	ErrCodecUIDInvalid           = errors.New("dicom: pixel data codec transfer syntax UID is empty")
+	ErrIncompatiblePixelData     = errors.New("dicom: pixel data is incompatible with transfer syntax")
 	ErrEncapsulatedPixelData     = errors.New("dicom: native frame extraction does not support encapsulated pixel data")
 	ErrPixelDataSizeMismatch     = errors.New("dicom: pixel data size does not match metadata")
 	tagRows                      = core.NewTag(0x0028, 0x0010)
@@ -62,6 +69,17 @@ type Codec interface {
 	Decode(pixel PixelData, obj *object.Object) (Frames, error)
 }
 
+type Registry interface {
+	RegisterCodec(uid string, codec Codec) error
+	GetCodec(uid string) (Codec, bool)
+	DecodeFrames(uid string, pixel PixelData, obj *object.Object) (Frames, error)
+}
+
+type MemoryRegistry struct {
+	mu    sync.RWMutex
+	byUID map[string]Codec
+}
+
 type Frames struct {
 	Rows    int
 	Columns int
@@ -74,6 +92,94 @@ type Frames struct {
 type NativeFrames struct {
 	Metadata Metadata
 	Data     [][]byte
+}
+
+var DefaultRegistry Registry = NewMemoryRegistry()
+
+func NewMemoryRegistry() *MemoryRegistry {
+	return &MemoryRegistry{byUID: make(map[string]Codec)}
+}
+
+func (r *MemoryRegistry) RegisterCodec(uid string, codec Codec) error {
+	if r == nil {
+		return ErrCodecRegistryNil
+	}
+	if codec == nil {
+		return ErrCodecNil
+	}
+
+	normalizedUID := transfer.NormalizeUID(uid)
+	if normalizedUID == "" {
+		return ErrCodecUIDInvalid
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.byUID == nil {
+		r.byUID = make(map[string]Codec)
+	}
+	r.byUID[normalizedUID] = codec
+	return nil
+}
+
+func (r *MemoryRegistry) GetCodec(uid string) (Codec, bool) {
+	if r == nil {
+		return nil, false
+	}
+
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	codec, ok := r.byUID[transfer.NormalizeUID(uid)]
+	return codec, ok
+}
+
+func (r *MemoryRegistry) DecodeFrames(uid string, pixel PixelData, obj *object.Object) (Frames, error) {
+	normalizedUID := transfer.NormalizeUID(uid)
+	if syntax, ok := transfer.DefaultRegistry.Get(normalizedUID); ok {
+		switch {
+		case syntax.Encapsulated && !pixel.Encapsulated:
+			return Frames{}, fmt.Errorf("%w: transfer syntax %q expects encapsulated pixel data", ErrIncompatiblePixelData, syntax.UID)
+		case !syntax.Encapsulated && pixel.Encapsulated:
+			return Frames{}, fmt.Errorf("%w: transfer syntax %q expects native pixel data", ErrIncompatiblePixelData, syntax.UID)
+		}
+	}
+
+	if !pixel.Encapsulated {
+		return decodeNativeFrames(pixel, obj)
+	}
+	if r == nil {
+		return Frames{}, fmt.Errorf("%w: transfer syntax %q", ErrCodecRegistryNil, normalizedUID)
+	}
+
+	codec, ok := r.GetCodec(normalizedUID)
+	if !ok {
+		return Frames{}, fmt.Errorf("%w: transfer syntax %q", ErrCodecNotFound, normalizedUID)
+	}
+	return codec.Decode(pixel, obj)
+}
+
+func RegisterCodec(uid string, codec Codec) error {
+	if DefaultRegistry == nil {
+		return ErrCodecRegistryNil
+	}
+	return DefaultRegistry.RegisterCodec(uid, codec)
+}
+
+func GetCodec(uid string) (Codec, bool, error) {
+	if DefaultRegistry == nil {
+		return nil, false, ErrCodecRegistryNil
+	}
+	codec, ok := DefaultRegistry.GetCodec(uid)
+	return codec, ok, nil
+}
+
+func DecodeFrames(uid string, pixel PixelData, obj *object.Object) (Frames, error) {
+	if DefaultRegistry == nil {
+		return Frames{}, ErrCodecRegistryNil
+	}
+	return DefaultRegistry.DecodeFrames(uid, pixel, obj)
 }
 
 func Extract(obj *object.Object) (PixelData, error) {
@@ -159,24 +265,58 @@ func ExtractMetadata(obj *object.Object) (Metadata, error) {
 // additional per-frame copies. Each frame slice references the cloned pixel
 // buffer produced by Extract.
 func ExtractNativeFrames(obj *object.Object) (*NativeFrames, error) {
-	metadata, err := ExtractMetadata(obj)
-	if err != nil {
-		return nil, err
-	}
-
 	pixel, err := Extract(obj)
 	if err != nil {
 		return nil, err
 	}
+	native, err := extractNativeFrames(pixel, obj)
+	if err != nil {
+		return nil, err
+	}
+
+	return &NativeFrames{
+		Metadata: native.Metadata,
+		Data:     native.Data,
+	}, nil
+}
+
+func extractNativeFrames(pixel PixelData, obj *object.Object) (*NativeFrames, error) {
+	metadata, frames, err := splitNativeFrames(pixel, obj)
+	if err != nil {
+		return nil, err
+	}
+	return &NativeFrames{
+		Metadata: metadata,
+		Data:     frames,
+	}, nil
+}
+
+func decodeNativeFrames(pixel PixelData, obj *object.Object) (Frames, error) {
+	metadata, frames, err := splitNativeFrames(pixel, obj)
+	if err != nil {
+		return Frames{}, err
+	}
+	return Frames{
+		Rows:    int(metadata.Rows),
+		Columns: int(metadata.Columns),
+		Data:    frames,
+	}, nil
+}
+
+func splitNativeFrames(pixel PixelData, obj *object.Object) (Metadata, [][]byte, error) {
+	metadata, err := ExtractMetadata(obj)
+	if err != nil {
+		return Metadata{}, nil, err
+	}
 	if pixel.Encapsulated {
-		return nil, ErrEncapsulatedPixelData
+		return Metadata{}, nil, ErrEncapsulatedPixelData
 	}
 
 	frameSize := metadata.FrameSize()
 	totalSize := metadata.TotalSize()
 	maxInt := int64(^uint(0) >> 1)
 	if frameSize <= 0 || totalSize <= 0 || frameSize > maxInt || totalSize > maxInt {
-		return nil, fmt.Errorf(
+		return Metadata{}, nil, fmt.Errorf(
 			"%w: rows=%d columns=%d samples_per_pixel=%d bits_allocated=%d number_of_frames=%d",
 			ErrInvalidMetadata,
 			metadata.Rows,
@@ -191,7 +331,7 @@ func ExtractNativeFrames(obj *object.Object) (*NativeFrames, error) {
 	totalSizeInt := int(totalSize)
 
 	if len(pixel.Raw) != totalSizeInt {
-		return nil, fmt.Errorf(
+		return Metadata{}, nil, fmt.Errorf(
 			"%w: expected %d bytes for %d frame(s), got %d",
 			ErrPixelDataSizeMismatch,
 			totalSizeInt,
@@ -206,10 +346,7 @@ func ExtractNativeFrames(obj *object.Object) (*NativeFrames, error) {
 		frames[i] = pixel.Raw[start : start+frameSizeInt]
 	}
 
-	return &NativeFrames{
-		Metadata: metadata,
-		Data:     frames,
-	}, nil
+	return metadata, frames, nil
 }
 
 func getUint16(obj *object.Object, tag core.Tag) (uint16, bool) {

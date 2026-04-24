@@ -29,6 +29,10 @@ var outputTemplate = template.Must(template.New("std").Parse(`// Code generated 
 // Source file: {{.SourcePath}}
 // Source URL: {{.SourceURL}}
 // Generated at: {{.GeneratedAt}}
+// Design notes:
+// - repeating tag ranges are expanded to concrete tags (exact-tag lookup only)
+// - context-dependent VRs are relaxed as xs->US, ox/lt/px->OW, up->UL
+// - Entry.Name is derived from the DICOM keyword because dicom.dic does not provide the long display name
 
 package std
 

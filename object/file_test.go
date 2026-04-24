@@ -393,7 +393,15 @@ func TestReadDataSetReadsRawExplicitVRLittleEndianDataSet(t *testing.T) {
 	}
 }
 
-func TestDicomRSIntegrationReadMappings(t *testing.T) {
+func TestIntegrationReadMappings(t *testing.T) {
+	// Covers multiple read-path variations:
+	// - Part 10 with preamble
+	// - explicit VR LE without file meta
+	// - OB value with unknown length
+	//
+	// The Go API uses separate entry points instead of a single auto-detecting
+	// reader: ReadFile handles Part 10 streams with preamble, while ReadDataSet
+	// handles raw datasets without file meta.
 	tests := []struct {
 		name string
 		run  func(t *testing.T)

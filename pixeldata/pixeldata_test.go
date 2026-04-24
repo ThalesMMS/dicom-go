@@ -5,12 +5,14 @@ import (
 	"encoding/binary"
 	"errors"
 	"math"
+	"reflect"
 	"testing"
 	"unsafe"
 
 	"github.com/ThalesMMS/dicom-go/core"
 	"github.com/ThalesMMS/dicom-go/internal/dicomtest"
 	"github.com/ThalesMMS/dicom-go/object"
+	"github.com/ThalesMMS/dicom-go/transfer"
 )
 
 func TestExtractReturnsEncapsulatedFragmentSequence(t *testing.T) {
@@ -283,6 +285,312 @@ func TestMetadataFrameSizeUsesInt64Arithmetic(t *testing.T) {
 	if metadata.TotalSize() != metadata.FrameSize()*2 {
 		t.Fatalf("TotalSize = %d, want %d", metadata.TotalSize(), metadata.FrameSize()*2)
 	}
+}
+
+func TestMemoryRegistryRegisterAndGetCodec(t *testing.T) {
+	r := NewMemoryRegistry()
+	first := &fakeCodec{}
+	second := &fakeCodec{}
+
+	if got, ok := r.GetCodec("1.2.3"); ok || got != nil {
+		t.Fatalf("GetCodec() = %#v ok=%v, want <nil> false", got, ok)
+	}
+
+	if err := r.RegisterCodec("1.2.3 \x00", first); err != nil {
+		t.Fatalf("RegisterCodec() error = %v, want nil", err)
+	}
+
+	got, ok := r.GetCodec("1.2.3 \x00")
+	if !ok {
+		t.Fatal("GetCodec() ok = false, want true")
+	}
+	if got != first {
+		t.Fatalf("GetCodec() = %#v, want %#v", got, first)
+	}
+
+	if err := r.RegisterCodec("1.2.3", second); err != nil {
+		t.Fatalf("RegisterCodec() replacement error = %v, want nil", err)
+	}
+
+	got, ok = r.GetCodec("1.2.3")
+	if !ok {
+		t.Fatal("GetCodec() ok = false after replacement, want true")
+	}
+	if got != second {
+		t.Fatalf("GetCodec() after replacement = %#v, want %#v", got, second)
+	}
+}
+
+func TestMemoryRegistryRegisterCodecReturnsValidationErrors(t *testing.T) {
+	t.Run("nil receiver", func(t *testing.T) {
+		var r *MemoryRegistry
+		err := r.RegisterCodec("1.2.3", &fakeCodec{})
+		if !errors.Is(err, ErrCodecRegistryNil) {
+			t.Fatalf("error = %v, want ErrCodecRegistryNil", err)
+		}
+	})
+
+	t.Run("nil codec", func(t *testing.T) {
+		r := NewMemoryRegistry()
+		err := r.RegisterCodec("1.2.3", nil)
+		if !errors.Is(err, ErrCodecNil) {
+			t.Fatalf("error = %v, want ErrCodecNil", err)
+		}
+	})
+
+	t.Run("empty normalized uid", func(t *testing.T) {
+		r := NewMemoryRegistry()
+		err := r.RegisterCodec(" \x00", &fakeCodec{})
+		if !errors.Is(err, ErrCodecUIDInvalid) {
+			t.Fatalf("error = %v, want ErrCodecUIDInvalid", err)
+		}
+	})
+}
+
+func TestMemoryRegistryDecodeFramesNativeWithoutCodec(t *testing.T) {
+	raw := sequentialBytes(64)
+	obj := object.FromElements(append(
+		pixelMetadataElements(8, 8, 1, 8, 8, 7, 0, nil,
+			dicomtest.NewStringElement(tagPhotometricInterpretation, core.VRCS, "MONOCHROME2"),
+		),
+		dicomtest.NewOBElement(core.TagPixelData, raw),
+	), nil)
+
+	pixel, err := Extract(obj)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	frames, err := NewMemoryRegistry().DecodeFrames(transfer.ExplicitVRLittleEndian.UID, pixel, obj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if frames.Rows != 8 || frames.Columns != 8 {
+		t.Fatalf("frame geometry = %dx%d, want 8x8", frames.Rows, frames.Columns)
+	}
+	if len(frames.Data) != 1 {
+		t.Fatalf("frame count = %d, want 1", len(frames.Data))
+	}
+	if !bytes.Equal(frames.Data[0], raw) {
+		t.Fatalf("frame data = %v, want %v", frames.Data[0], raw)
+	}
+}
+
+func TestDecodeFramesWithRegisteredCodec(t *testing.T) {
+	registry := NewMemoryRegistry()
+	obj, pixel := testEncapsulatedPixelObject(t)
+	codec := &fakeCodec{
+		frames: Frames{
+			Rows:    8,
+			Columns: 8,
+			Data:    [][]byte{{0xAA, 0xBB, 0xCC}},
+		},
+	}
+
+	if err := registry.RegisterCodec("1.2.840.10008.9999.9999.2", codec); err != nil {
+		t.Fatalf("RegisterCodec() error = %v, want nil", err)
+	}
+
+	got, err := registry.DecodeFrames("1.2.840.10008.9999.9999.2 \x00", pixel, obj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, codec.frames) {
+		t.Fatalf("DecodeFrames() = %#v, want %#v", got, codec.frames)
+	}
+	if !reflect.DeepEqual(codec.pixel, pixel) {
+		t.Fatalf("codec pixel = %#v, want %#v", codec.pixel, pixel)
+	}
+	if codec.obj != obj {
+		t.Fatalf("codec obj = %p, want %p", codec.obj, obj)
+	}
+}
+
+func TestDecodeFramesReturnsErrCodecNotFound(t *testing.T) {
+	obj, pixel := testEncapsulatedPixelObject(t)
+
+	_, err := NewMemoryRegistry().DecodeFrames("1.2.840.10008.9999.9999.404", pixel, obj)
+	if err == nil {
+		t.Fatal("DecodeFrames() error = nil, want ErrCodecNotFound")
+	}
+	if !errors.Is(err, ErrCodecNotFound) {
+		t.Fatalf("error = %v, want ErrCodecNotFound", err)
+	}
+}
+
+func TestDecodeFramesPropagatesCodecError(t *testing.T) {
+	registry := NewMemoryRegistry()
+	obj, pixel := testEncapsulatedPixelObject(t)
+	wantErr := errors.New("decode failed")
+	codec := &fakeCodec{err: wantErr}
+
+	if err := registry.RegisterCodec("1.2.840.10008.9999.9999.2", codec); err != nil {
+		t.Fatalf("RegisterCodec() error = %v, want nil", err)
+	}
+
+	_, err := registry.DecodeFrames("1.2.840.10008.9999.9999.2", pixel, obj)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("error = %v, want %v", err, wantErr)
+	}
+	if !reflect.DeepEqual(codec.pixel, pixel) {
+		t.Fatalf("codec pixel = %#v, want %#v", codec.pixel, pixel)
+	}
+	if codec.obj != obj {
+		t.Fatalf("codec obj = %p, want %p", codec.obj, obj)
+	}
+}
+
+func TestMemoryRegistryDecodeFramesReturnsErrIncompatiblePixelData(t *testing.T) {
+	obj := object.FromElements(append(
+		pixelMetadataElements(8, 8, 1, 8, 8, 7, 0, nil,
+			dicomtest.NewStringElement(tagPhotometricInterpretation, core.VRCS, "MONOCHROME2"),
+		),
+		dicomtest.NewOBElement(core.TagPixelData, sequentialBytes(64)),
+	), nil)
+
+	pixel, err := Extract(obj)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = NewMemoryRegistry().DecodeFrames(transfer.JPEGBaseline.UID, pixel, obj)
+	if err == nil {
+		t.Fatal("DecodeFrames() error = nil, want ErrIncompatiblePixelData")
+	}
+	if !errors.Is(err, ErrIncompatiblePixelData) {
+		t.Fatalf("error = %v, want ErrIncompatiblePixelData", err)
+	}
+}
+
+func TestMemoryRegistryDecodeFramesNilReceiverReturnsErrCodecRegistryNilForEncapsulatedData(t *testing.T) {
+	var registry *MemoryRegistry
+	obj, pixel := testEncapsulatedPixelObject(t)
+
+	_, err := registry.DecodeFrames("1.2.840.10008.9999.9999.2", pixel, obj)
+	if !errors.Is(err, ErrCodecRegistryNil) {
+		t.Fatalf("error = %v, want ErrCodecRegistryNil", err)
+	}
+}
+
+func TestPackageLevelRegisterCodecAndDecodeFrames(t *testing.T) {
+	prev := DefaultRegistry
+	DefaultRegistry = NewMemoryRegistry()
+	t.Cleanup(func() {
+		DefaultRegistry = prev
+	})
+
+	obj, pixel := testEncapsulatedPixelObject(t)
+	codec := &fakeCodec{
+		frames: Frames{
+			Rows:    8,
+			Columns: 8,
+			Data:    [][]byte{{0xAA, 0xBB, 0xCC}},
+		},
+	}
+
+	if err := RegisterCodec("1.2.840.10008.9999.9999.2 \x00", codec); err != nil {
+		t.Fatalf("RegisterCodec() error = %v, want nil", err)
+	}
+
+	gotCodec, ok, err := GetCodec("1.2.840.10008.9999.9999.2")
+	if err != nil {
+		t.Fatalf("GetCodec() error = %v, want nil", err)
+	}
+	if !ok {
+		t.Fatal("GetCodec() ok = false, want true")
+	}
+	if gotCodec != codec {
+		t.Fatalf("GetCodec() = %#v, want %#v", gotCodec, codec)
+	}
+
+	got, err := DecodeFrames("1.2.840.10008.9999.9999.2 \x00", pixel, obj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, codec.frames) {
+		t.Fatalf("DecodeFrames() = %#v, want %#v", got, codec.frames)
+	}
+	if !reflect.DeepEqual(codec.pixel, pixel) {
+		t.Fatalf("codec pixel = %#v, want %#v", codec.pixel, pixel)
+	}
+	if codec.obj != obj {
+		t.Fatalf("codec obj = %p, want %p", codec.obj, obj)
+	}
+}
+
+func TestPackageLevelRegisterCodecReturnsErrCodecRegistryNil(t *testing.T) {
+	prev := DefaultRegistry
+	DefaultRegistry = nil
+	t.Cleanup(func() {
+		DefaultRegistry = prev
+	})
+
+	err := RegisterCodec("1.2.3", &fakeCodec{})
+	if !errors.Is(err, ErrCodecRegistryNil) {
+		t.Fatalf("error = %v, want ErrCodecRegistryNil", err)
+	}
+}
+
+func TestPackageLevelGetCodecReturnsErrCodecRegistryNil(t *testing.T) {
+	prev := DefaultRegistry
+	DefaultRegistry = nil
+	t.Cleanup(func() {
+		DefaultRegistry = prev
+	})
+
+	got, ok, err := GetCodec("1.2.3")
+	if got != nil || ok {
+		t.Fatalf("GetCodec() = %#v ok=%v, want <nil> false", got, ok)
+	}
+	if !errors.Is(err, ErrCodecRegistryNil) {
+		t.Fatalf("error = %v, want ErrCodecRegistryNil", err)
+	}
+}
+
+func TestPackageLevelDecodeFramesReturnsErrCodecRegistryNil(t *testing.T) {
+	prev := DefaultRegistry
+	DefaultRegistry = nil
+	t.Cleanup(func() {
+		DefaultRegistry = prev
+	})
+
+	obj, pixel := testEncapsulatedPixelObject(t)
+
+	_, err := DecodeFrames("1.2.3", pixel, obj)
+	if !errors.Is(err, ErrCodecRegistryNil) {
+		t.Fatalf("error = %v, want ErrCodecRegistryNil", err)
+	}
+}
+
+type fakeCodec struct {
+	pixel  PixelData
+	obj    *object.Object
+	frames Frames
+	err    error
+}
+
+func (c *fakeCodec) Decode(pixel PixelData, obj *object.Object) (Frames, error) {
+	c.pixel = pixel
+	c.obj = obj
+	if c.err != nil {
+		return Frames{}, c.err
+	}
+	return c.frames, nil
+}
+
+func testEncapsulatedPixelObject(t *testing.T) (*object.Object, PixelData) {
+	t.Helper()
+	obj := object.FromElements(append(
+		pixelMetadataElements(8, 8, 1, 8, 8, 7, 0, nil,
+			dicomtest.NewStringElement(tagPhotometricInterpretation, core.VRCS, "MONOCHROME2"),
+		),
+		dicomtest.NewFragmentSequenceElement(core.TagPixelData, []byte{0x00, 0x00, 0x00, 0x00}, []byte{0xAA, 0xBB, 0xCC}),
+	), nil)
+	pixel, err := Extract(obj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return obj, pixel
 }
 
 func pixelMetadataElements(rows, columns, samplesPerPixel, bitsAllocated, bitsStored, highBit, pixelRepresentation uint16, numberOfFrames *string, extra ...core.Element) []core.Element {

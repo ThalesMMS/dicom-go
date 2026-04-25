@@ -16,10 +16,9 @@
 // usually resolve to UN unless callers inject a custom dictionary.
 //
 // Design notes:
-//   - Repeating tags are expanded during dictionary generation; there is no
-//     runtime range lookup.
-//   - There is no VirtualVr concept. Context-dependent VRs are resolved to
-//     concrete values during generation, currently xs->US and ox/px/lt->OW.
-//   - A hard-coded Overlay Data check for all even 60xx groups acts as a
-//     parser safety net, complementing the generated standard dictionary.
+//   - dicom-go expands repeating tags during dictionary generation.
+//   - Context-dependent VRs are resolved to concrete values during generation,
+//     currently xs->US and ox/px/lt->OW.
+//   - dicom-go keeps a hard-coded Overlay Data check for all even 60xx groups
+//     as a parser safety net, complementing the generated standard dictionary.
 package parser

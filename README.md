@@ -2,8 +2,8 @@
 
 A pure Go implementation of the DICOM medical imaging standard.
 
-`dicom-go` uses idiomatic Go packages, concrete value types and explicit
-registries. The `v0.1.0` release provides a practical subset
+`dicom-go` uses a layered architecture with idiomatic Go packages, concrete
+value types and explicit registries. The `v0.1.0` release provides a practical subset
 for reading and writing Part 10 files, converting datasets to/from DICOM JSON,
 extracting pixel data, and running minimal C-ECHO/C-STORE workflows.
 

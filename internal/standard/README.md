@@ -14,7 +14,6 @@ UID source:
 
 - Table: `DICOM PS 3.6` table `A-1`
 - Vendored file: `internal/standard/uids.tsv`
-- Derived from DICOM PS 3.6 table A-1 on April 23, 2026
 
 Why this file is committed:
 
@@ -33,7 +32,7 @@ Update procedure:
 6. Re-run `go generate ./dictionary/std` and `go generate ./dictionary/uid`, then confirm the outputs are byte-identical.
 7. Run `go test ./...`.
 
-Design choices in the Go generator:
+Design notes for the Go generator:
 
 - Repeating tag ranges are expanded to concrete tags because `dicom-go` currently exposes exact-tag lookup only.
 - Context-dependent VRs are relaxed to exact Go VRs: `xs -> US`, `ox -> OW`, `px -> OW`, `lt -> OW`, `up -> UL`.

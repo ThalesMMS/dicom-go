@@ -17,7 +17,7 @@ func TestReaderLimitsRejectMaxSequenceDepth(t *testing.T) {
 	nestedSeq := explicitLongHeaderBytes(binary.LittleEndian, core.NewTag(0x0008, 0x2222), core.VRSQ, [2]byte{}, 0xFFFFFFFF)
 	stream := bytes.Join([][]byte{
 		explicitLongHeaderBytes(binary.LittleEndian, core.NewTag(0x0008, 0x1111), core.VRSQ, [2]byte{}, 0xFFFFFFFF),
-		sequenceControlBytes(binary.LittleEndian, core.TagItem, 0xFFFFFFFF),
+		dicomtest.SequenceControlBytes(binary.LittleEndian, core.TagItem, 0xFFFFFFFF),
 		nestedSeq,
 	}, nil)
 
@@ -87,10 +87,10 @@ func TestReaderLimitsRejectMaxFragments(t *testing.T) {
 func TestReaderLimitsRejectMaxFragmentsBeforeReadingRejectedPayload(t *testing.T) {
 	stream := bytes.Join([][]byte{
 		explicitLongHeaderBytes(binary.LittleEndian, core.TagPixelData, core.VROB, [2]byte{}, 0xFFFFFFFF),
-		sequenceControlBytes(binary.LittleEndian, core.TagItem, 0),
-		sequenceControlBytes(binary.LittleEndian, core.TagItem, 2),
+		dicomtest.SequenceControlBytes(binary.LittleEndian, core.TagItem, 0),
+		dicomtest.SequenceControlBytes(binary.LittleEndian, core.TagItem, 2),
 		{0x01, 0x02},
-		sequenceControlBytes(binary.LittleEndian, core.TagItem, 0xFFFFFFFE),
+		dicomtest.SequenceControlBytes(binary.LittleEndian, core.TagItem, 0xFFFFFFFE),
 	}, nil)
 
 	reader := NewReader(bytes.NewReader(stream), transfer.JPEGBaseline, ReaderOptions{
@@ -142,7 +142,7 @@ func TestReaderLimitsAllowSyntheticDelimitersAtMaxTotalBytesBoundary(t *testing.
 		4,
 		[]byte("TEST"),
 	)
-	item := sequenceControlBytes(binary.LittleEndian, core.TagItem, uint32(len(inner)))
+	item := dicomtest.SequenceControlBytes(binary.LittleEndian, core.TagItem, uint32(len(inner)))
 	stream := bytes.Join([][]byte{
 		explicitLongHeaderBytes(binary.LittleEndian, core.NewTag(0x0008, 0x1111), core.VRSQ, [2]byte{}, uint32(len(item)+len(inner))),
 		item,
@@ -219,7 +219,7 @@ func TestReaderLimitsRejectPartialElementEOF(t *testing.T) {
 func TestReaderLimitsRejectUnterminatedItem(t *testing.T) {
 	stream := bytes.Join([][]byte{
 		explicitLongHeaderBytes(binary.LittleEndian, core.NewTag(0x0008, 0x1111), core.VRSQ, [2]byte{}, 0xFFFFFFFF),
-		sequenceControlBytes(binary.LittleEndian, core.TagItem, 0xFFFFFFFF),
+		dicomtest.SequenceControlBytes(binary.LittleEndian, core.TagItem, 0xFFFFFFFF),
 		dicomtest.EncodeElement(dicomtest.NewPNElement(core.NewTag(0x0010, 0x0010), "BROKEN^ITEM"), transfer.ExplicitVRLittleEndian),
 	}, nil)
 

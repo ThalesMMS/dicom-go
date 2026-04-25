@@ -1,9 +1,9 @@
 // Package dictionary defines the minimal data dictionary contract used by
 // implicit-VR decoding.
 //
-// The implementation intentionally keeps this surface small: exact tag and
-// keyword lookup only. Repeating tag ranges and virtual VRs are resolved
-// inside generated dictionaries before they reach callers.
+// The Go implementation intentionally keeps this surface small: exact tag and
+// keyword lookup only. Repeating tag ranges and virtual VRs are resolved inside
+// generated dictionaries before they reach callers.
 package dictionary
 
 import "github.com/ThalesMMS/dicom-go/core"

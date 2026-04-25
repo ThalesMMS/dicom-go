@@ -2,6 +2,7 @@ package object
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/ThalesMMS/dicom-go/core"
@@ -226,6 +227,38 @@ func TestCharacterSet(t *testing.T) {
 	}
 }
 
+func TestObjectSetTextOptionsInvalidatesCharsetCache(t *testing.T) {
+	obj := FromElements([]core.Element{
+		dicomtest.NewStringElement(tagSpecificCharacterSet, core.VRCS, "ISO_IR 6"),
+	}, std.Dictionary)
+
+	charset, err := obj.CharacterSet()
+	if err != nil {
+		t.Fatalf("CharacterSet() error = %v", err)
+	}
+	if charset.Name() != "ISO_IR 6" {
+		t.Fatalf("CharacterSet() = %q, want ISO_IR 6", charset.Name())
+	}
+
+	obj.elements[tagSpecificCharacterSet] = dicomtest.NewStringElement(tagSpecificCharacterSet, core.VRCS, "ISO_IR 100")
+	charset, err = obj.CharacterSet()
+	if err != nil {
+		t.Fatalf("CharacterSet() error = %v", err)
+	}
+	if charset.Name() != "ISO_IR 6" {
+		t.Fatalf("CharacterSet() after element mutation without SetTextOptions = %q, want cached ISO_IR 6", charset.Name())
+	}
+
+	obj.SetTextOptions(TextOptions{})
+	charset, err = obj.CharacterSet()
+	if err != nil {
+		t.Fatalf("CharacterSet() error = %v", err)
+	}
+	if charset.Name() != "ISO_IR 100" {
+		t.Fatalf("CharacterSet() after SetTextOptions = %q, want ISO_IR 100", charset.Name())
+	}
+}
+
 func TestGetPersonNameFullAndPartial(t *testing.T) {
 	nameTag := core.NewTag(0x0010, 0x0010)
 	partialTag := core.NewTag(0x0010, 0x1001)
@@ -424,5 +457,108 @@ func TestNilObjectAccessors(t *testing.T) {
 	}
 	if _, ok := obj.GetSequence(core.NewTag(0x0008, 0x1111)); ok {
 		t.Fatal("GetSequence() on nil object = ok true, want false")
+	}
+}
+
+// TestObjectMustGetReturnsElementOrError verifies MustGet returns the element
+// when present, and a descriptive error when the tag is absent.
+func TestObjectMustGetReturnsElementOrError(t *testing.T) {
+	tag := core.NewTag(0x0010, 0x0010)
+	obj := FromElements([]core.Element{
+		dicomtest.NewPNElement(tag, "FOUND^PATIENT"),
+	}, std.Dictionary)
+
+	elem, err := obj.MustGet(tag)
+	if err != nil {
+		t.Fatalf("MustGet present tag: %v", err)
+	}
+	if elem.Tag() != tag {
+		t.Fatalf("MustGet returned tag %s, want %s", elem.Tag(), tag)
+	}
+
+	_, err = obj.MustGet(core.NewTag(0x0010, 0x0020))
+	requireMissingTagError(t, err, core.NewTag(0x0010, 0x0020))
+}
+
+// TestObjectSortedElementsReturnsSortedOrder verifies SortedElements returns
+// elements sorted by ascending tag regardless of insertion order.
+func TestObjectSortedElementsReturnsSortedOrder(t *testing.T) {
+	tag1 := core.NewTag(0x0020, 0x000D) // group 0020
+	tag2 := core.NewTag(0x0010, 0x0010) // group 0010
+	tag3 := core.NewTag(0x0008, 0x0018) // group 0008
+
+	obj := New(std.Dictionary)
+	obj.Put(dicomtest.NewStringElement(tag1, core.VRUI, dicomtest.TestStudyInstanceUID))
+	obj.Put(dicomtest.NewPNElement(tag2, "TEST^PATIENT"))
+	obj.Put(dicomtest.NewStringElement(tag3, core.VRUI, dicomtest.TestSOPInstanceUID))
+
+	sorted := obj.SortedElements()
+	if len(sorted) != 3 {
+		t.Fatalf("SortedElements count = %d, want 3", len(sorted))
+	}
+	for i := 1; i < len(sorted); i++ {
+		prev := sorted[i-1].Tag()
+		curr := sorted[i].Tag()
+		if !prev.Less(curr) {
+			t.Fatalf("SortedElements: element %d (%s) not less than element %d (%s)", i-1, prev, i, curr)
+		}
+	}
+	if sorted[0].Tag() != tag3 {
+		t.Fatalf("first sorted tag = %s, want %s", sorted[0].Tag(), tag3)
+	}
+}
+
+// TestObjectLookupStringReturnsMissingError verifies the error path of
+// LookupString when a tag is absent from the object.
+func TestObjectLookupStringReturnsMissingError(t *testing.T) {
+	tag := core.NewTag(0x0010, 0x0010)
+	obj := New(std.Dictionary)
+	_, err := obj.LookupString(tag)
+	requireMissingTagError(t, err, tag)
+}
+
+func requireMissingTagError(t *testing.T, err error, tag core.Tag) {
+	t.Helper()
+
+	if err == nil {
+		t.Fatalf("missing tag %s: expected error, got nil", tag)
+	}
+	if !strings.Contains(err.Error(), "missing element") || !strings.Contains(err.Error(), tag.String()) {
+		t.Fatalf("missing tag error = %q, want missing element message containing %s", err, tag)
+	}
+}
+
+// TestObjectElementsPreservesInsertionOrder verifies that Elements() returns
+// elements in insertion order, not sorted order.
+func TestObjectElementsPreservesInsertionOrder(t *testing.T) {
+	tag1 := core.NewTag(0x0020, 0x000D)
+	tag2 := core.NewTag(0x0010, 0x0010)
+
+	obj := New(std.Dictionary)
+	obj.Put(dicomtest.NewStringElement(tag1, core.VRUI, dicomtest.TestStudyInstanceUID))
+	obj.Put(dicomtest.NewPNElement(tag2, "TEST^PATIENT"))
+
+	elems := obj.Elements()
+	if len(elems) != 2 {
+		t.Fatalf("Elements() count = %d, want 2", len(elems))
+	}
+	if elems[0].Tag() != tag1 {
+		t.Fatalf("Elements()[0] = %s, want %s (inserted first)", elems[0].Tag(), tag1)
+	}
+	if elems[1].Tag() != tag2 {
+		t.Fatalf("Elements()[1] = %s, want %s (inserted second)", elems[1].Tag(), tag2)
+	}
+}
+
+// TestObjectGetUIDsReturnsFalseForEmptyUID verifies that GetUIDs returns
+// false when all values are empty/whitespace after trimming.
+func TestObjectGetUIDsReturnsFalseForEmptyUID(t *testing.T) {
+	tag := core.NewTag(0x0008, 0x0018)
+	obj := FromElements([]core.Element{
+		core.NewRawElement(tag, core.VRUI, []byte("\x00")),
+	}, std.Dictionary)
+
+	if _, ok := obj.GetUIDs(tag); ok {
+		t.Fatal("GetUIDs() on all-null UID: expected false")
 	}
 }

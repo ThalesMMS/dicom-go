@@ -1,6 +1,7 @@
 package dimse
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -97,6 +98,7 @@ func (w *PDataWriter) maxPayload() int {
 
 type PDataReader struct {
 	assoc        *ul.Association
+	ctx          context.Context
 	pcID         byte
 	expectedType *bool
 	buf          []byte
@@ -109,6 +111,10 @@ func NewPDataReader(assoc *ul.Association, pcID byte) *PDataReader {
 
 func newTypedPDataReader(assoc *ul.Association, pcID byte, isCommand bool) *PDataReader {
 	return &PDataReader{assoc: assoc, pcID: pcID, expectedType: &isCommand}
+}
+
+func newTypedPDataReaderWithContext(ctx context.Context, assoc *ul.Association, pcID byte, isCommand bool) *PDataReader {
+	return &PDataReader{assoc: assoc, ctx: ctx, pcID: pcID, expectedType: &isCommand}
 }
 
 func (r *PDataReader) Read(p []byte) (int, error) {
@@ -136,7 +142,15 @@ func (r *PDataReader) readNextPData() error {
 	if r.assoc == nil {
 		return fmt.Errorf("dicom dimse: nil association")
 	}
-	pdu, err := r.assoc.ReadPDU()
+	var (
+		pdu ul.PDU
+		err error
+	)
+	if r.ctx != nil {
+		pdu, err = r.assoc.Receive(r.ctx)
+	} else {
+		pdu, err = r.assoc.ReadPDU()
+	}
 	if err != nil {
 		return err
 	}

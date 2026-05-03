@@ -1,6 +1,7 @@
 package dimse
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/ThalesMMS/dicom-go/core"
@@ -171,7 +172,11 @@ func SendDataSet(assoc *ul.Association, pcID byte, dataset *object.Object, synta
 }
 
 func ReceiveDataSet(assoc *ul.Association, pcID byte, syntax transfer.Syntax) (*object.Object, error) {
-	reader := newTypedPDataReader(assoc, pcID, false)
+	return receiveDataSetWithContext(nil, assoc, pcID, syntax)
+}
+
+func receiveDataSetWithContext(ctx context.Context, assoc *ul.Association, pcID byte, syntax transfer.Syntax) (*object.Object, error) {
+	reader := newTypedPDataReaderWithContext(ctx, assoc, pcID, false)
 	dataset, err := object.ReadDataSet(reader, syntax)
 	if err != nil {
 		return nil, fmt.Errorf("dicom dimse: receive dataset: %w", err)

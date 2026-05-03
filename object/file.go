@@ -10,6 +10,7 @@ import (
 	"sort"
 
 	"github.com/ThalesMMS/dicom-go/core"
+	"github.com/ThalesMMS/dicom-go/dictionary"
 	"github.com/ThalesMMS/dicom-go/dictionary/std"
 	"github.com/ThalesMMS/dicom-go/encoding"
 	"github.com/ThalesMMS/dicom-go/parser"
@@ -33,6 +34,8 @@ type File struct {
 	Meta           *Object
 	Dataset        *Object
 	TransferSyntax transfer.Syntax
+
+	source io.Closer
 }
 
 type WriteFileOptions struct {
@@ -159,9 +162,26 @@ func (f *File) SetTextOptions(opts TextOptions) {
 //
 // All numeric limit fields default to zero, which means unlimited.
 type ReadFileOptions struct {
+	// Dictionary controls the dictionary used when parsing the main dataset.
+	// A nil value defaults to dictionary/std.Dictionary.
+	Dictionary dictionary.DataDictionary
+	// FileMetaDictionary controls the dictionary used when parsing the Part 10
+	// file meta information. A nil value defaults to dictionary/std.Dictionary.
+	FileMetaDictionary dictionary.DataDictionary
+
 	// MaxElementBytes limits a single element value allocation in bytes.
 	// A zero value means unlimited.
 	MaxElementBytes int64
+	// InlineValueBytesThreshold controls when the underlying parser will stop
+	// materializing defined-length primitive element values into memory.
+	//
+	// If > 0 and an element value length is strictly greater than this
+	// threshold, its bytes will be consumed but the returned core.Element will
+	// have a nil Value (metadata-only for that element).
+	//
+	// A zero value preserves historical behavior of always materializing
+	// defined-length values (subject to MaxElementBytes).
+	InlineValueBytesThreshold int64
 	// MaxTotalBytes limits the total number of bytes read from the source.
 	// A zero value means unlimited.
 	MaxTotalBytes int64
@@ -196,7 +216,11 @@ func OpenFileWithOptions(path string, opts ReadFileOptions) (result *File, err e
 	if err != nil {
 		return nil, err
 	}
+	closeFile := true
 	defer func() {
+		if !closeFile {
+			return
+		}
 		if cerr := f.Close(); cerr != nil {
 			if err == nil {
 				err = cerr
@@ -206,7 +230,21 @@ func OpenFileWithOptions(path string, opts ReadFileOptions) (result *File, err e
 		}
 	}()
 	result, err = ReadFileWithOptions(f, opts)
+	if err == nil && result != nil && result.Dataset != nil && result.Dataset.valueProvider != nil && result.Dataset.deferredCount > 0 {
+		result.source = f
+		closeFile = false
+	}
 	return result, err
+}
+
+// Close releases any source handle kept alive for deferred value streaming.
+func (f *File) Close() error {
+	if f == nil || f.source == nil {
+		return nil
+	}
+	err := f.source.Close()
+	f.source = nil
+	return err
 }
 
 func ReadFile(r io.Reader) (*File, error) {
@@ -214,6 +252,13 @@ func ReadFile(r io.Reader) (*File, error) {
 }
 
 func ReadFileWithOptions(r io.Reader, opts ReadFileOptions) (*File, error) {
+	// Preserve ReadFile's historical zero-value behavior.
+	if opts.FileMetaDictionary == nil {
+		opts.FileMetaDictionary = std.Dictionary
+	}
+	if opts.Dictionary == nil {
+		opts.Dictionary = std.Dictionary
+	}
 	br := bufio.NewReader(r)
 	prefix := make([]byte, 132)
 	if _, err := io.ReadFull(br, prefix); err != nil {
@@ -227,21 +272,45 @@ func ReadFileWithOptions(r io.Reader, opts ReadFileOptions) (*File, error) {
 	if err != nil {
 		return nil, wrapFileMetaError(err)
 	}
-	reader := parser.NewReader(br, syntax, opts.parserReaderOptions(datasetOffset))
+	readerSource := io.Reader(br)
+	readerSourceSeekable := false
+	if rs, ok := r.(io.ReadSeeker); ok {
+		if _, err := rs.Seek(datasetOffset, io.SeekStart); err != nil {
+			return nil, wrapDataSetError(err)
+		}
+		readerSource = rs
+		readerSourceSeekable = true
+	}
+	readerReadOpts := opts
+	if !readerSourceSeekable {
+		readerReadOpts.InlineValueBytesThreshold = 0
+	}
+	readerOpts := readerReadOpts.parserReaderOptions(datasetOffset)
+	reader := parser.NewReader(readerSource, syntax, readerOpts)
 	dataset, err := reader.ReadDataSet()
 	if err != nil {
 		return nil, wrapDataSetError(err)
 	}
-	return &File{
+	file := &File{
 		Preamble:       prefix[:128],
 		Meta:           meta,
-		Dataset:        FromDataSet(dataset, std.Dictionary),
+		Dataset:        FromDataSet(dataset, readerOpts.Dictionary),
 		TransferSyntax: syntax,
-	}, nil
+	}
+	if readerOpts.InlineValueBytesThreshold > 0 && readerSourceSeekable && file.Dataset.deferredCount > 0 {
+		file.Dataset.setValueProvider(&readerValueProvider{reader: reader})
+	}
+	return file, nil
 }
 
 func readFileMeta(r io.Reader, baseOffset int64, opts ReadFileOptions) (*Object, transfer.Syntax, int64, error) {
-	metaReader := parser.NewReader(r, transfer.ExplicitVRLittleEndian, opts.parserReaderOptions(baseOffset))
+	metaOpts := opts
+	metaOpts.InlineValueBytesThreshold = 0
+	if opts.FileMetaDictionary != nil {
+		metaOpts.Dictionary = opts.FileMetaDictionary
+	}
+	metaReaderOpts := metaOpts.parserReaderOptions(baseOffset)
+	metaReader := parser.NewReader(r, transfer.ExplicitVRLittleEndian, metaReaderOpts)
 	first, err := metaReader.Next()
 	if err != nil {
 		return nil, transfer.Syntax{}, 0, err
@@ -255,13 +324,13 @@ func readFileMeta(r io.Reader, baseOffset int64, opts ReadFileOptions) (*Object,
 	}
 	metaLen := binary.LittleEndian.Uint32(raw)
 	metaElements := []core.Element{first.Element}
-	metaReader = parser.NewReader(io.LimitReader(r, int64(metaLen)), transfer.ExplicitVRLittleEndian, opts.parserReaderOptions(metaReader.Position()))
+	metaReader = parser.NewReader(io.LimitReader(r, int64(metaLen)), transfer.ExplicitVRLittleEndian, metaOpts.parserReaderOptions(metaReader.Position()))
 	more, err := metaReader.ReadAll()
 	if err != nil {
 		return nil, transfer.Syntax{}, 0, err
 	}
 	metaElements = append(metaElements, more...)
-	meta := FromDataSet(core.DataSet{Elements: metaElements}, std.Dictionary)
+	meta := FromDataSet(core.DataSet{Elements: metaElements}, metaReaderOpts.Dictionary)
 
 	uid, ok := meta.GetString(core.NewTag(0x0002, 0x0010))
 	if !ok {
@@ -290,12 +359,18 @@ func ReadDataSetWithOptions(r io.Reader, syntax transfer.Syntax, opts ReadFileOp
 	if err != nil {
 		return nil, err
 	}
-	reader := parser.NewReader(r, syntax, opts.parserReaderOptions(0))
+	_, seekable := r.(io.ReadSeeker)
+	readerOpts := opts.datasetParserReaderOptions(0, seekable)
+	reader := parser.NewReader(r, syntax, readerOpts)
 	dataset, err := reader.ReadDataSet()
 	if err != nil {
 		return nil, err
 	}
-	return FromDataSet(dataset, std.Dictionary), nil
+	obj := FromDataSet(dataset, readerOpts.Dictionary)
+	if readerOpts.InlineValueBytesThreshold > 0 && obj.deferredCount > 0 {
+		obj.setValueProvider(&readerValueProvider{reader: reader})
+	}
+	return obj, nil
 }
 
 func OpenDataSet(path string, syntax transfer.Syntax) (*Object, error) {
@@ -307,7 +382,11 @@ func OpenDataSetWithOptions(path string, syntax transfer.Syntax, opts ReadFileOp
 	if err != nil {
 		return nil, err
 	}
+	closeFile := true
 	defer func() {
+		if !closeFile {
+			return
+		}
 		if cerr := f.Close(); cerr != nil {
 			if err == nil {
 				err = cerr
@@ -317,6 +396,10 @@ func OpenDataSetWithOptions(path string, syntax transfer.Syntax, opts ReadFileOp
 		}
 	}()
 	result, err = ReadDataSetWithOptions(f, syntax, opts)
+	if err == nil && result != nil && result.valueProvider != nil && result.deferredCount > 0 {
+		result.source = f
+		closeFile = false
+	}
 	return result, err
 }
 
@@ -401,17 +484,30 @@ func (f *File) objectForTag(tag core.Tag) *Object {
 }
 
 func (o ReadFileOptions) parserReaderOptions(baseOffset int64) parser.ReaderOptions {
-	return parser.ReaderOptions{
-		Dictionary:          std.Dictionary,
-		MaxElementBytes:     o.MaxElementBytes,
-		MaxTotalBytes:       o.MaxTotalBytes,
-		BaseOffset:          baseOffset,
-		MaxSequenceDepth:    o.MaxSequenceDepth,
-		MaxElements:         o.MaxElements,
-		MaxFragments:        o.MaxFragments,
-		StrictReservedBytes: o.StrictReservedBytes,
-		OddLengthPolicy:     o.OddLengthPolicy,
+	dict := std.Dictionary
+	if o.Dictionary != nil {
+		dict = o.Dictionary
 	}
+	return parser.ReaderOptions{
+		Dictionary:                dict,
+		MaxElementBytes:           o.MaxElementBytes,
+		MaxTotalBytes:             o.MaxTotalBytes,
+		BaseOffset:                baseOffset,
+		MaxSequenceDepth:          o.MaxSequenceDepth,
+		MaxElements:               o.MaxElements,
+		MaxFragments:              o.MaxFragments,
+		InlineValueBytesThreshold: o.InlineValueBytesThreshold,
+		StrictReservedBytes:       o.StrictReservedBytes,
+		OddLengthPolicy:           o.OddLengthPolicy,
+	}
+}
+
+func (o ReadFileOptions) datasetParserReaderOptions(baseOffset int64, streamValues bool) parser.ReaderOptions {
+	opts := o.parserReaderOptions(baseOffset)
+	if !streamValues {
+		opts.InlineValueBytesThreshold = 0
+	}
+	return opts
 }
 
 func prepareFileMeta(file *File, syntax transfer.Syntax) ([]core.Element, error) {

@@ -2,6 +2,7 @@ package dimse
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 
@@ -35,7 +36,11 @@ func SendCommandSet(assoc *ul.Association, pcID byte, elements []core.Element) e
 }
 
 func ReceiveCommandSet(assoc *ul.Association, pcID byte) (*object.Object, error) {
-	reader := newTypedPDataReader(assoc, pcID, true)
+	return receiveCommandSetWithContext(nil, assoc, pcID)
+}
+
+func receiveCommandSetWithContext(ctx context.Context, assoc *ul.Association, pcID byte) (*object.Object, error) {
+	reader := newTypedPDataReaderWithContext(ctx, assoc, pcID, true)
 	var data bytes.Buffer
 	if _, err := io.Copy(&data, reader); err != nil {
 		return nil, err

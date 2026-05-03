@@ -20,6 +20,9 @@ var outputTemplate = template.Must(template.New("std").Parse(`// Code generated 
 //
 // Source file: {{.SourcePath}}
 // Source origin: DICOM PS3.6 table A-1, vendored in internal/standard/uids.tsv
+// Implementation notes:
+// - lookup is case-insensitive by keyword in Go to match the existing dictionary contract
+// - the registry is package-local generated Go code instead of per-type constants
 
 package uid
 

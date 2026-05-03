@@ -18,6 +18,16 @@ var (
 	Priority                  = core.NewTag(0x0000, 0x0700)
 	CommandDataSetType        = core.NewTag(0x0000, 0x0800)
 	Status                    = core.NewTag(0x0000, 0x0900)
+	ErrorComment              = core.NewTag(0x0000, 0x0902)
+
+	// Query/Retrieve service command elements.
+	MoveDestination = core.NewTag(0x0000, 0x0600)
+
+	// Storage Commitment (Normalized DIMSE) command elements.
+	RequestedSOPClassUID    = core.NewTag(0x0000, 0x0003)
+	RequestedSOPInstanceUID = core.NewTag(0x0000, 0x1001)
+	ActionTypeID            = core.NewTag(0x0000, 0x1008)
+	EventTypeID             = core.NewTag(0x0000, 0x1002)
 )
 
 const (
@@ -25,13 +35,26 @@ const (
 	CStoreRSP uint16 = 0x8001
 	CEchoRQ   uint16 = 0x0030
 	CEchoRSP  uint16 = 0x8030
-	// C-FIND, C-MOVE, and C-GET command fields are intentionally out of scope
-	// for this minimal DIMSE layer.
+	CFindRQ   uint16 = 0x0020
+	CFindRSP  uint16 = 0x8020
+
+	// Query/Retrieve command fields.
+	CGetRQ   uint16 = 0x0010
+	CGetRSP  uint16 = 0x8010
+	CMoveRQ  uint16 = 0x0021
+	CMoveRSP uint16 = 0x8021
+
+	// Storage Commitment / Normalized DIMSE command fields.
+	NActionRQ       uint16 = 0x0130
+	NActionRSP      uint16 = 0x8130
+	NEventReportRQ  uint16 = 0x0100
+	NEventReportRSP uint16 = 0x8100
 )
 
 const (
 	DataSetPresent uint16 = 0x0000 // CommandDataSetType value indicating a dataset follows.
 	NoDataSet      uint16 = 0x0101 // CommandDataSetType value indicating no dataset follows.
+	DataSetAbsent  uint16 = NoDataSet
 )
 
 const (

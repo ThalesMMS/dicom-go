@@ -3,6 +3,7 @@ package object
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"sort"
 	"strconv"
 	"strings"
@@ -26,9 +27,18 @@ type Object struct {
 	dict     dictionary.DataDictionary
 	text     TextOptions
 
+	valueProvider     valueProvider
+	source            io.Closer
+	deferredCount     int
+	ambiguousDeferred map[core.Tag]bool
+
 	charsetCached bool
 	charset       dicomenc.SpecificCharacterSet
 	charsetErr    error
+}
+
+type valueProvider interface {
+	CopyValueTo(tag core.Tag, w io.Writer) (int64, error)
 }
 
 func New(dict dictionary.DataDictionary) *Object {
@@ -83,12 +93,40 @@ func (o *Object) SetTextOptions(opts TextOptions) {
 	o.invalidateCharacterSetCache()
 }
 
+func (o *Object) setValueProvider(p valueProvider) {
+	if o == nil {
+		return
+	}
+	o.valueProvider = p
+}
+
+// Close releases any source handle kept alive for deferred value streaming.
+func (o *Object) Close() error {
+	if o == nil {
+		return nil
+	}
+	o.valueProvider = nil
+	if o.source == nil {
+		return nil
+	}
+	err := o.source.Close()
+	o.source = nil
+	return err
+}
+
 func (o *Object) Put(elem core.Element) {
 	if o.elements == nil {
 		o.elements = map[core.Tag]core.Element{}
 	}
 	tag := elem.Tag()
-	if _, exists := o.elements[tag]; exists {
+	if existing, exists := o.elements[tag]; exists {
+		if !o.ambiguousDeferred[tag] {
+			o.deferredCount -= countDeferredElement(existing)
+		}
+		if o.ambiguousDeferred == nil {
+			o.ambiguousDeferred = map[core.Tag]bool{}
+		}
+		o.ambiguousDeferred[tag] = true
 		for i := range o.order {
 			if o.order[i] != tag {
 				continue
@@ -100,9 +138,35 @@ func (o *Object) Put(elem core.Element) {
 	}
 	o.order = append(o.order, tag)
 	o.elements[tag] = elem
+	if !o.ambiguousDeferred[tag] {
+		o.deferredCount += countDeferredElement(elem)
+	}
 	if tag == tagSpecificCharacterSet {
 		o.invalidateCharacterSetCache()
 	}
+}
+
+func countDeferredElements(elements []core.Element) int {
+	count := 0
+	for _, elem := range elements {
+		count += countDeferredElement(elem)
+	}
+	return count
+}
+
+func countDeferredElement(elem core.Element) int {
+	if elem.Value == nil {
+		return 1
+	}
+	seq, ok := elem.Value.(core.SequenceValue)
+	if !ok {
+		return 0
+	}
+	count := 0
+	for _, item := range seq.Items {
+		count += countDeferredElements(item.Elements)
+	}
+	return count
 }
 
 func (o *Object) Get(tag core.Tag) (core.Element, bool) {
@@ -138,6 +202,47 @@ func (o *Object) GetRaw(tag core.Tag) ([]byte, bool) {
 		return nil, false
 	}
 	return core.CloneBytes(raw), true
+}
+
+// CopyValueTo streams the raw encoded value bytes of the element identified by tag
+// into w.
+//
+// Lifecycle & concurrency:
+//
+//   - CopyValueTo is not safe for concurrent use with other Object methods.
+//   - If the element was skipped during parsing, CopyValueTo requires that the
+//     Object was built by a reader API such as ReadFileWithOptions,
+//     ReadDataSetWithOptions, or OpenDataSetWithOptions over a seekable input
+//     source with an attached valueProvider.
+//   - For skipped values, CopyValueTo may reparse the underlying stream and does
+//     not preserve any parser progress.
+//
+// If the element was materialized in memory, CopyValueTo copies from its RawValue.
+// If the element value was skipped during parsing (e.g., because
+// ReadFileOptions.InlineValueBytesThreshold was exceeded), CopyValueTo can still
+// succeed when the Object was built by a reader that provides a seekable input
+// source and a valueProvider.
+func (o *Object) CopyValueTo(tag core.Tag, w io.Writer) (int64, error) {
+	if o == nil {
+		return 0, fmt.Errorf("dicom: nil object")
+	}
+	elem, ok := o.Get(tag)
+	if !ok {
+		return 0, fmt.Errorf("dicom: missing element %s", tag)
+	}
+	if raw, ok := elem.RawBytes(); ok {
+		return io.Copy(w, bytes.NewReader(raw))
+	}
+	if elem.Value != nil {
+		return 0, fmt.Errorf("dicom: element %s value is not a raw byte payload", tag)
+	}
+	if o.ambiguousDeferred[tag] {
+		return 0, fmt.Errorf("dicom: deferred value for element %s is ambiguous due to duplicate tags", tag)
+	}
+	if o.valueProvider == nil {
+		return 0, fmt.Errorf("dicom: no value provider available for element %s", tag)
+	}
+	return o.valueProvider.CopyValueTo(tag, w)
 }
 
 func (o *Object) GetString(tag core.Tag) (string, bool) {

@@ -29,6 +29,10 @@ func BenchmarkReadFile(b *testing.B) {
 				}
 			}
 		})
+
+		b.Run(fixture.name+"_streaming_threshold", func(b *testing.B) {
+			b.Skip("streaming/threshold benchmarks are covered at the parser layer; object-level fixture needs a larger Pixel Data payload to meaningfully exercise the skip path")
+		})
 	}
 }
 

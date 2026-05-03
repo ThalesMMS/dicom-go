@@ -40,6 +40,27 @@ func BenchmarkReaderNext(b *testing.B) {
 				}
 			}
 		})
+
+		b.Run(fixture.name+"_streaming_threshold", func(b *testing.B) {
+			b.ReportAllocs()
+			b.ResetTimer()
+
+			for i := 0; i < b.N; i++ {
+				reader := NewReader(bytes.NewReader(fixture.data), fixture.syntax, ReaderOptions{
+					Dictionary:               fixture.dict,
+					InlineValueBytesThreshold: 8, // tiny threshold to force skip path for Pixel Data/OB values
+				})
+				for {
+					_, err := reader.Next()
+					if errorsIsEOF(err) {
+						break
+					}
+					if err != nil {
+						b.Fatal(err)
+					}
+				}
+			}
+		})
 	}
 }
 
@@ -54,6 +75,21 @@ func BenchmarkReadDataSet(b *testing.B) {
 
 			for i := 0; i < b.N; i++ {
 				reader := NewReader(bytes.NewReader(fixture.data), fixture.syntax, ReaderOptions{Dictionary: fixture.dict})
+				if _, err := reader.ReadDataSet(); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+
+		b.Run(fixture.name+"_streaming_threshold", func(b *testing.B) {
+			b.ReportAllocs()
+			b.ResetTimer()
+
+			for i := 0; i < b.N; i++ {
+				reader := NewReader(bytes.NewReader(fixture.data), fixture.syntax, ReaderOptions{
+					Dictionary:               fixture.dict,
+					InlineValueBytesThreshold: 8,
+				})
 				if _, err := reader.ReadDataSet(); err != nil {
 					b.Fatal(err)
 				}

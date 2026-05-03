@@ -64,6 +64,126 @@ func TestReadAllFromMinimalFileElementStream(t *testing.T) {
 		t.Fatalf("expected EOF after ReadAll consumed stream, got %v", err)
 	}
 }
+
+func TestLargeDefinedLengthValueIsNotMaterializedAndReaderAdvances(t *testing.T) {
+	largeTag := core.NewTag(0x7FE1, 0x0010) // arbitrary non-sequence tag
+	patientNameTag := core.NewTag(0x0010, 0x0010)
+
+	large := bytes.Repeat([]byte{0xAB}, 32)
+	stream := bytes.Join([][]byte{
+		dicomtest.ExplicitLongHeaderBytes(binary.LittleEndian, largeTag, core.VROB, uint32(len(large))),
+		large,
+		dicomtest.EncodeElement(dicomtest.NewPNElement(patientNameTag, "AFTER"), transfer.ExplicitVRLittleEndian),
+	}, nil)
+
+	reader := NewReader(bytes.NewReader(stream), transfer.ExplicitVRLittleEndian, ReaderOptions{
+		Dictionary:                std.Dictionary,
+		InlineValueBytesThreshold: 8,
+	})
+
+	tok, err := reader.Next()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok.Kind != TokenElement {
+		t.Fatalf("first token kind = %v, want %v", tok.Kind, TokenElement)
+	}
+	if tok.Element.Tag() != largeTag {
+		t.Fatalf("first tag = %s, want %s", tok.Element.Tag(), largeTag)
+	}
+	if tok.Element.Value != nil {
+		t.Fatalf("large element value = %T, want nil", tok.Element.Value)
+	}
+
+	tok, err = reader.Next()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok.Element.Tag() != patientNameTag {
+		t.Fatalf("second tag = %s, want %s", tok.Element.Tag(), patientNameTag)
+	}
+	if got := tok.Element.StringValue(); got != "AFTER" {
+		t.Fatalf("patient name = %q, want %q", got, "AFTER")
+	}
+}
+
+func TestUTValueIsMaterializedWhenInlineThresholdSet(t *testing.T) {
+	tag := core.NewTag(0x0040, 0xA160)
+	nextTag := core.NewTag(0x7FE1, 0x0010)
+	value := []byte("REPORT")
+	stream := bytes.Join([][]byte{
+		dicomtest.ExplicitLongHeaderBytes(binary.LittleEndian, tag, core.VRUT, uint32(len(value))),
+		value,
+		dicomtest.EncodeElement(dicomtest.NewOBElement(nextTag, []byte{0x01, 0x02, 0x03, 0x04}), transfer.ExplicitVRLittleEndian),
+	}, nil)
+
+	reader := NewReader(bytes.NewReader(stream), transfer.ExplicitVRLittleEndian, ReaderOptions{
+		Dictionary:                std.Dictionary,
+		InlineValueBytesThreshold: 4,
+	})
+
+	tok, err := reader.Next()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok.Element.Tag() != tag {
+		t.Fatalf("first tag = %s, want %s", tok.Element.Tag(), tag)
+	}
+	raw, ok := tok.Element.RawBytes()
+	if !ok {
+		t.Fatalf("UT value = %T, want raw bytes", tok.Element.Value)
+	}
+	if !bytes.Equal(raw, value) {
+		t.Fatalf("UT raw value = % X, want % X", raw, value)
+	}
+
+	tok, err = reader.Next()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok.Element.Tag() != nextTag {
+		t.Fatalf("second tag = %s, want %s", tok.Element.Tag(), nextTag)
+	}
+}
+
+func TestNativePixelDataDefinedLengthNotMaterializedAndReaderAdvances(t *testing.T) {
+	pixelDataTag := core.TagPixelData
+	patientNameTag := core.NewTag(0x0010, 0x0010)
+
+	pixel := bytes.Repeat([]byte{0x11}, 64)
+	stream := bytes.Join([][]byte{
+		dicomtest.ExplicitLongHeaderBytes(binary.LittleEndian, pixelDataTag, core.VROB, uint32(len(pixel))),
+		pixel,
+		dicomtest.EncodeElement(dicomtest.NewPNElement(patientNameTag, "AFTER"), transfer.ExplicitVRLittleEndian),
+	}, nil)
+
+	reader := NewReader(bytes.NewReader(stream), transfer.ExplicitVRLittleEndian, ReaderOptions{
+		Dictionary:                std.Dictionary,
+		InlineValueBytesThreshold: 8,
+	})
+
+	tok, err := reader.Next()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok.Element.Tag() != pixelDataTag {
+		t.Fatalf("first tag = %s, want %s", tok.Element.Tag(), pixelDataTag)
+	}
+	if tok.Element.Value != nil {
+		t.Fatalf("pixel data value = %T, want nil", tok.Element.Value)
+	}
+
+	tok, err = reader.Next()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok.Element.Tag() != patientNameTag {
+		t.Fatalf("second tag = %s, want %s", tok.Element.Tag(), patientNameTag)
+	}
+	if got := tok.Element.StringValue(); got != "AFTER" {
+		t.Fatalf("patient name = %q, want %q", got, "AFTER")
+	}
+}
 func TestImplicitVRLittleEndianElement(t *testing.T) {
 	buf := dicomtest.ImplicitElement(
 		dicomtest.NewPNElement(core.NewTag(0x0010, 0x0010), "TEST"),
@@ -420,6 +540,39 @@ func TestReaderBaseOffsetShiftsReportedPosition(t *testing.T) {
 	want := baseOffset + int64(len(buf))
 	if pos := reader.Position(); pos != want {
 		t.Fatalf("Position() after read with BaseOffset = %d, want %d", pos, want)
+	}
+}
+func TestCopyElementValueToUsesSeekOriginSeparateFromBaseOffset(t *testing.T) {
+	const baseOffset = int64(132)
+	tag := core.NewTag(0x7FE0, 0x0010)
+	want := []byte{0x01, 0x02, 0x03, 0x04}
+	data := dicomtest.EncodeElement(dicomtest.NewOBElement(tag, want), transfer.ExplicitVRLittleEndian)
+	source := append(bytes.Repeat([]byte{0x00}, int(baseOffset)), data...)
+	section := io.NewSectionReader(bytes.NewReader(source), baseOffset, int64(len(data)))
+	reader := NewReader(section, transfer.ExplicitVRLittleEndian, ReaderOptions{
+		Dictionary:                std.Dictionary,
+		BaseOffset:                baseOffset,
+		InlineValueBytesThreshold: 1,
+	})
+
+	tok, err := reader.Next()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok.Element.Value != nil {
+		t.Fatalf("expected deferred value, got %T", tok.Element.Value)
+	}
+	if pos := reader.Position(); pos != baseOffset+int64(len(data)) {
+		t.Fatalf("Position() after deferred read = %d, want %d", pos, baseOffset+int64(len(data)))
+	}
+
+	var got bytes.Buffer
+	n, err := reader.CopyElementValueTo(tag, &got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != int64(len(want)) || !bytes.Equal(got.Bytes(), want) {
+		t.Fatalf("CopyElementValueTo copied %d bytes % X, want %d bytes % X", n, got.Bytes(), len(want), want)
 	}
 }
 func TestReaderBaseOffsetAppearsInParseError(t *testing.T) {

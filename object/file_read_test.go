@@ -5,14 +5,28 @@ import (
 	"encoding/binary"
 	"errors"
 	"github.com/ThalesMMS/dicom-go/core"
+	"github.com/ThalesMMS/dicom-go/dictionary"
 	"github.com/ThalesMMS/dicom-go/internal/dicomtest"
 	"github.com/ThalesMMS/dicom-go/parser"
 	"github.com/ThalesMMS/dicom-go/transfer"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
+
+type preservingDictionary struct {
+	name string
+}
+
+func (preservingDictionary) ByTag(core.Tag) (dictionary.Entry, bool) {
+	return dictionary.Entry{}, false
+}
+
+func (preservingDictionary) ByKeyword(string) (dictionary.Entry, bool) {
+	return dictionary.Entry{}, false
+}
 
 func TestReadFileWithMinimalSyntheticFixture(t *testing.T) {
 	file, err := ReadFile(bytes.NewReader(dicomtest.MinimalFile()))
@@ -362,6 +376,11 @@ func TestReadDataSetReadsRawExplicitVRLittleEndianDataSet(t *testing.T) {
 	}
 }
 func TestIntegrationReadMappings(t *testing.T) {
+	// Integration tests covering multiple read-path scenarios:
+	// - read data with preamble / auto-detect preamble
+	// - explicit VR LE without file meta / auto-detect without preamble
+	// - OB value with unknown length
+	//
 	// The Go API uses separate entry points instead of a single auto-detecting
 	// reader: ReadFile handles Part 10 streams with preamble, while ReadDataSet
 	// handles raw datasets without file meta.
@@ -471,6 +490,192 @@ func TestReadDataSetWithOptionsAppliesParserLimits(t *testing.T) {
 		t.Fatalf("expected ErrMaxElementBytesExceeded, got %v", err)
 	}
 }
+func TestReadDataSetWithOptionsDefersValuesWhenInlineThresholdSet(t *testing.T) {
+	tag := core.NewTag(0x7FE0, 0x0010)
+	want := []byte{0x01, 0x02, 0x03, 0x04}
+	data := dicomtest.EncodeElements(
+		transfer.ExplicitVRLittleEndian,
+		dicomtest.NewOBElement(tag, want),
+	)
+	path := filepath.Join(t.TempDir(), "raw.dcm")
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name string
+		read func() (*Object, error)
+	}{
+		{
+			name: "ReadDataSetWithOptions",
+			read: func() (*Object, error) {
+				return ReadDataSetWithOptions(bytes.NewReader(data), transfer.ExplicitVRLittleEndian, ReadFileOptions{
+					InlineValueBytesThreshold: 1,
+				})
+			},
+		},
+		{
+			name: "OpenDataSetWithOptions",
+			read: func() (*Object, error) {
+				return OpenDataSetWithOptions(path, transfer.ExplicitVRLittleEndian, ReadFileOptions{
+					InlineValueBytesThreshold: 1,
+				})
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			obj, err := tt.read()
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = obj.Close() })
+			elem, ok := obj.Get(tag)
+			if !ok {
+				t.Fatalf("missing element %s", tag)
+			}
+			if elem.Value != nil {
+				t.Fatalf("expected deferred nil value for %s before CopyValueTo, got %T", tag, elem.Value)
+			}
+
+			var got bytes.Buffer
+			n, err := obj.CopyValueTo(tag, &got)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if n != int64(len(want)) || !bytes.Equal(got.Bytes(), want) {
+				t.Fatalf("CopyValueTo copied %d bytes % X, want %d bytes % X", n, got.Bytes(), len(want), want)
+			}
+		})
+	}
+}
+func TestReadDataSetWithOptionsCloseClearsValueProvider(t *testing.T) {
+	tag := core.NewTag(0x7FE0, 0x0010)
+	want := []byte{0x01, 0x02, 0x03, 0x04}
+	data := dicomtest.EncodeElements(
+		transfer.ExplicitVRLittleEndian,
+		dicomtest.NewOBElement(tag, want),
+	)
+
+	obj, err := ReadDataSetWithOptions(bytes.NewReader(data), transfer.ExplicitVRLittleEndian, ReadFileOptions{
+		InlineValueBytesThreshold: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var got bytes.Buffer
+	if _, err := obj.CopyValueTo(tag, &got); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got.Bytes(), want) {
+		t.Fatalf("CopyValueTo copied % X, want % X", got.Bytes(), want)
+	}
+
+	if err := obj.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	if _, err := obj.CopyValueTo(tag, &bytes.Buffer{}); err == nil {
+		t.Fatal("CopyValueTo after Object.Close(): expected error, got nil")
+	} else if !strings.Contains(err.Error(), "no value provider") {
+		t.Fatalf("CopyValueTo after Object.Close() error = %v, want no value provider", err)
+	}
+}
+func TestReadDataSetWithOptionsRejectsDeferredDuplicateTagReplay(t *testing.T) {
+	tag := core.NewTag(0x7FE0, 0x0010)
+	first := []byte{0x01, 0x02, 0x03, 0x04}
+	second := []byte{0x05, 0x06, 0x07, 0x08}
+	data := dicomtest.EncodeElements(
+		transfer.ExplicitVRLittleEndian,
+		dicomtest.NewOBElement(tag, first),
+		dicomtest.NewOBElement(tag, second),
+	)
+
+	obj, err := ReadDataSetWithOptions(bytes.NewReader(data), transfer.ExplicitVRLittleEndian, ReadFileOptions{
+		InlineValueBytesThreshold: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	elem, ok := obj.Get(tag)
+	if !ok {
+		t.Fatalf("missing element %s", tag)
+	}
+	if elem.Value != nil {
+		t.Fatalf("expected deferred duplicate value for %s, got %T", tag, elem.Value)
+	}
+	if obj.valueProvider != nil {
+		t.Fatal("duplicate deferred tag should not attach a tag-only valueProvider")
+	}
+
+	var got bytes.Buffer
+	_, err = obj.CopyValueTo(tag, &got)
+	if err == nil {
+		t.Fatal("CopyValueTo on deferred duplicate tag: expected error, got nil")
+	}
+	if bytes.Equal(got.Bytes(), first) {
+		t.Fatalf("CopyValueTo returned first duplicate bytes % X for ambiguous tag", got.Bytes())
+	}
+	if !strings.Contains(err.Error(), "ambiguous") {
+		t.Fatalf("CopyValueTo duplicate error = %v, want ambiguous", err)
+	}
+}
+func TestReadDataSetWithOptionsMaterializesSequenceItemValuesWhenInlineThresholdSet(t *testing.T) {
+	seqTag := core.NewTag(0x0008, 0x1111)
+	valueTag := core.NewTag(0x7FE0, 0x0010)
+	want := []byte{0x01, 0x02, 0x03, 0x04}
+	data := dicomtest.EncodeElements(
+		transfer.ExplicitVRLittleEndian,
+		dicomtest.NewSequenceElement(seqTag, core.DataSet{
+			Elements: []core.Element{dicomtest.NewOBElement(valueTag, want)},
+		}),
+	)
+
+	obj, err := ReadDataSetWithOptions(bytes.NewReader(data), transfer.ExplicitVRLittleEndian, ReadFileOptions{
+		InlineValueBytesThreshold: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if obj.deferredCount != 0 {
+		t.Fatalf("deferredCount = %d, want 0 for sequence item values", obj.deferredCount)
+	}
+	items, ok := obj.GetSequence(seqTag)
+	if !ok || len(items) != 1 {
+		t.Fatalf("GetSequence(%s) returned %d items, ok=%v; want 1 item", seqTag, len(items), ok)
+	}
+	elem, ok := items[0].Get(valueTag)
+	if !ok {
+		t.Fatalf("missing item element %s", valueTag)
+	}
+	if elem.Value == nil {
+		t.Fatalf("expected item element %s to be materialized", valueTag)
+	}
+
+	var got bytes.Buffer
+	n, err := items[0].CopyValueTo(valueTag, &got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != int64(len(want)) || !bytes.Equal(got.Bytes(), want) {
+		t.Fatalf("CopyValueTo copied %d bytes % X, want %d bytes % X", n, got.Bytes(), len(want), want)
+	}
+}
+func TestReadDataSetWithOptionsPreservesConfiguredObjectDictionary(t *testing.T) {
+	data := dicomtest.EncodeElements(transfer.ExplicitVRLittleEndian, dicomtest.MinimalDataset()...)
+	dict := preservingDictionary{name: "dataset"}
+
+	obj, err := ReadDataSetWithOptions(bytes.NewReader(data), transfer.ExplicitVRLittleEndian, ReadFileOptions{
+		Dictionary: dict,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if obj.dict != dict {
+		t.Fatalf("Object dictionary = %#v, want %#v", obj.dict, dict)
+	}
+}
 func TestReadDataSetRejectsDeflatedTransferSyntax(t *testing.T) {
 	data := dicomtest.EncodeElements(transfer.ExplicitVRLittleEndian, dicomtest.MinimalDataset()...)
 
@@ -540,6 +745,26 @@ func TestOpenDataSetReadsRawDataSetFromPath(t *testing.T) {
 		t.Fatalf("unexpected patient id: %q ok=%v", got, ok)
 	}
 }
+func TestOpenDataSetWithOptionsDoesNotKeepSourceWithoutDeferredValues(t *testing.T) {
+	data := dicomtest.EncodeElements(transfer.ExplicitVRLittleEndian, dicomtest.MinimalDataset()...)
+	path := filepath.Join(t.TempDir(), "raw.dcm")
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	obj, err := OpenDataSetWithOptions(path, transfer.ExplicitVRLittleEndian, ReadFileOptions{
+		InlineValueBytesThreshold: 1 << 20,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if obj.valueProvider != nil {
+		t.Fatal("unexpected valueProvider without deferred values")
+	}
+	if obj.source != nil {
+		t.Fatal("OpenDataSetWithOptions retained source without deferred values")
+	}
+}
 func TestReadFileWithZeroValuedOptionsPreservesValidFileCompatibility(t *testing.T) {
 	data := dicomtest.MinimalFile()
 
@@ -566,6 +791,93 @@ func TestReadFileWithExplicitHighLimitsPreservesValidFileCompatibility(t *testin
 
 	requireMinimalFile(t, file)
 }
+func TestReadFileWithOptionsPreservesConfiguredObjectDictionaries(t *testing.T) {
+	data := dicomtest.MinimalFile()
+	datasetDict := preservingDictionary{name: "dataset"}
+	metaDict := preservingDictionary{name: "meta"}
+
+	file, err := ReadFileWithOptions(bytes.NewReader(data), ReadFileOptions{
+		Dictionary:         datasetDict,
+		FileMetaDictionary: metaDict,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if file.Dataset.dict != datasetDict {
+		t.Fatalf("Dataset dictionary = %#v, want %#v", file.Dataset.dict, datasetDict)
+	}
+	if file.Meta.dict != metaDict {
+		t.Fatalf("Meta dictionary = %#v, want %#v", file.Meta.dict, metaDict)
+	}
+}
+func TestReadFileWithOptionsStreamsSkippedValueFromSeekableSource(t *testing.T) {
+	tag := core.NewTag(0x7FE0, 0x0010)
+	want := bytes.Repeat([]byte{0xAB}, 128)
+	data, err := dicomtest.Part10File(
+		transfer.ExplicitVRLittleEndian,
+		append(dicomtest.MinimalDataset(), dicomtest.NewOBElement(tag, want))...,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	file, err := ReadFileWithOptions(bytes.NewReader(data), ReadFileOptions{
+		InlineValueBytesThreshold: 64,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	elem, ok := file.Dataset.Get(tag)
+	if !ok {
+		t.Fatalf("missing element %s", tag)
+	}
+	if elem.Value != nil {
+		t.Fatalf("expected %s to be skipped, got value type %T", tag, elem.Value)
+	}
+
+	var got bytes.Buffer
+	n, err := file.Dataset.CopyValueTo(tag, &got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != int64(len(want)) || !bytes.Equal(got.Bytes(), want) {
+		t.Fatalf("CopyValueTo copied %d bytes % X, want %d bytes % X", n, got.Bytes(), len(want), want)
+	}
+}
+func TestReadFileWithOptionsMaterializesValueFromNonSeekableSource(t *testing.T) {
+	tag := core.NewTag(0x7FE0, 0x0010)
+	want := bytes.Repeat([]byte{0xAB}, 128)
+	data, err := dicomtest.Part10File(
+		transfer.ExplicitVRLittleEndian,
+		append(dicomtest.MinimalDataset(), dicomtest.NewOBElement(tag, want))...,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	file, err := ReadFileWithOptions(bytes.NewBuffer(data), ReadFileOptions{
+		InlineValueBytesThreshold: 64,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	elem, ok := file.Dataset.Get(tag)
+	if !ok {
+		t.Fatalf("missing element %s", tag)
+	}
+	if elem.Value == nil {
+		t.Fatalf("expected %s to be materialized for non-seekable ReadFileWithOptions source", tag)
+	}
+
+	var got bytes.Buffer
+	n, err := file.Dataset.CopyValueTo(tag, &got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != int64(len(want)) || !bytes.Equal(got.Bytes(), want) {
+		t.Fatalf("CopyValueTo copied %d bytes % X, want %d bytes % X", n, got.Bytes(), len(want), want)
+	}
+}
 func TestOpenFileReadsMinimalPart10FromDisk(t *testing.T) {
 	t.Parallel()
 
@@ -580,6 +892,100 @@ func TestOpenFileReadsMinimalPart10FromDisk(t *testing.T) {
 	}
 
 	requireMinimalFile(t, file)
+}
+func TestOpenFileWithOptionsKeepsLazySourceOpen(t *testing.T) {
+	tag := core.NewTag(0x7FE0, 0x0010)
+	want := bytes.Repeat([]byte{0xAB}, 128)
+	data, err := dicomtest.Part10File(
+		transfer.ExplicitVRLittleEndian,
+		append(dicomtest.MinimalDataset(), dicomtest.NewOBElement(tag, want))...,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "lazy.dcm")
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	file, err := OpenFileWithOptions(path, ReadFileOptions{
+		InlineValueBytesThreshold: 64,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := file.Close(); err != nil {
+			t.Fatalf("Close() error = %v", err)
+		}
+	}()
+
+	var got bytes.Buffer
+	n, err := file.Dataset.CopyValueTo(tag, &got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != int64(len(want)) || !bytes.Equal(got.Bytes(), want) {
+		t.Fatalf("CopyValueTo copied %d bytes % X, want %d bytes % X", n, got.Bytes(), len(want), want)
+	}
+}
+func TestOpenFileWithOptionsDoesNotKeepSourceWithoutDeferredValues(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "minimal.dcm")
+	if err := os.WriteFile(path, dicomtest.MinimalFile(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	file, err := OpenFileWithOptions(path, ReadFileOptions{
+		InlineValueBytesThreshold: 1 << 20,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if file.Dataset.valueProvider != nil {
+		t.Fatal("unexpected valueProvider without deferred values")
+	}
+	if file.source != nil {
+		t.Fatal("OpenFileWithOptions retained source without deferred values")
+	}
+}
+func TestOpenFileWithOptionsLazySourceFailsAfterClose(t *testing.T) {
+	tag := core.NewTag(0x7FE0, 0x0010)
+	want := bytes.Repeat([]byte{0xAB}, 128)
+	data, err := dicomtest.Part10File(
+		transfer.ExplicitVRLittleEndian,
+		append(dicomtest.MinimalDataset(), dicomtest.NewOBElement(tag, want))...,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "lazy-close.dcm")
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	file, err := OpenFileWithOptions(path, ReadFileOptions{
+		InlineValueBytesThreshold: 64,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = file.Close() })
+
+	var got bytes.Buffer
+	n, err := file.Dataset.CopyValueTo(tag, &got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != int64(len(want)) || !bytes.Equal(got.Bytes(), want) {
+		t.Fatalf("CopyValueTo copied %d bytes % X, want %d bytes % X", n, got.Bytes(), len(want), want)
+	}
+
+	if err := file.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	if _, err := file.Dataset.CopyValueTo(tag, &bytes.Buffer{}); err == nil {
+		t.Fatal("CopyValueTo after file.Close(): expected error, got nil")
+	}
 }
 func TestOpenFileReturnsOSErrorForMissingPath(t *testing.T) {
 	t.Parallel()

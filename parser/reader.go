@@ -1,6 +1,7 @@
 package parser
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -44,6 +45,16 @@ type ReaderOptions struct {
 	// bytes. Use it to reject suspiciously large values before allocating
 	// memory. A zero value means unlimited.
 	MaxElementBytes int64
+	// InlineValueBytesThreshold controls when the reader will materialize a
+	// defined-length primitive value into memory.
+	//
+	// If InlineValueBytesThreshold is > 0 and a primitive element has a defined
+	// length strictly greater than this threshold, the reader will not allocate a
+	// value buffer and will instead return an element token with a nil Value.
+	//
+	// A zero value preserves the historical behavior of always materializing
+	// defined-length primitive values (subject to MaxElementBytes).
+	InlineValueBytesThreshold int64
 	// MaxTotalBytes limits the total number of bytes consumed from the source.
 	// Use it to bound parser work on untrusted input. A zero value means
 	// unlimited.
@@ -72,6 +83,7 @@ type Reader struct {
 	dec                 dicomenc.BasicDecoder
 	dict                dictionary.DataDictionary
 	maxElementBytes     int64
+	inlineThreshold     int64
 	maxTotalBytes       int64
 	maxSequenceDepth    int
 	maxElements         int
@@ -85,16 +97,26 @@ type Reader struct {
 	seqDelimiters                   []seqToken
 	delimiterCheckPending           bool
 	pixelSequenceOffsetTablePending bool
+
+	baseOffset int64
+	rootOffset int64
 }
 
 func NewReader(r io.Reader, syntax transfer.Syntax, opts ReaderOptions) *Reader {
 	cr := &countingReader{r: r, pos: opts.BaseOffset, maxTotalBytes: opts.MaxTotalBytes}
+	rootOffset := int64(0)
+	if seeker, ok := r.(io.Seeker); ok {
+		if pos, err := seeker.Seek(0, io.SeekCurrent); err == nil {
+			rootOffset = pos
+		}
+	}
 	return &Reader{
 		counter:             cr,
 		syntax:              syntax,
 		dec:                 dicomenc.NewBasicDecoder(syntax.ByteOrder),
 		dict:                opts.Dictionary,
 		maxElementBytes:     opts.MaxElementBytes,
+		inlineThreshold:     opts.InlineValueBytesThreshold,
 		maxTotalBytes:       opts.MaxTotalBytes,
 		maxSequenceDepth:    opts.MaxSequenceDepth,
 		maxElements:         opts.MaxElements,
@@ -102,6 +124,8 @@ func NewReader(r io.Reader, syntax transfer.Syntax, opts ReaderOptions) *Reader 
 		strictReservedBytes: opts.StrictReservedBytes,
 		oddLengthPolicy:     opts.OddLengthPolicy,
 		seqDelimiters:       make([]seqToken, 0),
+		baseOffset:          opts.BaseOffset,
+		rootOffset:          rootOffset,
 	}
 }
 
@@ -147,6 +171,86 @@ func (r *Reader) Position() int64 {
 		return 0
 	}
 	return r.counter.Position()
+}
+
+// CopyElementValueTo streams the raw encoded bytes of the first occurrence of tag
+// from a seekable source.
+//
+// Lifecycle & concurrency:
+//
+//   - CopyElementValueTo is not safe for concurrent use with other Reader methods.
+//   - The Reader must have been created over an io.ReadSeeker.
+//   - The Reader is rewound to its rootOffset and reparsed; any prior parsing
+//     progress is discarded.
+//
+// It reparses the data set from the reader rootOffset and writes the matching
+// element value to w without materializing it in memory.
+func (r *Reader) CopyElementValueTo(tag core.Tag, w io.Writer) (int64, error) {
+	if r == nil || r.counter == nil {
+		return 0, fmt.Errorf("dicom: nil reader")
+	}
+	rs, ok := r.counter.r.(io.ReadSeeker)
+	if !ok {
+		return 0, fmt.Errorf("dicom: underlying reader is not seekable")
+	}
+	if _, err := rs.Seek(r.rootOffset, io.SeekStart); err != nil {
+		return 0, err
+	}
+	// Reset parser state for a fresh scan.
+	r.counter.pos = r.baseOffset
+	r.seqDelimiters = r.seqDelimiters[:0]
+	r.delimiterCheckPending = false
+	r.pixelSequenceOffsetTablePending = false
+	r.elementCount = 0
+	r.fragmentCount = 0
+
+	for {
+		okTok, err := r.Next()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return 0, fmt.Errorf("dicom: element %s not found", tag)
+			}
+			return 0, err
+		}
+		if okTok.Kind != TokenElement {
+			continue
+		}
+		elem := okTok.Element
+		if elem.Tag() != tag {
+			continue
+		}
+		if elem.Header.Length == core.UndefinedLength {
+			return 0, fmt.Errorf("dicom: element %s has undefined length", tag)
+		}
+		// Value has already been read/consumed by Next() at this point.
+		// If it was materialized, we can copy from memory.
+		if raw, ok := elem.RawBytes(); ok {
+			return io.Copy(w, bytes.NewReader(raw))
+		}
+		// Otherwise, this element was parsed in skip-large-values mode. To stream it
+		// without allocation, re-read it from the seekable source. At this point the
+		// reader cursor is positioned immediately after the value.
+		valueEnd := r.Position()
+		valueStart := valueEnd - int64(elem.Header.Length)
+		if valueStart < r.baseOffset {
+			return 0, fmt.Errorf("dicom: invalid element %s value position", tag)
+		}
+		valueStartSeek := r.rootOffset + (valueStart - r.baseOffset)
+		valueEndSeek := r.rootOffset + (valueEnd - r.baseOffset)
+		if _, err := rs.Seek(valueStartSeek, io.SeekStart); err != nil {
+			return 0, err
+		}
+		copied, err := io.CopyN(w, rs, int64(elem.Header.Length))
+		if err != nil {
+			return copied, err
+		}
+		// Restore cursor to the end of the value to keep the reader usable after this call.
+		if _, err := rs.Seek(valueEndSeek, io.SeekStart); err != nil {
+			return copied, err
+		}
+		r.counter.pos = valueEnd
+		return copied, nil
+	}
 }
 
 func (r *Reader) Next() (Token, error) {
@@ -250,6 +354,14 @@ func (r *Reader) ReadDataSet() (core.DataSet, error) {
 }
 
 func (r *Reader) collectElements(inItem bool) ([]core.Element, error) {
+	if inItem && r.inlineThreshold > 0 {
+		inlineThreshold := r.inlineThreshold
+		r.inlineThreshold = 0
+		defer func() {
+			r.inlineThreshold = inlineThreshold
+		}()
+	}
+
 	var elements []core.Element
 	for {
 		tok, err := r.Next()
@@ -804,6 +916,36 @@ func (r *Reader) validateDefinedValueLength(header core.ElementHeader) error {
 	}
 }
 
+func (r *Reader) skipN(offset int64, header core.ElementHeader, n int64) error {
+	if n == 0 {
+		return nil
+	}
+	if n < 0 {
+		return &ParseError{
+			Op:     OpReadValue,
+			Offset: offset,
+			Tag:    header.Tag,
+			VR:     header.VR,
+			Length: header.Length,
+			Err:    fmt.Errorf("cannot skip negative length %d", n),
+		}
+	}
+	// io.CopyN returns nil when exactly n bytes were copied; otherwise it returns
+	// an error (including EOF). We normalize EOF into UnexpectedEOF if we've
+	// advanced at all.
+	if _, err := io.CopyN(io.Discard, r.counter, n); err != nil {
+		return &ParseError{
+			Op:     OpReadValue,
+			Offset: offset,
+			Tag:    header.Tag,
+			VR:     header.VR,
+			Length: header.Length,
+			Err:    normalizeReadError(offset, r.Position(), err),
+		}
+	}
+	return nil
+}
+
 func (r *Reader) readDefinedValueToken(header core.ElementHeader) (Token, error) {
 	if err := r.validateDefinedValueLength(header); err != nil {
 		return Token{}, err
@@ -828,8 +970,43 @@ func (r *Reader) readDefinedValueToken(header core.ElementHeader) (Token, error)
 			Err:    fmt.Errorf("%w: got %d, limit %d", ErrMaxElementsExceeded, r.elementCount+1, r.maxElements),
 		}
 	}
-	data := make([]byte, int(header.Length))
 	valueOffset := r.Position()
+	if r.inlineThreshold > 0 && int64(header.Length) > r.inlineThreshold && header.VR != core.VRUT {
+		// Large defined-length primitive.
+		//
+		// We only support skipping/streaming raw bytes for VRs where consumers can
+		// reasonably interpret the bytes without additional parsing/decoding.
+		//
+		// This includes the typical "byte blob" VRs and native (defined-length)
+		// Pixel Data.
+		switch header.VR {
+		case core.VROB, core.VROW, core.VROF, core.VROD, core.VRUN:
+			// ok
+		default:
+			return Token{}, &ParseError{
+				Op:     OpReadValue,
+				Offset: valueOffset,
+				Tag:    header.Tag,
+				VR:     header.VR,
+				Length: header.Length,
+				Err:    fmt.Errorf("dicom: refusing to skip/stream large defined-length value for VR %s", header.VR),
+			}
+		}
+		if err := r.skipN(valueOffset, header, int64(header.Length)); err != nil {
+			return Token{}, err
+		}
+		r.elementCount++
+		r.delimiterCheckPending = true
+		return Token{
+			Kind:   TokenElement,
+			Header: header,
+			Element: core.Element{
+				Header: header,
+				Value:  nil,
+			},
+		}, nil
+	}
+	data := make([]byte, int(header.Length))
 	if _, err := io.ReadFull(r.counter, data); err != nil {
 		return Token{}, &ParseError{
 			Op:     OpReadValue,

@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project uses Go module semantic version tags.
 
+## [Unreleased]
+
+### Added
+
+- DIMSE Query/Retrieve: Study Root C-MOVE SCU implementation with status handling
+  and a small `dicom-go-retrieve` CLI for interoperability testing.
+- DIMSE Storage Commitment Push Model primitives: N-ACTION and N-EVENT-REPORT,
+  including status classification helpers and transaction UID correlation helper.
+- Documentation: Query/Retrieve and Storage Commitment design notes, conformance
+  scope updates, and Orthanc interop setup guide.
+
+### Changed
+
+- Conformance and README limitations updated to reflect newly added DIMSE
+  capabilities and remaining non-goals.
+
 ## [0.1.0] - 2026-04-24
 
 Initial public release of `dicom-go`.

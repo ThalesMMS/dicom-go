@@ -2,12 +2,6 @@
 
 Contributions should keep the repository testable and predictable before expanding DICOM coverage.
 
-## Reference mapping
-
-Before implementing an issue, review the relevant design specifications and reference materials.
-
-Map behavior, contracts, and relevant test cases to idiomatic Go.
-
 ## Local workflow
 
 Use Go 1.22 or newer and run the standardized targets from the repository root:
@@ -52,5 +46,5 @@ make check
 
 - Follow [.github/pull_request_template.md](.github/pull_request_template.md) as the canonical pull request template. Include a brief summary of the change and link the relevant issue.
 - Complete the interface-governance checklist whenever a change affects contracts, fingerprints, checkpoints, or exported summaries.
-- Document any intentional design decisions in the pull request description.
+- Document any intentional design decisions or divergences from the DICOM standard in the pull request description.
 - Avoid introducing new DICOM functionality in infra-only issues.

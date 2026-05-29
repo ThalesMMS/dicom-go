@@ -1,9 +1,12 @@
 package dicomjson
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"fmt"
+	"io"
 	"math"
 	"sort"
 	"strings"
@@ -13,6 +16,7 @@ import (
 	"github.com/ThalesMMS/dicom-go/dictionary/std"
 	"github.com/ThalesMMS/dicom-go/internal/dicomtest"
 	"github.com/ThalesMMS/dicom-go/object"
+	"github.com/ThalesMMS/dicom-go/transfer"
 )
 
 func TestMarshalSerializesStringLikeVR(t *testing.T) {
@@ -49,6 +53,456 @@ func TestMarshalSerializesBinaryVRAsInlineBinary(t *testing.T) {
 	if string(got) != want {
 		t.Fatalf("Marshal() = %s, want %s", got, want)
 	}
+}
+
+func TestMarshalPreservesEncapsulatedPixelDataValueField(t *testing.T) {
+	pixel := dicomtest.NewFragmentSequenceElement(
+		core.TagPixelData,
+		[]byte{0x00, 0x00, 0x00, 0x00},
+		[]byte{0xAA, 0xBB, 0xCC},
+		[]byte{0x10, 0x20, 0x30, 0x40},
+	)
+	encoded := dicomtest.EncodeElement(pixel, transfer.JPEGBaseline)
+	const explicitLongHeaderLength = 12
+	wantValueField := encoded[explicitLongHeaderLength:]
+
+	deferred, err := object.ReadDataSetWithOptions(bytes.NewReader(encoded), transfer.JPEGBaseline, object.ReadFileOptions{
+		DeferPixelData: true,
+	})
+	if err != nil {
+		t.Fatalf("ReadDataSetWithOptions() error = %v", err)
+	}
+	t.Cleanup(func() { _ = deferred.Close() })
+
+	for _, test := range []struct {
+		name string
+		obj  *object.Object
+	}{
+		{name: "materialized fragments", obj: object.FromElements([]core.Element{pixel}, std.Dictionary)},
+		{name: "deferred fragments", obj: deferred},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var streamed []byte
+			bulkJSON, err := Marshal(test.obj, Options{
+				Pretty: false,
+				PixelDataBulkDataURIFunc: func(tag core.Tag, vr core.VR, open func() (io.ReadCloser, error)) (string, error) {
+					reader, err := open()
+					if err != nil {
+						return "", err
+					}
+					defer reader.Close()
+					streamed, err = io.ReadAll(reader)
+					return "https://example.test/pixel-data", err
+				},
+			})
+			if err != nil {
+				t.Fatalf("streaming Marshal() error = %v", err)
+			}
+			if !bytes.Equal(streamed, wantValueField) {
+				t.Fatalf("streamed Pixel Data = % X, want % X", streamed, wantValueField)
+			}
+			if !bytes.Contains(bulkJSON, []byte(`"BulkDataURI":"https://example.test/pixel-data"`)) {
+				t.Fatalf("streaming Marshal() = %s, want BulkDataURI", bulkJSON)
+			}
+
+			encodedJSON, err := MarshalCompact(test.obj)
+			if err != nil {
+				t.Fatalf("MarshalCompact() error = %v", err)
+			}
+			var decoded map[string]Element
+			if err := json.Unmarshal(encodedJSON, &decoded); err != nil {
+				t.Fatalf("json.Unmarshal() error = %v", err)
+			}
+			gotValueField, err := base64.StdEncoding.DecodeString(decoded["7FE00010"].InlineBinary)
+			if err != nil {
+				t.Fatalf("InlineBinary is not base64: %v", err)
+			}
+			if !bytes.Equal(gotValueField, wantValueField) {
+				t.Fatalf("InlineBinary Value Field = % X, want % X", gotValueField, wantValueField)
+			}
+		})
+	}
+}
+
+func TestMarshalStreamsDeferredPrimitiveValue(t *testing.T) {
+	tag := core.NewTag(0x0011, 0x1010)
+	want := []byte{0x01, 0x02, 0x03, 0x04}
+	encoded := dicomtest.EncodeElement(core.NewRawElement(tag, core.VROB, want), transfer.ExplicitVRLittleEndian)
+	obj, err := object.ReadDataSetWithOptions(bytes.NewReader(encoded), transfer.ExplicitVRLittleEndian, object.ReadFileOptions{
+		InlineValueBytesThreshold: 1,
+	})
+	if err != nil {
+		t.Fatalf("ReadDataSetWithOptions() error = %v", err)
+	}
+	t.Cleanup(func() { _ = obj.Close() })
+
+	encodedJSON, err := MarshalCompact(obj)
+	if err != nil {
+		t.Fatalf("MarshalCompact() error = %v", err)
+	}
+	var decoded map[string]Element
+	if err := json.Unmarshal(encodedJSON, &decoded); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+	got, err := base64.StdEncoding.DecodeString(decoded[tag.HexString()].InlineBinary)
+	if err != nil || !bytes.Equal(got, want) {
+		t.Fatalf("InlineBinary = % X, %v; want % X", got, err, want)
+	}
+}
+
+func TestMarshalRejectsInvalidFragmentOffsetTable(t *testing.T) {
+	pixel := dicomtest.NewFragmentSequenceElement(core.TagPixelData, []byte{0x01})
+	obj := object.FromElements([]core.Element{pixel}, std.Dictionary)
+
+	_, err := MarshalCompact(obj)
+	if err == nil || !strings.Contains(err.Error(), "Basic Offset Table length 1 is not a multiple of 4") {
+		t.Fatalf("MarshalCompact() error = %v, want invalid Basic Offset Table length", err)
+	}
+}
+
+func TestMarshalRejectsUnavailableDeferredValueButAllowsExplicitEmptyValue(t *testing.T) {
+	tag := core.NewTag(0x0011, 0x1010)
+	missing := object.FromElements([]core.Element{{
+		Header: core.ElementHeader{Tag: tag, VR: core.VROB, Length: 4, LengthSet: true},
+		Value:  nil,
+	}}, std.Dictionary)
+	if _, err := MarshalCompact(missing); err == nil || !strings.Contains(err.Error(), "no value provider") {
+		t.Fatalf("MarshalCompact(missing deferred) error = %v, want no value provider", err)
+	}
+
+	empty := object.FromElements([]core.Element{{
+		Header: core.ElementHeader{Tag: tag, VR: core.VROB, Length: 0, LengthSet: true},
+		Value:  nil,
+	}}, std.Dictionary)
+	got, err := MarshalCompact(empty)
+	if err != nil {
+		t.Fatalf("MarshalCompact(empty) error = %v", err)
+	}
+	const want = `{"00111010":{"vr":"OB"}}`
+	if string(got) != want {
+		t.Fatalf("MarshalCompact(empty) = %s, want %s", got, want)
+	}
+}
+
+func TestMarshalSerializesVRValueMatrix(t *testing.T) {
+	tests := []struct {
+		name       string
+		element    core.Element
+		wantValue  []any
+		wantInline []byte
+	}{
+		{
+			name:      "AE string",
+			element:   dicomtest.NewStringElement(core.NewTag(0x0008, 0x0054), core.VRAE, "DEST_AE"),
+			wantValue: []any{"DEST_AE"},
+		},
+		{
+			name:      "AS string",
+			element:   dicomtest.NewStringElement(core.NewTag(0x0010, 0x1010), core.VRAS, "042Y"),
+			wantValue: []any{"042Y"},
+		},
+		{
+			name:      "CS string",
+			element:   dicomtest.NewStringElement(core.NewTag(0x0008, 0x0060), core.VRCS, "OT"),
+			wantValue: []any{"OT"},
+		},
+		{
+			name:      "DA string",
+			element:   dicomtest.NewStringElement(core.NewTag(0x0010, 0x0030), core.VRDA, "20240604"),
+			wantValue: []any{"20240604"},
+		},
+		{
+			name:      "DS numeric string",
+			element:   dicomtest.NewStringElement(core.NewTag(0x0018, 0x1063), core.VRDS, "1.5"),
+			wantValue: []any{"1.5"},
+		},
+		{
+			name:      "DT string",
+			element:   dicomtest.NewStringElement(core.NewTag(0x0008, 0x002A), core.VRDT, "20240604123000"),
+			wantValue: []any{"20240604123000"},
+		},
+		{
+			name:      "AT tag list",
+			element:   core.NewRawElement(core.NewTag(0x0008, 0x0008), core.VRAT, rawATValues(core.NewTag(0x0010, 0x0010), core.TagPixelData)),
+			wantValue: []any{"00100010", "7FE00010"},
+		},
+		{
+			name:      "FL float32",
+			element:   core.NewRawElement(core.NewTag(0x0018, 0x1160), core.VRFL, rawFloat32Values(1.5, -2.25)),
+			wantValue: []any{1.5, -2.25},
+		},
+		{
+			name:      "FD float64",
+			element:   core.NewRawElement(core.NewTag(0x0018, 0x1164), core.VRFD, rawFloat64Values(3.5, -4.75)),
+			wantValue: []any{3.5, -4.75},
+		},
+		{
+			name:      "IS integer string",
+			element:   dicomtest.NewStringElement(core.NewTag(0x0020, 0x0013), core.VRIS, "7"),
+			wantValue: []any{"7"},
+		},
+		{
+			name:      "LO string",
+			element:   dicomtest.NewStringElement(core.NewTag(0x0010, 0x0020), core.VRLO, "PATIENT-001"),
+			wantValue: []any{"PATIENT-001"},
+		},
+		{
+			name:      "LT string",
+			element:   dicomtest.NewStringElement(core.NewTag(0x4000, 0x4000), core.VRLT, "long text"),
+			wantValue: []any{"long text"},
+		},
+		{
+			name:      "SS int16",
+			element:   core.NewRawElement(core.NewTag(0x0028, 0x0103), core.VRSS, rawInt16Values(-1, 2)),
+			wantValue: []any{-1, 2},
+		},
+		{
+			name:      "US uint16",
+			element:   core.NewRawElement(core.NewTag(0x0028, 0x0002), core.VRUS, rawUint16Values(1, 513)),
+			wantValue: []any{1, 513},
+		},
+		{
+			name:      "SL int32",
+			element:   core.NewRawElement(core.NewTag(0x0028, 0x0010), core.VRSL, rawInt32Values(-2147483648, 42)),
+			wantValue: []any{-2147483648, 42},
+		},
+		{
+			name:      "UL uint32",
+			element:   core.NewRawElement(core.NewTag(0x0028, 0x0100), core.VRUL, rawUint32Values(305419896)),
+			wantValue: []any{305419896},
+		},
+		{
+			name:      "SV int64",
+			element:   core.NewRawElement(core.NewTag(0x0028, 0x0011), core.VRSV, rawInt64Values(-42)),
+			wantValue: []any{-42},
+		},
+		{
+			name:      "UV uint64",
+			element:   core.NewRawElement(core.NewTag(0x0028, 0x0012), core.VRUV, rawUint64Values(42)),
+			wantValue: []any{42},
+		},
+		{
+			name:      "PN components",
+			element:   dicomtest.NewPNElement(core.NewTag(0x0010, 0x0010), "Doe^John=山田^太郎"),
+			wantValue: []any{map[string]any{"Alphabetic": "Doe^John", "Ideographic": "山田^太郎"}},
+		},
+		{
+			name:      "SH string",
+			element:   dicomtest.NewStringElement(core.NewTag(0x0008, 0x103E), core.VRSH, "SERIES"),
+			wantValue: []any{"SERIES"},
+		},
+		{
+			name:      "SQ sequence",
+			element:   dicomtest.NewSequenceElement(core.NewTag(0x0008, 0x1111), core.DataSet{}),
+			wantValue: []any{map[string]any{}},
+		},
+		{
+			name:      "ST string",
+			element:   dicomtest.NewStringElement(core.NewTag(0x0008, 0x4000), core.VRST, "short text"),
+			wantValue: []any{"short text"},
+		},
+		{
+			name:      "TM string",
+			element:   dicomtest.NewStringElement(core.NewTag(0x0008, 0x0030), core.VRTM, "123000"),
+			wantValue: []any{"123000"},
+		},
+		{
+			name:      "UC string",
+			element:   dicomtest.NewStringElement(core.NewTag(0x0008, 0x0100), core.VRUC, "CODE"),
+			wantValue: []any{"CODE"},
+		},
+		{
+			name:      "UI string",
+			element:   dicomtest.NewUIElement(core.NewTag(0x0008, 0x0018), "1.2.3"),
+			wantValue: []any{"1.2.3"},
+		},
+		{
+			name:      "UR string",
+			element:   dicomtest.NewStringElement(core.NewTag(0x0008, 0x1190), core.VRUR, "https://example.test/dicom"),
+			wantValue: []any{"https://example.test/dicom"},
+		},
+		{
+			name:      "UT string",
+			element:   dicomtest.NewStringElement(core.NewTag(0x0040, 0xA160), core.VRUT, "unlimited text"),
+			wantValue: []any{"unlimited text"},
+		},
+		{
+			name:       "OB binary",
+			element:    core.NewRawElement(core.TagPixelData, core.VROB, []byte{1, 2, 3}),
+			wantInline: []byte{1, 2, 3},
+		},
+		{
+			name:       "OD binary",
+			element:    core.NewRawElement(core.NewTag(0x0066, 0x0040), core.VROD, rawFloat64Values(1.25)),
+			wantInline: rawFloat64Values(1.25),
+		},
+		{
+			name:       "OF binary",
+			element:    core.NewRawElement(core.NewTag(0x0066, 0x0029), core.VROF, rawFloat32Values(1.25)),
+			wantInline: rawFloat32Values(1.25),
+		},
+		{
+			name:       "OL binary",
+			element:    core.NewRawElement(core.NewTag(0x0066, 0x0041), core.VROL, rawUint32Values(1, 2)),
+			wantInline: rawUint32Values(1, 2),
+		},
+		{
+			name:       "OV binary",
+			element:    core.NewRawElement(core.NewTag(0x0066, 0x0042), core.VROV, rawUint64Values(1, 2)),
+			wantInline: rawUint64Values(1, 2),
+		},
+		{
+			name:       "OW binary",
+			element:    core.NewRawElement(core.NewTag(0x0028, 0x1201), core.VROW, rawUint16Values(1, 2)),
+			wantInline: rawUint16Values(1, 2),
+		},
+		{
+			name:       "UN binary",
+			element:    core.NewRawElement(core.NewTag(0x0011, 0x1010), core.VRUN, []byte{0xde, 0xad}),
+			wantInline: []byte{0xde, 0xad},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			obj := object.FromDataSet(core.DataSet{Elements: []core.Element{tt.element}}, std.Dictionary)
+
+			got, err := MarshalCompact(obj)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			var decoded map[string]Element
+			if err := json.Unmarshal(got, &decoded); err != nil {
+				t.Fatal(err)
+			}
+			entry, ok := decoded[tt.element.Tag().HexString()]
+			if !ok {
+				t.Fatalf("missing element %s in %s", tt.element.Tag().HexString(), got)
+			}
+			if entry.VR != tt.element.VR().String() {
+				t.Fatalf("vr = %s, want %s", entry.VR, tt.element.VR())
+			}
+			if tt.wantValue != nil {
+				assertJSONValue(t, entry.Value, tt.wantValue)
+				if entry.InlineBinary != "" {
+					t.Fatalf("InlineBinary = %q, want omitted", entry.InlineBinary)
+				}
+				return
+			}
+			if len(entry.Value) != 0 {
+				t.Fatalf("Value = %#v, want omitted", entry.Value)
+			}
+			gotInline, err := base64.StdEncoding.DecodeString(entry.InlineBinary)
+			if err != nil {
+				t.Fatalf("InlineBinary is not base64: %v", err)
+			}
+			if string(gotInline) != string(tt.wantInline) {
+				t.Fatalf("InlineBinary bytes = %v, want %v", gotInline, tt.wantInline)
+			}
+		})
+	}
+}
+
+func TestMarshalUsesConfiguredBigEndianForNumericAndATValues(t *testing.T) {
+	tests := []struct {
+		name      string
+		element   core.Element
+		wantValue []any
+	}{
+		{
+			name:      "AT tag list",
+			element:   core.NewRawElement(core.NewTag(0x0008, 0x0008), core.VRAT, rawATValuesWithOrder(binary.BigEndian, core.NewTag(0x0010, 0x0020))),
+			wantValue: []any{"00100020"},
+		},
+		{
+			name:      "US rows",
+			element:   core.NewRawElement(core.NewTag(0x0028, 0x0010), core.VRUS, rawUint16ValuesWithOrder(binary.BigEndian, 512)),
+			wantValue: []any{512},
+		},
+		{
+			name:      "SS signed",
+			element:   core.NewRawElement(core.NewTag(0x0028, 0x0103), core.VRSS, rawInt16ValuesWithOrder(binary.BigEndian, -2)),
+			wantValue: []any{-2},
+		},
+		{
+			name:      "UL unsigned",
+			element:   core.NewRawElement(core.NewTag(0x0028, 0x0100), core.VRUL, rawUint32ValuesWithOrder(binary.BigEndian, 305419896)),
+			wantValue: []any{305419896},
+		},
+		{
+			name:      "SL signed",
+			element:   core.NewRawElement(core.NewTag(0x0028, 0x0011), core.VRSL, rawInt32ValuesWithOrder(binary.BigEndian, math.MinInt32)),
+			wantValue: []any{-2147483648},
+		},
+		{
+			name:      "FL float32",
+			element:   core.NewRawElement(core.NewTag(0x0018, 0x1160), core.VRFL, rawFloat32ValuesWithOrder(binary.BigEndian, 1.5)),
+			wantValue: []any{1.5},
+		},
+		{
+			name:      "FD float64",
+			element:   core.NewRawElement(core.NewTag(0x0018, 0x1164), core.VRFD, rawFloat64ValuesWithOrder(binary.BigEndian, 3.5)),
+			wantValue: []any{3.5},
+		},
+		{
+			name:      "SV signed 64",
+			element:   core.NewRawElement(core.NewTag(0x0028, 0x0012), core.VRSV, rawInt64ValuesWithOrder(binary.BigEndian, -42)),
+			wantValue: []any{-42},
+		},
+		{
+			name:      "UV unsigned 64",
+			element:   core.NewRawElement(core.NewTag(0x0028, 0x0013), core.VRUV, rawUint64ValuesWithOrder(binary.BigEndian, 42)),
+			wantValue: []any{42},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			obj := object.FromDataSet(core.DataSet{Elements: []core.Element{tt.element}}, std.Dictionary)
+
+			got, err := Marshal(obj, Options{
+				OmitGroupLength: true,
+				ByteOrder:       binary.BigEndian,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			var decoded map[string]Element
+			if err := json.Unmarshal(got, &decoded); err != nil {
+				t.Fatal(err)
+			}
+			entry := decoded[tt.element.Tag().HexString()]
+			assertJSONValue(t, entry.Value, tt.wantValue)
+		})
+	}
+}
+
+func TestMarshalUsesObjectBigEndianByDefaultForNumericAndATValues(t *testing.T) {
+	elements := []core.Element{
+		core.NewRawElement(core.NewTag(0x0008, 0x0008), core.VRAT, rawATValuesWithOrder(binary.BigEndian, core.NewTag(0x0010, 0x0020))),
+		core.NewRawElement(core.NewTag(0x0028, 0x0010), core.VRUS, rawUint16ValuesWithOrder(binary.BigEndian, 512)),
+		core.NewRawElement(core.NewTag(0x0028, 0x0103), core.VRSS, rawInt16ValuesWithOrder(binary.BigEndian, -2)),
+		core.NewRawElement(core.NewTag(0x0028, 0x0100), core.VRUL, rawUint32ValuesWithOrder(binary.BigEndian, 305419896)),
+		core.NewRawElement(core.NewTag(0x0018, 0x1160), core.VRFL, rawFloat32ValuesWithOrder(binary.BigEndian, 1.5)),
+	}
+	obj := object.FromElements(elements, std.Dictionary)
+	obj.SetValueByteOrder(binary.BigEndian)
+
+	got, err := MarshalCompact(obj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded map[string]Element
+	if err := json.Unmarshal(got, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	assertJSONValue(t, decoded["00080008"].Value, []any{"00100020"})
+	assertJSONValue(t, decoded["00280010"].Value, []any{512})
+	assertJSONValue(t, decoded["00280103"].Value, []any{-2})
+	assertJSONValue(t, decoded["00280100"].Value, []any{305419896})
+	assertJSONValue(t, decoded["00181160"].Value, []any{1.5})
 }
 
 func TestMarshalSerializesSequenceRecursively(t *testing.T) {
@@ -99,6 +553,35 @@ func TestMarshalSerializesSequenceRecursively(t *testing.T) {
 	}
 	if _, ok := firstItem["00100020"]; !ok {
 		t.Fatalf("first item missing nested LO element: %#v", firstItem)
+	}
+}
+
+func TestMarshalSequenceInheritsSpecificCharacterSet(t *testing.T) {
+	obj := object.FromElements([]core.Element{
+		core.NewRawElement(core.NewTag(0x0008, 0x0005), core.VRCS, []byte("ISO_IR 192")),
+		dicomtest.NewSequenceElement(core.NewTag(0x0008, 0x1111), core.DataSet{Elements: []core.Element{
+			core.NewRawElement(core.NewTag(0x0010, 0x0010), core.VRPN, []byte("René^José")),
+		}}),
+	}, std.Dictionary)
+
+	encoded, err := Marshal(obj, Options{})
+	if err != nil {
+		t.Fatalf("Marshal() error = %v", err)
+	}
+	var decoded map[string]map[string]any
+	if err := json.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+	sequenceValues, ok := decoded["00081111"]["Value"].([]any)
+	if !ok || len(sequenceValues) != 1 {
+		t.Fatalf("sequence Value = %#v, want one item", decoded["00081111"]["Value"])
+	}
+	item := sequenceValues[0].(map[string]any)
+	personName := item["00100010"].(map[string]any)
+	values := personName["Value"].([]any)
+	components := values[0].(map[string]any)
+	if components["Alphabetic"] != "René^José" {
+		t.Fatalf("nested PN = %#v, want René^José", components["Alphabetic"])
 	}
 }
 
@@ -525,6 +1008,59 @@ func TestUnmarshalTreatsDSAndISAsStringValues(t *testing.T) {
 	}
 }
 
+func TestUnmarshalAcceptsConformantDSAndISLexicalForms(t *testing.T) {
+	const src = `{
+		"00181063": {"vr":"DS","Value":[1e2,"+.5","1.","  -12.5E+3  "]},
+		"00200013": {"vr":"IS","Value":[-2147483648,"+2147483647"," 7 "]}
+	}`
+
+	obj, err := Unmarshal([]byte(src), std.Dictionary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dsElement, _ := obj.Get(core.NewTag(0x0018, 0x1063))
+	ds, _ := dsElement.Value.(core.StringValue)
+	if len(ds) != 4 || ds[0] != "1e2" || ds[1] != "+.5" || ds[2] != "1." || ds[3] != "  -12.5E+3  " {
+		t.Fatalf("DS values = %#v, want original conformant tokens", ds)
+	}
+	isElement, _ := obj.Get(core.NewTag(0x0020, 0x0013))
+	is, _ := isElement.Value.(core.StringValue)
+	if len(is) != 3 || is[0] != "-2147483648" || is[1] != "+2147483647" || is[2] != " 7 " {
+		t.Fatalf("IS values = %#v, want original conformant tokens", is)
+	}
+}
+
+func TestUnmarshalRejectsNonConformantDSAndISTokens(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		tag   string
+		vr    string
+		value string
+	}{
+		{name: "IS exponent number", tag: "00200013", vr: "IS", value: "1e2"},
+		{name: "IS decimal string", tag: "00200013", vr: "IS", value: `"1.5"`},
+		{name: "IS embedded space", tag: "00200013", vr: "IS", value: `"12 3"`},
+		{name: "IS int32 overflow", tag: "00200013", vr: "IS", value: "2147483648"},
+		{name: "IS over 12 bytes", tag: "00200013", vr: "IS", value: `"0000000000001"`},
+		{name: "DS repeated decimal", tag: "00181063", vr: "DS", value: `"1.2.3"`},
+		{name: "DS incomplete exponent", tag: "00181063", vr: "DS", value: `"1e"`},
+		{name: "DS non-finite", tag: "00181063", vr: "DS", value: `"NaN"`},
+		{name: "DS over 16 bytes", tag: "00181063", vr: "DS", value: `"12345678901234567"`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			src := fmt.Sprintf(`{"%s":{"vr":"%s","Value":[%s]}}`, test.tag, test.vr, test.value)
+			_, err := Unmarshal([]byte(src), std.Dictionary)
+			if err == nil {
+				t.Fatal("Unmarshal() error = nil, want invalid numeric string error")
+			}
+			wantPath := test.tag + "/Value[0]"
+			if !strings.Contains(err.Error(), wantPath) {
+				t.Fatalf("Unmarshal() error = %q, want path %q", err, wantPath)
+			}
+		})
+	}
+}
+
 func TestUnmarshalParsesAdditionalNumericVRs(t *testing.T) {
 	const src = `{
 		"00280011": {"vr":"SV","Value":["9223372036854775807"]},
@@ -552,6 +1088,94 @@ func TestUnmarshalParsesAdditionalNumericVRs(t *testing.T) {
 	}
 	if binary.LittleEndian.Uint16(atRaw[0:2]) != 0x0010 || binary.LittleEndian.Uint16(atRaw[2:4]) != 0x0010 {
 		t.Fatalf("AT raw = %v, want tag 00100010", atRaw)
+	}
+}
+
+func TestUnmarshalWithOptionsWritesBigEndianNumericAndATBytes(t *testing.T) {
+	const src = `{
+		"00080016": {"vr":"AT","Value":["00100020"]},
+		"00181160": {"vr":"FL","Value":[1.5]},
+		"00181164": {"vr":"FD","Value":[3.5]},
+		"00280010": {"vr":"US","Value":[512]},
+		"00280103": {"vr":"SS","Value":[-2]},
+		"00280100": {"vr":"UL","Value":[305419896]},
+		"00280011": {"vr":"SL","Value":[-2147483648]},
+		"00280012": {"vr":"SV","Value":[-42]},
+		"00280013": {"vr":"UV","Value":[42]}
+	}`
+
+	obj, err := UnmarshalWithOptions([]byte(src), std.Dictionary, UnmarshalOptions{
+		ByteOrder: binary.BigEndian,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if obj.ValueByteOrder() != binary.BigEndian {
+		t.Fatalf("ValueByteOrder() = %T, want binary.BigEndian", obj.ValueByteOrder())
+	}
+
+	tests := []struct {
+		name string
+		tag  core.Tag
+		want []byte
+	}{
+		{
+			name: "AT tag list",
+			tag:  core.NewTag(0x0008, 0x0016),
+			want: rawATValuesWithOrder(binary.BigEndian, core.NewTag(0x0010, 0x0020)),
+		},
+		{
+			name: "FL float32",
+			tag:  core.NewTag(0x0018, 0x1160),
+			want: rawFloat32ValuesWithOrder(binary.BigEndian, 1.5),
+		},
+		{
+			name: "FD float64",
+			tag:  core.NewTag(0x0018, 0x1164),
+			want: rawFloat64ValuesWithOrder(binary.BigEndian, 3.5),
+		},
+		{
+			name: "US rows",
+			tag:  core.NewTag(0x0028, 0x0010),
+			want: rawUint16ValuesWithOrder(binary.BigEndian, 512),
+		},
+		{
+			name: "SS signed",
+			tag:  core.NewTag(0x0028, 0x0103),
+			want: rawInt16ValuesWithOrder(binary.BigEndian, -2),
+		},
+		{
+			name: "UL unsigned",
+			tag:  core.NewTag(0x0028, 0x0100),
+			want: rawUint32ValuesWithOrder(binary.BigEndian, 305419896),
+		},
+		{
+			name: "SL signed",
+			tag:  core.NewTag(0x0028, 0x0011),
+			want: rawInt32ValuesWithOrder(binary.BigEndian, math.MinInt32),
+		},
+		{
+			name: "SV signed 64",
+			tag:  core.NewTag(0x0028, 0x0012),
+			want: rawInt64ValuesWithOrder(binary.BigEndian, -42),
+		},
+		{
+			name: "UV unsigned 64",
+			tag:  core.NewTag(0x0028, 0x0013),
+			want: rawUint64ValuesWithOrder(binary.BigEndian, 42),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := obj.GetRaw(tt.tag)
+			if !ok {
+				t.Fatalf("missing raw value for %s", tt.tag)
+			}
+			if string(got) != string(tt.want) {
+				t.Fatalf("raw = % X, want % X", got, tt.want)
+			}
+		})
 	}
 }
 
@@ -599,6 +1223,44 @@ func TestUnmarshalParsesInlineBinary(t *testing.T) {
 	}
 	if string(raw) != string([]byte{0x01, 0x02, 0x03, 0x04}) {
 		t.Fatalf("raw = %v, want [1 2 3 4]", raw)
+	}
+}
+
+func TestUnmarshalValueErrorsIncludeVRAndJSONType(t *testing.T) {
+	tests := []struct {
+		name     string
+		src      string
+		contains []string
+	}{
+		{
+			name:     "string_vr_receives_number",
+			src:      `{"00100020":{"vr":"LO","Value":[123]}}`,
+			contains: []string{"00100020/Value[0]", "VR LO", "received number", "expected string"},
+		},
+		{
+			name:     "un_vr_receives_value_array",
+			src:      `{"00111010":{"vr":"UN","Value":[1,2]}}`,
+			contains: []string{"00111010/Value", "VR UN", "received array", "InlineBinary"},
+		},
+		{
+			name:     "sq_vr_receives_object",
+			src:      `{"00081111":{"vr":"SQ","Value":{}}}`,
+			contains: []string{"00081111/Value", "VR SQ", "received object", "expected JSON array"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := Unmarshal([]byte(tt.src), std.Dictionary)
+			if err == nil {
+				t.Fatal("Unmarshal() unexpectedly succeeded")
+			}
+			for _, want := range tt.contains {
+				if !strings.Contains(err.Error(), want) {
+					t.Fatalf("error = %v, want substring %q", err, want)
+				}
+			}
+		})
 	}
 }
 
@@ -665,4 +1327,146 @@ func TestUnmarshalErrorsIncludePath(t *testing.T) {
 			}
 		})
 	}
+}
+
+func assertJSONValue(t *testing.T, got, want []any) {
+	t.Helper()
+	gotJSON, err := json.Marshal(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantJSON, err := json.Marshal(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(gotJSON) != string(wantJSON) {
+		t.Fatalf("Value = %s, want %s", gotJSON, wantJSON)
+	}
+}
+
+func rawATValues(values ...core.Tag) []byte {
+	return rawATValuesWithOrder(binary.LittleEndian, values...)
+}
+
+func rawATValuesWithOrder(order binary.ByteOrder, values ...core.Tag) []byte {
+	data := make([]byte, 0, len(values)*4)
+	for _, value := range values {
+		var buf [4]byte
+		order.PutUint16(buf[0:2], value.Group)
+		order.PutUint16(buf[2:4], value.Element)
+		data = append(data, buf[:]...)
+	}
+	return data
+}
+
+func rawFloat32Values(values ...float32) []byte {
+	return rawFloat32ValuesWithOrder(binary.LittleEndian, values...)
+}
+
+func rawFloat32ValuesWithOrder(order binary.ByteOrder, values ...float32) []byte {
+	data := make([]byte, 0, len(values)*4)
+	for _, value := range values {
+		var buf [4]byte
+		order.PutUint32(buf[:], math.Float32bits(value))
+		data = append(data, buf[:]...)
+	}
+	return data
+}
+
+func rawFloat64Values(values ...float64) []byte {
+	return rawFloat64ValuesWithOrder(binary.LittleEndian, values...)
+}
+
+func rawFloat64ValuesWithOrder(order binary.ByteOrder, values ...float64) []byte {
+	data := make([]byte, 0, len(values)*8)
+	for _, value := range values {
+		var buf [8]byte
+		order.PutUint64(buf[:], math.Float64bits(value))
+		data = append(data, buf[:]...)
+	}
+	return data
+}
+
+func rawInt16Values(values ...int16) []byte {
+	return rawInt16ValuesWithOrder(binary.LittleEndian, values...)
+}
+
+func rawInt16ValuesWithOrder(order binary.ByteOrder, values ...int16) []byte {
+	data := make([]byte, 0, len(values)*2)
+	for _, value := range values {
+		var buf [2]byte
+		order.PutUint16(buf[:], uint16(value))
+		data = append(data, buf[:]...)
+	}
+	return data
+}
+
+func rawUint16Values(values ...uint16) []byte {
+	return rawUint16ValuesWithOrder(binary.LittleEndian, values...)
+}
+
+func rawUint16ValuesWithOrder(order binary.ByteOrder, values ...uint16) []byte {
+	data := make([]byte, 0, len(values)*2)
+	for _, value := range values {
+		var buf [2]byte
+		order.PutUint16(buf[:], value)
+		data = append(data, buf[:]...)
+	}
+	return data
+}
+
+func rawInt32Values(values ...int32) []byte {
+	return rawInt32ValuesWithOrder(binary.LittleEndian, values...)
+}
+
+func rawInt32ValuesWithOrder(order binary.ByteOrder, values ...int32) []byte {
+	data := make([]byte, 0, len(values)*4)
+	for _, value := range values {
+		var buf [4]byte
+		order.PutUint32(buf[:], uint32(value))
+		data = append(data, buf[:]...)
+	}
+	return data
+}
+
+func rawUint32Values(values ...uint32) []byte {
+	return rawUint32ValuesWithOrder(binary.LittleEndian, values...)
+}
+
+func rawUint32ValuesWithOrder(order binary.ByteOrder, values ...uint32) []byte {
+	data := make([]byte, 0, len(values)*4)
+	for _, value := range values {
+		var buf [4]byte
+		order.PutUint32(buf[:], value)
+		data = append(data, buf[:]...)
+	}
+	return data
+}
+
+func rawInt64Values(values ...int64) []byte {
+	return rawInt64ValuesWithOrder(binary.LittleEndian, values...)
+}
+
+func rawInt64ValuesWithOrder(order binary.ByteOrder, values ...int64) []byte {
+	data := make([]byte, 0, len(values)*8)
+	for _, value := range values {
+		var buf [8]byte
+		order.PutUint64(buf[:], uint64(value))
+		data = append(data, buf[:]...)
+	}
+	return data
+}
+
+func rawUint64Values(values ...uint64) []byte {
+	return rawUint64ValuesWithOrder(binary.LittleEndian, values...)
+}
+
+func rawUint64ValuesWithOrder(order binary.ByteOrder, values ...uint64) []byte {
+	data := make([]byte, 0, len(values)*8)
+	for _, value := range values {
+		var buf [8]byte
+		order.PutUint64(buf[:], value)
+		data = append(data, buf[:]...)
+	}
+	return data
 }

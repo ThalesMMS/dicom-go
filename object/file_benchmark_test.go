@@ -54,6 +54,36 @@ func BenchmarkWriteFile(b *testing.B) {
 	}
 }
 
+func BenchmarkWriteFileWriterCalls(b *testing.B) {
+	for _, fixture := range benchmarkPart10WriteFixtures() {
+		fixture := fixture
+		b.Run(fixture.name, func(b *testing.B) {
+			var writer benchmarkCountingWriter
+			var totalCalls int64
+			b.ReportAllocs()
+			b.ResetTimer()
+
+			for i := 0; i < b.N; i++ {
+				writer.calls = 0
+				if err := WriteFile(&writer, fixture.file); err != nil {
+					b.Fatal(err)
+				}
+				totalCalls += writer.calls
+			}
+			b.ReportMetric(float64(totalCalls)/float64(b.N), "writes/op")
+		})
+	}
+}
+
+type benchmarkCountingWriter struct {
+	calls int64
+}
+
+func (w *benchmarkCountingWriter) Write(p []byte) (int, error) {
+	w.calls++
+	return len(p), nil
+}
+
 func BenchmarkRoundTrip(b *testing.B) {
 	for _, fixture := range benchmarkPart10WriteFixtures() {
 		fixture := fixture

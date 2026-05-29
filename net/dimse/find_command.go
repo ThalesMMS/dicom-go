@@ -1,6 +1,7 @@
 package dimse
 
 import (
+	"encoding/binary"
 	"fmt"
 
 	"github.com/ThalesMMS/dicom-go/core"
@@ -47,8 +48,8 @@ type CFindResponse struct {
 	Status                        uint16
 	CommandDataSetType            uint16
 	ErrorComment                  string
-	OffendingElementOrNil         *core.Tag // TODO: populate from ParseCFindResponse when command parsing supports it.
-	FailedSOPInstanceUIDListOrNil []string  // TODO: populate from ParseCFindResponse when command parsing supports it.
+	OffendingElementOrNil         *core.Tag
+	FailedSOPInstanceUIDListOrNil []string
 }
 
 func (r CFindResponse) CommandSet() []core.Element {
@@ -64,6 +65,12 @@ func (r CFindResponse) CommandSet() []core.Element {
 			Header: core.ElementHeader{Tag: ErrorComment, VR: core.VRLO},
 			Value:  core.StringValue{r.ErrorComment},
 		})
+	}
+	if r.OffendingElementOrNil != nil {
+		elements = append(elements, newATCommandElement(OffendingElement, *r.OffendingElementOrNil))
+	}
+	if len(r.FailedSOPInstanceUIDListOrNil) > 0 {
+		elements = append(elements, newUIListElement(FailedSOPInstanceUIDList, r.FailedSOPInstanceUIDListOrNil))
 	}
 	return elements
 }
@@ -88,8 +95,11 @@ func ParseCFindRequest(obj *object.Object) (*CFindRequest, error) {
 	if err != nil {
 		return nil, err
 	}
-	if dst != DataSetPresent {
-		return nil, fmt.Errorf("dicom dimse: C-FIND request dataset type 0x%04X, want dataset present 0x%04X", dst, DataSetPresent)
+	if dst == NoDataSet {
+		return nil, fmt.Errorf("dicom dimse: C-FIND request does not contain an Identifier dataset")
+	}
+	if priority > PriorityLow {
+		return nil, fmt.Errorf("dicom dimse: C-FIND request priority 0x%04X is invalid", priority)
 	}
 	affectedUID, ok := obj.GetString(AffectedSOPClassUID)
 	if !ok {
@@ -118,9 +128,13 @@ func ParseCFindResponse(obj *object.Object) (*CFindResponse, error) {
 	if err != nil {
 		return nil, err
 	}
-	affectedUID, ok := obj.GetString(AffectedSOPClassUID)
-	if !ok {
-		return nil, fmt.Errorf("dicom dimse: missing or invalid command element %s", AffectedSOPClassUID)
+	affectedUID := ""
+	if _, present := obj.Get(AffectedSOPClassUID); present {
+		var ok bool
+		affectedUID, ok = obj.GetString(AffectedSOPClassUID)
+		if !ok {
+			return nil, fmt.Errorf("dicom dimse: invalid command element %s", AffectedSOPClassUID)
+		}
 	}
 
 	resp := &CFindResponse{
@@ -132,5 +146,61 @@ func ParseCFindResponse(obj *object.Object) (*CFindResponse, error) {
 	if s, ok := obj.GetString(ErrorComment); ok {
 		resp.ErrorComment = s
 	}
+	offending, ok, err := optionalCommandTags(obj, OffendingElement)
+	if err != nil {
+		return nil, err
+	}
+	if ok && len(offending) > 0 {
+		tag := offending[0]
+		resp.OffendingElementOrNil = &tag
+	}
+	failed, ok, err := optionalCommandUIDs(obj, FailedSOPInstanceUIDList)
+	if err != nil {
+		return nil, err
+	}
+	if ok {
+		resp.FailedSOPInstanceUIDListOrNil = failed
+	}
 	return resp, nil
+}
+
+func optionalCommandTags(obj *object.Object, tag core.Tag) ([]core.Tag, bool, error) {
+	elem, ok := obj.Get(tag)
+	if !ok {
+		return nil, false, nil
+	}
+	if elem.VR() != core.VRAT {
+		return nil, true, fmt.Errorf("dicom dimse: command element %s has VR %s, want AT", tag, elem.VR())
+	}
+	raw, ok := elem.RawBytes()
+	if !ok {
+		return nil, true, fmt.Errorf("dicom dimse: command element %s is not raw AT data", tag)
+	}
+	if len(raw)%4 != 0 {
+		return nil, true, fmt.Errorf("dicom dimse: command element %s has %d byte value, want a multiple of 4", tag, len(raw))
+	}
+	tags := make([]core.Tag, len(raw)/4)
+	for i := range tags {
+		offset := i * 4
+		tags[i] = core.NewTag(
+			binary.LittleEndian.Uint16(raw[offset:]),
+			binary.LittleEndian.Uint16(raw[offset+2:]),
+		)
+	}
+	return tags, true, nil
+}
+
+func optionalCommandUIDs(obj *object.Object, tag core.Tag) ([]string, bool, error) {
+	elem, ok := obj.Get(tag)
+	if !ok {
+		return nil, false, nil
+	}
+	if elem.VR() != core.VRUI {
+		return nil, true, fmt.Errorf("dicom dimse: command element %s has VR %s, want UI", tag, elem.VR())
+	}
+	values, ok := obj.GetUIDs(tag)
+	if !ok {
+		return nil, true, fmt.Errorf("dicom dimse: command element %s is not a valid UI list", tag)
+	}
+	return values, true, nil
 }

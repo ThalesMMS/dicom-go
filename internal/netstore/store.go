@@ -84,6 +84,10 @@ func SavePart10(outDir string, dataset *object.Object, syntax transfer.Syntax) (
 }
 
 func CreateInstanceFile(outDir, sopInstanceUID string) (string, *os.File, error) {
+	return createInstanceFile(outDir, sopInstanceUID, protectInstanceFile)
+}
+
+func createInstanceFile(outDir, sopInstanceUID string, protect func(string) error) (string, *os.File, error) {
 	base := SafeFileBase(sopInstanceUID)
 	for i := 0; i < 1000; i++ {
 		name := base + ".dcm"
@@ -93,6 +97,15 @@ func CreateInstanceFile(outDir, sopInstanceUID string) (string, *os.File, error)
 		path := filepath.Join(outDir, name)
 		f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 		if err == nil {
+			if err := protect(path); err != nil {
+				closeErr := f.Close()
+				removeErr := os.Remove(path)
+				return "", nil, errors.Join(
+					fmt.Errorf("protect DICOM instance file: %w", err),
+					closeErr,
+					removeErr,
+				)
+			}
 			return path, f, nil
 		}
 		if errors.Is(err, os.ErrExist) {
@@ -104,7 +117,7 @@ func CreateInstanceFile(outDir, sopInstanceUID string) (string, *os.File, error)
 }
 
 func SafeFileBase(uid string) string {
-	uid = strings.TrimRight(uid, " \x00")
+	uid = core.NormalizeUID(uid)
 	if uid == "" {
 		return "instance"
 	}

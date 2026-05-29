@@ -38,7 +38,7 @@ const (
 //
 // RequestedSOPClassUID and RequestedSOPInstanceUID must match the Storage
 // Commitment Push Model UIDs.
-// MessageID must be non-zero.
+// MessageID is any US value not already outstanding on the association.
 // ActionTypeID must be StorageCommitmentActionTypeID.
 //
 // The caller is responsible for choosing a presentation context that has
@@ -53,14 +53,13 @@ type NActionRequest struct {
 }
 
 func (r NActionRequest) CommandSet() []core.Element {
-	return []core.Element{
-		newUIElement(RequestedSOPClassUID, r.RequestedSOPClassUID),
-		newUSCommandElement(CommandField, NActionRQ),
-		newUSCommandElement(MessageID, r.MessageID),
-		newUIElement(RequestedSOPInstanceUID, r.RequestedSOPInstanceUID),
-		newUSCommandElement(ActionTypeID, r.ActionTypeID),
-		newUSCommandElement(CommandDataSetType, DataSetPresent),
-	}
+	return (NormalizedActionRequest{
+		RequestedSOPClassUID:    r.RequestedSOPClassUID,
+		MessageID:               r.MessageID,
+		CommandDataSetType:      DataSetPresent,
+		RequestedSOPInstanceUID: r.RequestedSOPInstanceUID,
+		ActionTypeID:            r.ActionTypeID,
+	}).CommandSet()
 }
 
 // NActionResponse represents an N-ACTION-RSP command.
@@ -76,130 +75,67 @@ type NActionResponse struct {
 }
 
 func (r NActionResponse) CommandSet() []core.Element {
-	datasetType := NoDataSet
+	var actionTypeID *uint16
 	if r.HasActionReply {
-		datasetType = DataSetPresent
+		value := StorageCommitmentActionTypeID
+		actionTypeID = &value
 	}
-	return []core.Element{
-		newUIElement(AffectedSOPClassUID, r.AffectedSOPClassUID),
-		newUSCommandElement(CommandField, NActionRSP),
-		newUSCommandElement(MessageIDBeingRespondedTo, r.MessageIDBeingRespondedTo),
-		newUIElement(AffectedSOPInstanceUID, r.AffectedSOPInstanceUID),
-		newUSCommandElement(CommandDataSetType, datasetType),
-		newUSCommandElement(Status, r.Status),
-	}
+	return (NormalizedActionResponse{
+		AffectedSOPClassUID:       r.AffectedSOPClassUID,
+		MessageIDBeingRespondedTo: r.MessageIDBeingRespondedTo,
+		CommandDataSetType:        normalizedDataSetType(r.HasActionReply),
+		Status:                    r.Status,
+		AffectedSOPInstanceUID:    r.AffectedSOPInstanceUID,
+		ActionTypeIDOrNil:         actionTypeID,
+	}).CommandSet()
 }
 
 func ParseNActionRequest(obj *object.Object) (*NActionRequest, error) {
-	field, err := CommandUint16(obj, CommandField)
+	generic, err := ParseNormalizedActionRequest(obj)
 	if err != nil {
 		return nil, err
 	}
-	if field != NActionRQ {
-		return nil, fmt.Errorf("dicom dimse: command field 0x%04X, want N-ACTION-RQ 0x%04X", field, NActionRQ)
+	if generic.RequestedSOPClassUID != StorageCommitmentPushModelSOPClassUID {
+		return nil, fmt.Errorf("dicom dimse: N-ACTION request RequestedSOPClassUID %q, want %q", generic.RequestedSOPClassUID, StorageCommitmentPushModelSOPClassUID)
 	}
-	sopClassUID, err := commandUID(obj, RequestedSOPClassUID)
-	if err != nil {
-		return nil, err
+	if generic.RequestedSOPInstanceUID != StorageCommitmentPushModelSOPInstanceUID {
+		return nil, fmt.Errorf("dicom dimse: N-ACTION request RequestedSOPInstanceUID %q, want %q", generic.RequestedSOPInstanceUID, StorageCommitmentPushModelSOPInstanceUID)
 	}
-	if sopClassUID != StorageCommitmentPushModelSOPClassUID {
-		return nil, fmt.Errorf("dicom dimse: N-ACTION request RequestedSOPClassUID %q, want %q", sopClassUID, StorageCommitmentPushModelSOPClassUID)
+	if generic.ActionTypeID != StorageCommitmentActionTypeID {
+		return nil, fmt.Errorf("dicom dimse: N-ACTION request ActionTypeID %d, want StorageCommitmentActionTypeID %d", generic.ActionTypeID, StorageCommitmentActionTypeID)
 	}
-	msgID, err := CommandUint16(obj, MessageID)
-	if err != nil {
-		return nil, err
-	}
-	if msgID == 0 {
-		return nil, fmt.Errorf("dicom dimse: N-ACTION request MessageID must be non-zero")
-	}
-	sopInstanceUID, err := commandUID(obj, RequestedSOPInstanceUID)
-	if err != nil {
-		return nil, err
-	}
-	if sopInstanceUID != StorageCommitmentPushModelSOPInstanceUID {
-		return nil, fmt.Errorf("dicom dimse: N-ACTION request RequestedSOPInstanceUID %q, want %q", sopInstanceUID, StorageCommitmentPushModelSOPInstanceUID)
-	}
-	actionTypeID, err := CommandUint16(obj, ActionTypeID)
-	if err != nil {
-		return nil, err
-	}
-	if actionTypeID != StorageCommitmentActionTypeID {
-		return nil, fmt.Errorf("dicom dimse: N-ACTION request ActionTypeID %d, want StorageCommitmentActionTypeID %d", actionTypeID, StorageCommitmentActionTypeID)
-	}
-	dataSetType, err := CommandUint16(obj, CommandDataSetType)
-	if err != nil {
-		return nil, err
-	}
-	if dataSetType != DataSetPresent {
-		return nil, fmt.Errorf("dicom dimse: N-ACTION request dataset type 0x%04X, want dataset present 0x%04X", dataSetType, DataSetPresent)
+	if !normalizedHasDataSet(generic.CommandDataSetType) {
+		return nil, fmt.Errorf("dicom dimse: N-ACTION request dataset type 0x%04X, want dataset present", generic.CommandDataSetType)
 	}
 	return &NActionRequest{
-		RequestedSOPClassUID:    sopClassUID,
-		RequestedSOPInstanceUID: sopInstanceUID,
-		MessageID:               msgID,
-		ActionTypeID:            actionTypeID,
+		RequestedSOPClassUID:    generic.RequestedSOPClassUID,
+		RequestedSOPInstanceUID: generic.RequestedSOPInstanceUID,
+		MessageID:               generic.MessageID,
+		ActionTypeID:            generic.ActionTypeID,
 	}, nil
 }
 
 func ParseNActionResponse(obj *object.Object) (*NActionResponse, error) {
-	field, err := CommandUint16(obj, CommandField)
+	generic, err := ParseNormalizedActionResponse(obj)
 	if err != nil {
 		return nil, err
 	}
-	if field != NActionRSP {
-		return nil, fmt.Errorf("dicom dimse: command field 0x%04X, want N-ACTION-RSP 0x%04X", field, NActionRSP)
+	if generic.AffectedSOPClassUID != StorageCommitmentPushModelSOPClassUID {
+		return nil, fmt.Errorf("dicom dimse: N-ACTION response AffectedSOPClassUID %q, want %q", generic.AffectedSOPClassUID, StorageCommitmentPushModelSOPClassUID)
 	}
-	sopClassUID, err := commandUID(obj, AffectedSOPClassUID)
-	if err != nil {
-		return nil, err
-	}
-	if sopClassUID != StorageCommitmentPushModelSOPClassUID {
-		return nil, fmt.Errorf("dicom dimse: N-ACTION response AffectedSOPClassUID %q, want %q", sopClassUID, StorageCommitmentPushModelSOPClassUID)
-	}
-	msgID, err := CommandUint16(obj, MessageIDBeingRespondedTo)
-	if err != nil {
-		return nil, err
-	}
-	if msgID == 0 {
-		return nil, fmt.Errorf("dicom dimse: N-ACTION response MessageIDBeingRespondedTo must be non-zero")
-	}
-	sopInstanceUID, err := commandUID(obj, AffectedSOPInstanceUID)
-	if err != nil {
-		return nil, err
-	}
-	if sopInstanceUID != StorageCommitmentPushModelSOPInstanceUID {
-		return nil, fmt.Errorf("dicom dimse: N-ACTION response AffectedSOPInstanceUID %q, want %q", sopInstanceUID, StorageCommitmentPushModelSOPInstanceUID)
-	}
-	dataSetType, err := CommandUint16(obj, CommandDataSetType)
-	if err != nil {
-		return nil, err
-	}
-	var hasActionReply bool
-	switch dataSetType {
-	case DataSetPresent:
-		hasActionReply = true
-	case DataSetAbsent:
-		hasActionReply = false
-	default:
-		return nil, fmt.Errorf("dicom dimse: N-ACTION response dataset type 0x%04X, want 0x%04X or 0x%04X", dataSetType, DataSetPresent, DataSetAbsent)
-	}
-	status, err := CommandUint16(obj, Status)
-	if err != nil {
-		return nil, err
+	if generic.AffectedSOPInstanceUID != StorageCommitmentPushModelSOPInstanceUID {
+		return nil, fmt.Errorf("dicom dimse: N-ACTION response AffectedSOPInstanceUID %q, want %q", generic.AffectedSOPInstanceUID, StorageCommitmentPushModelSOPInstanceUID)
 	}
 	return &NActionResponse{
-		AffectedSOPClassUID:       sopClassUID,
-		AffectedSOPInstanceUID:    sopInstanceUID,
-		MessageIDBeingRespondedTo: msgID,
-		Status:                    status,
-		HasActionReply:            hasActionReply,
+		AffectedSOPClassUID:       generic.AffectedSOPClassUID,
+		AffectedSOPInstanceUID:    generic.AffectedSOPInstanceUID,
+		MessageIDBeingRespondedTo: generic.MessageIDBeingRespondedTo,
+		Status:                    generic.Status,
+		HasActionReply:            normalizedHasDataSet(generic.CommandDataSetType),
 	}, nil
 }
 
 func SendNActionRequest(assoc *ul.Association, pcID byte, req NActionRequest) error {
-	if req.MessageID == 0 {
-		return fmt.Errorf("dicom dimse: N-ACTION request MessageID must be non-zero")
-	}
 	if req.RequestedSOPClassUID != StorageCommitmentPushModelSOPClassUID {
 		return fmt.Errorf("dicom dimse: N-ACTION request RequestedSOPClassUID %q, want %q", req.RequestedSOPClassUID, StorageCommitmentPushModelSOPClassUID)
 	}
@@ -221,9 +157,6 @@ func ReceiveNActionRequest(assoc *ul.Association, pcID byte) (*NActionRequest, e
 }
 
 func SendNActionResponse(assoc *ul.Association, pcID byte, rsp NActionResponse) error {
-	if rsp.MessageIDBeingRespondedTo == 0 {
-		return fmt.Errorf("dicom dimse: N-ACTION response MessageIDBeingRespondedTo must be non-zero")
-	}
 	if rsp.AffectedSOPClassUID != StorageCommitmentPushModelSOPClassUID {
 		return fmt.Errorf("dicom dimse: N-ACTION response AffectedSOPClassUID %q, want %q", rsp.AffectedSOPClassUID, StorageCommitmentPushModelSOPClassUID)
 	}

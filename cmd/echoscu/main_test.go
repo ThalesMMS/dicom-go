@@ -4,6 +4,9 @@ import (
 	"bytes"
 	"errors"
 	"flag"
+	"net"
+	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -42,5 +45,30 @@ func TestParseArgsUsageError(t *testing.T) {
 	_, err = parseArgs([]string{"-h"}, &bytes.Buffer{})
 	if !errors.Is(err, flag.ErrHelp) {
 		t.Fatalf("parseArgs(-h) error = %v, want flag.ErrHelp", err)
+	}
+}
+
+func TestRunNetworkErrorIsClassified(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen() error = %v", err)
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
+	if err := listener.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	exitCode := run([]string{"-host", "127.0.0.1", "-port", strconv.Itoa(port)}, &stdout, &stderr)
+
+	if exitCode != 1 {
+		t.Fatalf("run() exit code = %d, want 1; stderr=%q", exitCode, stderr.String())
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("unexpected stdout: %q", stdout.String())
+	}
+	if got := stderr.String(); !strings.Contains(got, "echoscu: network:") {
+		t.Fatalf("stderr = %q, want network classification", got)
 	}
 }

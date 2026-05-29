@@ -146,6 +146,54 @@ func TestUTValueIsMaterializedWhenInlineThresholdSet(t *testing.T) {
 	}
 }
 
+func TestExplicitSVAndUVUseLongHeaderAndReaderStaysAligned(t *testing.T) {
+	patientNameTag := core.NewTag(0x0010, 0x0010)
+	value := []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08}
+
+	tests := []struct {
+		name string
+		tag  core.Tag
+		vr   core.VR
+	}{
+		{name: "SV", tag: core.NewTag(0x0018, 0x9901), vr: core.VRSV},
+		{name: "UV", tag: core.NewTag(0x0018, 0x9902), vr: core.VRUV},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			stream := bytes.Join([][]byte{
+				explicitLongHeaderBytes(binary.LittleEndian, tt.tag, tt.vr, [2]byte{}, uint32(len(value))),
+				value,
+				dicomtest.EncodeElement(dicomtest.NewPNElement(patientNameTag, "AFTER"), transfer.ExplicitVRLittleEndian),
+			}, nil)
+			reader := NewReader(bytes.NewReader(stream), transfer.ExplicitVRLittleEndian, ReaderOptions{Dictionary: std.Dictionary})
+
+			tok, err := reader.Next()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tok.Element.Tag() != tt.tag || tok.Element.VR() != tt.vr {
+				t.Fatalf("first element = %s %s, want %s %s", tok.Element.Tag(), tok.Element.VR(), tt.tag, tt.vr)
+			}
+			raw, ok := tok.Element.RawBytes()
+			if !ok || !bytes.Equal(raw, value) {
+				t.Fatalf("%s raw value = % X ok=%v, want % X", tt.vr, raw, ok, value)
+			}
+
+			tok, err = reader.Next()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tok.Element.Tag() != patientNameTag {
+				t.Fatalf("second tag = %s, want %s", tok.Element.Tag(), patientNameTag)
+			}
+			if got := tok.Element.StringValue(); got != "AFTER" {
+				t.Fatalf("patient name = %q, want AFTER", got)
+			}
+		})
+	}
+}
+
 func TestNativePixelDataDefinedLengthNotMaterializedAndReaderAdvances(t *testing.T) {
 	pixelDataTag := core.TagPixelData
 	patientNameTag := core.NewTag(0x0010, 0x0010)
@@ -352,54 +400,81 @@ func TestImplicitVRPrivateTagsFallbackToUNAndPreserveReaderState(t *testing.T) {
 		t.Fatalf("patient name = %q, want %q", got, "AFTER^TEST")
 	}
 }
-func TestImplicitVRPrivateTagRejectsUndefinedLengthWithoutCorruptingReaderState(t *testing.T) {
+func TestImplicitVRPrivateUndefinedLengthSequence(t *testing.T) {
 	privateDataTag := core.NewTag(0x0011, 0x1001)
 	patientNameTag := core.NewTag(0x0010, 0x0010)
-
-	stream := bytes.Join([][]byte{
-		implicitHeaderBytes(binary.LittleEndian, privateDataTag, 0xFFFFFFFF),
-		definedElementBytes(transfer.ImplicitVRLittleEndian, patientNameTag, core.VRPN, 10, []byte("AFTER^TEST")),
-	}, nil)
-
-	reader := NewReader(bytes.NewReader(stream), transfer.ImplicitVRLittleEndian, ReaderOptions{Dictionary: std.Dictionary})
-
-	_, err := reader.Next()
-	if err == nil {
-		t.Fatal("expected error")
+	inner := definedElementBytes(transfer.ImplicitVRLittleEndian, patientNameTag, core.VRPN, 10, []byte("INNER^TEST"))
+	tests := []struct {
+		name     string
+		stream   []byte
+		options  ReaderOptions
+		validate func(*testing.T, core.DataSet, error)
+	}{
+		{
+			name: "parses as sequence",
+			stream: bytes.Join([][]byte{
+				implicitHeaderBytes(binary.LittleEndian, privateDataTag, 0xFFFFFFFF),
+				dicomtest.SequenceControlBytes(binary.LittleEndian, core.TagItem, uint32(len(inner))),
+				inner,
+				dicomtest.SequenceControlBytes(binary.LittleEndian, core.TagSequenceDelimitationItem, 0),
+			}, nil),
+			options: ReaderOptions{Dictionary: std.Dictionary},
+			validate: func(t *testing.T, dataset core.DataSet, err error) {
+				if err != nil {
+					t.Fatal(err)
+				}
+				outer := onlyElement(t, dataset)
+				if outer.Tag() != privateDataTag || outer.VR() != core.VRUN {
+					t.Fatalf("private sequence = %s %s, want %s UN", outer.Tag(), outer.VR(), privateDataTag)
+				}
+				sequence, ok := outer.Value.(core.SequenceValue)
+				if !ok || len(sequence.Items) != 1 || len(sequence.Items[0].Elements) != 1 {
+					t.Fatalf("private sequence value = %#v, want one item/element", outer.Value)
+				}
+				if got := sequence.Items[0].Elements[0].StringValue(); got != "INNER^TEST" {
+					t.Fatalf("private nested value = %q, want INNER^TEST", got)
+				}
+			},
+		},
+		{
+			name: "rejects malformed sequence body",
+			stream: bytes.Join([][]byte{
+				implicitHeaderBytes(binary.LittleEndian, privateDataTag, 0xFFFFFFFF),
+				definedElementBytes(transfer.ImplicitVRLittleEndian, patientNameTag, core.VRPN, 10, []byte("AFTER^TEST")),
+			}, nil),
+			options: ReaderOptions{Dictionary: std.Dictionary},
+			validate: func(t *testing.T, _ core.DataSet, err error) {
+				if err == nil {
+					t.Fatal("ReadDataSet() error = nil, want malformed sequence body error")
+				}
+				var parseErr *ParseError
+				if !errors.As(err, &parseErr) || parseErr.Op != OpReadValue || parseErr.Tag != patientNameTag {
+					t.Fatalf("ReadDataSet() error = %v, want OpReadValue ParseError for %s", err, patientNameTag)
+				}
+			},
+		},
+		{
+			name: "honors sequence depth limit",
+			stream: bytes.Join([][]byte{
+				implicitHeaderBytes(binary.LittleEndian, privateDataTag, 0xFFFFFFFF),
+				dicomtest.SequenceControlBytes(binary.LittleEndian, core.TagItem, 0xFFFFFFFF),
+				dicomtest.SequenceControlBytes(binary.LittleEndian, core.TagItemDelimitationItem, 0),
+				dicomtest.SequenceControlBytes(binary.LittleEndian, core.TagSequenceDelimitationItem, 0),
+			}, nil),
+			options: ReaderOptions{Dictionary: std.Dictionary, MaxSequenceDepth: 1},
+			validate: func(t *testing.T, _ core.DataSet, err error) {
+				if !errors.Is(err, ErrMaxDepthExceeded) {
+					t.Fatalf("ReadDataSet() error = %v, want ErrMaxDepthExceeded", err)
+				}
+			},
+		},
 	}
-	if !errors.Is(err, ErrUnsupportedUndefinedLength) {
-		t.Fatalf("expected ErrUnsupportedUndefinedLength, got %v", err)
-	}
-
-	var parseErr *ParseError
-	if !errors.As(err, &parseErr) {
-		t.Fatalf("expected ParseError, got %T", err)
-	}
-	if parseErr.Op != OpReadValue {
-		t.Fatalf("op = %s, want %s", parseErr.Op, OpReadValue)
-	}
-	if parseErr.Tag != privateDataTag {
-		t.Fatalf("tag = %s, want %s", parseErr.Tag, privateDataTag)
-	}
-	if parseErr.VR != core.VRUN {
-		t.Fatalf("VR = %s, want %s", parseErr.VR, core.VRUN)
-	}
-	if parseErr.Length != core.UndefinedLength {
-		t.Fatalf("length = %s, want %s", parseErr.Length, core.UndefinedLength)
-	}
-
-	tok, err := reader.Next()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if tok.Element.Tag() != patientNameTag {
-		t.Fatalf("subsequent tag = %s, want %s", tok.Element.Tag(), patientNameTag)
-	}
-	if tok.Element.VR() != core.VRPN {
-		t.Fatalf("subsequent VR = %s, want %s", tok.Element.VR(), core.VRPN)
-	}
-	if got := tok.Element.StringValue(); got != "AFTER^TEST" {
-		t.Fatalf("subsequent patient name = %q, want %q", got, "AFTER^TEST")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			reader := NewReader(bytes.NewReader(tt.stream), transfer.ImplicitVRLittleEndian, tt.options)
+			dataset, err := reader.ReadDataSet()
+			tt.validate(t, dataset, err)
+		})
 	}
 }
 func TestReadHeaderImplicitVRUsesDictionaryForRetiredTag(t *testing.T) {
@@ -444,7 +519,7 @@ func TestReadDataSetImplicitVRUsesCustomDictionaryForSequenceTag(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if dict.byTagCalls == 0 {
+	if dict.byTagCalls.Load() == 0 {
 		t.Fatal("custom dictionary was not consulted")
 	}
 	if len(got.Elements) != 1 {

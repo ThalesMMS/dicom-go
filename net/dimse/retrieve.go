@@ -1,6 +1,7 @@
 package dimse
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/ThalesMMS/dicom-go/core"
@@ -14,14 +15,12 @@ import (
 // dataset (i.e., CommandDataSetType == DataSetPresent) rather than as a command
 // element.
 //
-// This package intentionally models a minimal subset: callers are responsible
-// for choosing the SOP Class UID (AffectedSOPClassUID) appropriate for the
-// desired Query/Retrieve Information Model.
+// This package models the common C-MOVE command fields plus the optional Move
+// Originator fields used when a C-MOVE was triggered by another DIMSE operation.
+// Callers are responsible for choosing the SOP Class UID (AffectedSOPClassUID)
+// appropriate for the desired Query/Retrieve Information Model.
 //
 // Ref: DICOM PS3.7 C.4.2 (C-MOVE).
-//
-// Note: The C-MOVE command set includes additional optional elements (e.g.
-// Move Originator AE Title/Message ID) that are out of scope for this subtask.
 //
 // Priority uses the standard DIMSE Priority element (0=medium, 1=high, 2=low).
 //
@@ -40,20 +39,21 @@ import (
 // - (0000,0600) Move Destination
 // - (0000,0700) Priority
 // - (0000,0800) Command Data Set Type
+// - (0000,1030) Move Originator Application Entity Title, optional
+// - (0000,1031) Move Originator Message ID, optional
 //
-// The response command set includes Status and sub-operation counts, which are
-// not modeled here yet.
-//
-// For now, Parse/CommandSet focus on the required base elements.
+// The response command set includes Status and optional sub-operation counts.
 type CMoveRequest struct {
-	AffectedSOPClassUID string
-	MessageID           uint16
-	Priority            uint16
-	MoveDestination     string
+	AffectedSOPClassUID          string
+	MessageID                    uint16
+	Priority                     uint16
+	MoveDestination              string
+	MoveOriginatorAETitle        string
+	MoveOriginatorMessageIDOrNil *uint16
 }
 
 func (r CMoveRequest) CommandSet() []core.Element {
-	return []core.Element{
+	elements := []core.Element{
 		newUIElement(AffectedSOPClassUID, r.AffectedSOPClassUID),
 		newUSCommandElement(CommandField, CMoveRQ),
 		newUSCommandElement(MessageID, r.MessageID),
@@ -61,18 +61,33 @@ func (r CMoveRequest) CommandSet() []core.Element {
 		newUSCommandElement(Priority, r.Priority),
 		newUSCommandElement(CommandDataSetType, DataSetPresent),
 	}
+	if r.MoveOriginatorAETitle != "" {
+		elements = append(elements, core.Element{
+			Header: core.ElementHeader{Tag: MoveOriginatorApplicationEntityTitle, VR: core.VRAE},
+			Value:  core.StringValue{r.MoveOriginatorAETitle},
+		})
+	}
+	if r.MoveOriginatorMessageIDOrNil != nil {
+		elements = append(elements, newUSCommandElement(MoveOriginatorMessageID, *r.MoveOriginatorMessageIDOrNil))
+	}
+	return elements
 }
 
 // CMoveResponse represents a C-MOVE-RSP DIMSE command.
 //
-// This minimal struct includes only the common response fields. The query/retrieve
-// service defines additional optional fields (e.g. number of remaining/completed
-// sub-operations) that are not represented here.
+// Optional sub-operation counts are exposed when present in pending, warning,
+// failure, cancel or final success responses. Identifier is only sent/received
+// for statuses that allow a response identifier dataset.
 type CMoveResponse struct {
-	AffectedSOPClassUID       string
-	MessageIDBeingRespondedTo uint16
-	Status                    uint16
-	Identifier                *object.Object
+	AffectedSOPClassUID                 string
+	MessageIDBeingRespondedTo           uint16
+	Status                              uint16
+	ErrorComment                        string
+	Identifier                          *object.Object
+	NumberOfRemainingSuboperationsOrNil *uint16
+	NumberOfCompletedSuboperationsOrNil *uint16
+	NumberOfFailedSuboperationsOrNil    *uint16
+	NumberOfWarningSuboperationsOrNil   *uint16
 }
 
 func (r CMoveResponse) CommandSet() []core.Element {
@@ -80,13 +95,32 @@ func (r CMoveResponse) CommandSet() []core.Element {
 	if r.Identifier != nil && cMoveResponseStatusAllowsIdentifier(r.Status) {
 		datasetType = DataSetPresent
 	}
-	return []core.Element{
+	elements := []core.Element{
 		newUIElement(AffectedSOPClassUID, r.AffectedSOPClassUID),
 		newUSCommandElement(CommandField, CMoveRSP),
 		newUSCommandElement(MessageIDBeingRespondedTo, r.MessageIDBeingRespondedTo),
 		newUSCommandElement(CommandDataSetType, datasetType),
 		newUSCommandElement(Status, r.Status),
 	}
+	if r.NumberOfRemainingSuboperationsOrNil != nil {
+		elements = append(elements, newUSCommandElement(NumberOfRemainingSuboperations, *r.NumberOfRemainingSuboperationsOrNil))
+	}
+	if r.NumberOfCompletedSuboperationsOrNil != nil {
+		elements = append(elements, newUSCommandElement(NumberOfCompletedSuboperations, *r.NumberOfCompletedSuboperationsOrNil))
+	}
+	if r.NumberOfFailedSuboperationsOrNil != nil {
+		elements = append(elements, newUSCommandElement(NumberOfFailedSuboperations, *r.NumberOfFailedSuboperationsOrNil))
+	}
+	if r.NumberOfWarningSuboperationsOrNil != nil {
+		elements = append(elements, newUSCommandElement(NumberOfWarningSuboperations, *r.NumberOfWarningSuboperationsOrNil))
+	}
+	if r.ErrorComment != "" {
+		elements = append(elements, core.Element{
+			Header: core.ElementHeader{Tag: ErrorComment, VR: core.VRLO},
+			Value:  core.StringValue{r.ErrorComment},
+		})
+	}
+	return elements
 }
 
 func ParseCMoveRequest(obj *object.Object) (*CMoveRequest, error) {
@@ -120,12 +154,21 @@ func ParseCMoveRequest(obj *object.Object) (*CMoveRequest, error) {
 	if dataSetType != DataSetPresent {
 		return nil, fmt.Errorf("dicom dimse: C-MOVE request dataset type 0x%04X, want dataset present 0x%04X", dataSetType, DataSetPresent)
 	}
-	return &CMoveRequest{
+	req := &CMoveRequest{
 		AffectedSOPClassUID: sopClassUID,
 		MessageID:           messageID,
 		Priority:            priority,
 		MoveDestination:     moveDest,
-	}, nil
+	}
+	if originator, ok := obj.GetString(MoveOriginatorApplicationEntityTitle); ok {
+		req.MoveOriginatorAETitle = originator
+	}
+	originatorMessageID, err := optionalCommandUint16(obj, MoveOriginatorMessageID)
+	if err != nil {
+		return nil, err
+	}
+	req.MoveOriginatorMessageIDOrNil = originatorMessageID
+	return req, nil
 }
 
 func ParseCMoveResponse(obj *object.Object) (*CMoveResponse, error) {
@@ -153,22 +196,42 @@ func ParseCMoveResponse(obj *object.Object) (*CMoveResponse, error) {
 		return nil, err
 	}
 	var identifier *object.Object
-	switch dataSetType {
-	case NoDataSet:
-	case DataSetPresent:
+	if dataSetType != NoDataSet {
 		statusClass := ClassifyCMoveStatus(status)
-		if statusClass == CMoveStatusSuccess || statusClass == CMoveStatusPending {
-			return nil, fmt.Errorf("dicom dimse: C-MOVE response dataset present for status 0x%04X", status)
+		if statusClass != CMoveStatusSuccess && statusClass != CMoveStatusPending {
+			identifier = object.New(nil)
 		}
-		identifier = object.New(nil)
-	default:
-		return nil, fmt.Errorf("dicom dimse: C-MOVE response dataset type 0x%04X, want 0x%04X or 0x%04X", dataSetType, DataSetPresent, NoDataSet)
+	}
+	remaining, err := optionalCommandUint16(obj, NumberOfRemainingSuboperations)
+	if err != nil {
+		return nil, err
+	}
+	completed, err := optionalCommandUint16(obj, NumberOfCompletedSuboperations)
+	if err != nil {
+		return nil, err
+	}
+	failed, err := optionalCommandUint16(obj, NumberOfFailedSuboperations)
+	if err != nil {
+		return nil, err
+	}
+	warning, err := optionalCommandUint16(obj, NumberOfWarningSuboperations)
+	if err != nil {
+		return nil, err
+	}
+	errorComment := ""
+	if s, ok := obj.GetString(ErrorComment); ok {
+		errorComment = s
 	}
 	return &CMoveResponse{
-		AffectedSOPClassUID:       sopClassUID,
-		MessageIDBeingRespondedTo: msgID,
-		Status:                    status,
-		Identifier:                identifier,
+		AffectedSOPClassUID:                 sopClassUID,
+		MessageIDBeingRespondedTo:           msgID,
+		Status:                              status,
+		ErrorComment:                        errorComment,
+		Identifier:                          identifier,
+		NumberOfRemainingSuboperationsOrNil: remaining,
+		NumberOfCompletedSuboperationsOrNil: completed,
+		NumberOfFailedSuboperationsOrNil:    failed,
+		NumberOfWarningSuboperationsOrNil:   warning,
 	}, nil
 }
 
@@ -194,6 +257,10 @@ func ReceiveCMoveRequest(assoc *ul.Association, pcID byte) (*CMoveRequest, error
 }
 
 func SendCMoveResponse(assoc *ul.Association, pcID byte, rsp CMoveResponse) error {
+	return SendCMoveResponseWithContext(nil, assoc, pcID, rsp)
+}
+
+func SendCMoveResponseWithContext(ctx context.Context, assoc *ul.Association, pcID byte, rsp CMoveResponse) error {
 	if rsp.MessageIDBeingRespondedTo == 0 {
 		return fmt.Errorf("dicom dimse: C-MOVE response MessageIDBeingRespondedTo must be non-zero")
 	}
@@ -203,7 +270,7 @@ func SendCMoveResponse(assoc *ul.Association, pcID byte, rsp CMoveResponse) erro
 	if rsp.Identifier != nil && !cMoveResponseStatusAllowsIdentifier(rsp.Status) {
 		return fmt.Errorf("dicom dimse: C-MOVE response identifier dataset not allowed for status 0x%04X", rsp.Status)
 	}
-	if err := SendCommandSet(assoc, pcID, rsp.CommandSet()); err != nil {
+	if err := SendCommandSetWithContext(ctx, assoc, pcID, rsp.CommandSet()); err != nil {
 		return err
 	}
 	if rsp.Identifier == nil {
@@ -213,11 +280,15 @@ func SendCMoveResponse(assoc *ul.Association, pcID byte, rsp CMoveResponse) erro
 	if err != nil {
 		return err
 	}
-	return SendDataSet(assoc, pcID, rsp.Identifier, syntax)
+	return SendDataSetWithContext(ctx, assoc, pcID, rsp.Identifier, syntax)
 }
 
 func ReceiveCMoveResponse(assoc *ul.Association, pcID byte) (*CMoveResponse, error) {
-	command, err := ReceiveCommandSet(assoc, pcID)
+	return receiveCMoveResponseWithContext(nil, assoc, pcID)
+}
+
+func receiveCMoveResponseWithContext(ctx context.Context, assoc *ul.Association, pcID byte) (*CMoveResponse, error) {
+	command, err := receiveCommandSetWithContext(ctx, assoc, pcID)
 	if err != nil {
 		return nil, err
 	}
@@ -232,7 +303,7 @@ func ReceiveCMoveResponse(assoc *ul.Association, pcID byte) (*CMoveResponse, err
 	if err != nil {
 		return nil, err
 	}
-	rsp.Identifier, err = ReceiveDataSet(assoc, pcID, syntax)
+	rsp.Identifier, err = receiveIdentifierDataSetWithContext(ctx, assoc, pcID, syntax)
 	if err != nil {
 		return nil, err
 	}
@@ -240,19 +311,7 @@ func ReceiveCMoveResponse(assoc *ul.Association, pcID byte) (*CMoveResponse, err
 }
 
 func acceptedTransferSyntax(assoc *ul.Association, pcID byte) (transfer.Syntax, error) {
-	if assoc == nil {
-		return transfer.Syntax{}, fmt.Errorf("dicom dimse: nil association")
-	}
-	for _, ac := range assoc.AcceptedContexts {
-		if ac.ID != pcID {
-			continue
-		}
-		if syntax, ok := transfer.DefaultRegistry.Get(ac.TransferSyntaxUID); ok {
-			return syntax, nil
-		}
-		return transfer.Syntax{}, fmt.Errorf("dicom dimse: unsupported transfer syntax UID %q for presentation context %d", ac.TransferSyntaxUID, pcID)
-	}
-	return transfer.Syntax{}, fmt.Errorf("dicom dimse: no accepted presentation context %d", pcID)
+	return AcceptedTransferSyntax(assoc, pcID)
 }
 
 func cMoveResponseStatusAllowsIdentifier(status uint16) bool {

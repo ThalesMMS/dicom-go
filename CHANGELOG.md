@@ -9,6 +9,42 @@ and this project uses Go module semantic version tags.
 
 ### Added
 
+- `video`: bounded, context-aware inspection and streaming extraction for DICOM
+  MPEG, H.264, and HEVC transfer syntaxes, including fragment/container
+  validation and deterministic frame timing metadata for application-owned
+  native media backends.
+- `gsps`: image/frame-specific Displayed Area selection with
+  SCALE TO FIT/TRUE SIZE/MAGNIFY calibration and complete rectangular,
+  circular, polygonal, and bitmap Display Shutter read/write/apply support,
+  including strict malformed/unknown-field errors and exact P-Value, CIELab,
+  and overlay-data preservation.
+- `pixeldata/display`: a staged grayscale display pipeline (`Pipeline` /
+  `RenderGray`) implementing the DICOM modality and VOI transforms — stored
+  pixel extraction, Rescale Slope/Intercept, Modality LUT Sequence, Window
+  Center/Width with LINEAR/LINEAR_EXACT/SIGMOID functions, and VOI LUT Sequence
+  — with `*FromObject` extractors and invalid-LUT-descriptor reporting.
+- `pixeldata/display` presentation stage: a `Presentation` transform modeled
+  after the modality/VOI transforms covering MONOCHROME1 / Presentation LUT
+  Shape inversion, DICOM overlays (groups 0x6000-0x601E) burn-in, and
+  rectangular/circular/polygonal/bitmap display shutters with intersection
+  semantics, plus Presentation LUT Sequence application. GSPS interpretation
+  returns an explicit `ErrUnsupportedGSPS` limitation.
+- `pixeldata/display` color path: `RenderColor` converts PALETTE COLOR (via
+  red/green/blue palette LUTs), YBR_FULL and YBR_FULL_422, and RGB (interleaved
+  or planar) to RGBA, with `PaletteFromObject` and a metadata-only
+  `ColorMetadataFromObject` (Color Space and raw ICC Profile, no color
+  management). Segmented palette LUTs are expanded from discrete, linear, and
+  indirect segments. Unsupported photometric/layout cases return typed errors
+  instead of misleading images, preserving the lightweight default dependency
+  policy.
+- `pixeldata/display`: `VOILUT.WindowByte` (window a single pre-sampled modality
+  value) and `DecodeModality` (extract stored pixels to modality values for
+  callers that re-window the same frame, such as render caches).
+- `sr`: typed DICOM Structured Reporting primitives for Key Object Selection
+  (KOS) and Basic Text SR — document metadata, the content-item tree
+  (CONTAINER/TEXT/CODE/IMAGE/NUM), coded entries, image references, and numeric
+  measurements — with dataset encode (`Document.Dataset`) and decode
+  (`ReadDocument`) for synthetic round-trips.
 - DIMSE Query/Retrieve: Study Root C-MOVE SCU implementation with status handling
   and a small `dicom-go-retrieve` CLI for interoperability testing.
 - DIMSE Storage Commitment Push Model primitives: N-ACTION and N-EVENT-REPORT,
@@ -18,8 +54,23 @@ and this project uses Go module semantic version tags.
 
 ### Changed
 
+- `net/dicomweb`: `TokenManager.Logout` is terminal. Subsequent `Token` calls
+  return `ErrBearerTokenUnavailable` and cannot reacquire credentials; callers
+  must construct a new manager to authenticate again.
+- `pixeldata/frame` grayscale rendering now delegates to `pixeldata/display`,
+  removing the duplicated windowing/modality math while preserving output.
+- `render`: VR transfer-function colors are now linearized from sRGB before DVR
+  compositing and converted back to sRGB for display output; STL iso-surface
+  export documents the intentional watertight voxel-boundary mesh policy instead
+  of smoothing with marching cubes.
 - Conformance and README limitations updated to reflect newly added DIMSE
   capabilities and remaining non-goals.
+
+### Fixed
+
+- `deid`: explicit burned-in pixel redaction now supports RGB native pixel data
+  with `PlanarConfiguration=1`, masking the requested rectangle in each color
+  plane instead of rejecting planar images.
 
 ## [0.1.0] - 2026-04-24
 

@@ -5,6 +5,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/ThalesMMS/dicom-go/core"
 	uiddict "github.com/ThalesMMS/dicom-go/dictionary/uid"
 )
 
@@ -69,7 +70,7 @@ var DefaultRegistry Registry = newDefaultRegistry()
 
 // NormalizeUID trims trailing spaces and NUL bytes from a transfer syntax UID.
 func NormalizeUID(uid string) string {
-	return strings.TrimRight(uid, " \x00")
+	return core.NormalizeUID(uid)
 }
 
 func newDefaultRegistry() Registry {
@@ -166,6 +167,20 @@ func knownTransferSyntax(entry uiddict.Entry) Syntax {
 		return JPEG2000Part2
 	case RLELossless.UID:
 		return RLELossless
+	case JPIPReferenced.UID:
+		return JPIPReferenced
+	case JPIPReferencedDeflate.UID:
+		return JPIPReferencedDeflate
+	case JPIPHTJ2KReferenced.UID:
+		return JPIPHTJ2KReferenced
+	case JPIPHTJ2KReferencedDeflate.UID:
+		return JPIPHTJ2KReferencedDeflate
+	}
+	if IsJPEGXLTransferSyntax(entry.UID) {
+		return newJPEGXLSyntax(entry.UID, entry.Name)
+	}
+	if IsVideoTransferSyntax(entry.UID) {
+		return newVideoMediaSyntax(entry.UID, entry.Name)
 	}
 
 	syntax := Syntax{

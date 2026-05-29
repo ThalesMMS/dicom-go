@@ -173,6 +173,33 @@ func TestBasicCoderDefaultsToLittleEndian(t *testing.T) {
 	}
 }
 
+func TestEndiannessByteOrder(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		in   Endianness
+		want []byte
+	}{
+		{name: "little", in: LittleEndian, want: []byte{0x02, 0x01}},
+		{name: "big", in: BigEndian, want: []byte{0x01, 0x02}},
+		{name: "unknown defaults little", in: Endianness(99), want: []byte{0x02, 0x01}},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			buf := make([]byte, 2)
+			tt.in.ByteOrder().PutUint16(buf, 0x0102)
+			if !bytes.Equal(buf, tt.want) {
+				t.Fatalf("ByteOrder().PutUint16() = %v, want %v", buf, tt.want)
+			}
+		})
+	}
+}
+
 func TestBasicDecoderPreservesIOError(t *testing.T) {
 	t.Parallel()
 

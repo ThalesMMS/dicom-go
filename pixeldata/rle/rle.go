@@ -1,9 +1,11 @@
 package rle
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/ThalesMMS/dicom-go/object"
 	"github.com/ThalesMMS/dicom-go/pixeldata"
@@ -13,11 +15,12 @@ import (
 const UID = "1.2.840.10008.1.2.5"
 
 var (
-	ErrInvalidHeader            = errors.New("dicom: invalid RLE header")
-	ErrInvalidSegmentCount      = errors.New("dicom: invalid RLE segment count")
-	ErrInvalidSegmentOffset     = errors.New("dicom: invalid RLE segment offset")
-	ErrSegmentDecodeFailed      = errors.New("dicom: RLE segment decode failed")
-	ErrUnsupportedBitsAllocated = errors.New("dicom: unsupported RLE BitsAllocated")
+	ErrInvalidHeader              = errors.New("dicom: invalid RLE header")
+	ErrInvalidSegmentCount        = errors.New("dicom: invalid RLE segment count")
+	ErrInvalidSegmentOffset       = errors.New("dicom: invalid RLE segment offset")
+	ErrSegmentDecodeFailed        = errors.New("dicom: RLE segment decode failed")
+	ErrUnsupportedBitsAllocated   = errors.New("dicom: unsupported RLE BitsAllocated")
+	ErrUnsupportedSamplesPerPixel = errors.New("dicom: unsupported RLE SamplesPerPixel")
 )
 
 // Codec decodes DICOM RLE Lossless encapsulated pixel data.
@@ -42,7 +45,19 @@ func RegisterDefault() error {
 }
 
 // Decode decodes one RLE fragment per output frame.
-func (*Codec) Decode(pixel pixeldata.PixelData, obj *object.Object) (pixeldata.Frames, error) {
+func (c *Codec) Decode(pixel pixeldata.PixelData, obj *object.Object) (pixeldata.Frames, error) {
+	return c.DecodeContext(context.Background(), pixel, obj)
+}
+
+// DecodeContext decodes one RLE fragment per output frame while honoring
+// cancellation between frames, segments, and PackBits runs.
+func (*Codec) DecodeContext(ctx context.Context, pixel pixeldata.PixelData, obj *object.Object) (pixeldata.Frames, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return pixeldata.Frames{}, err
+	}
 	if !pixel.Encapsulated {
 		return pixeldata.Frames{}, fmt.Errorf("%w: RLE requires encapsulated pixel data", pixeldata.ErrIncompatiblePixelData)
 	}
@@ -53,6 +68,31 @@ func (*Codec) Decode(pixel pixeldata.PixelData, obj *object.Object) (pixeldata.F
 	}
 	if metadata.BitsAllocated != 8 && metadata.BitsAllocated != 16 {
 		return pixeldata.Frames{}, fmt.Errorf("%w: BitsAllocated=%d", ErrUnsupportedBitsAllocated, metadata.BitsAllocated)
+	}
+	if metadata.BitsStored == 0 || metadata.BitsStored > metadata.BitsAllocated || metadata.HighBit != metadata.BitsStored-1 {
+		return pixeldata.Frames{}, fmt.Errorf("%w: invalid stored-bit metadata", pixeldata.ErrIncompatiblePixelData)
+	}
+	if metadata.SamplesPerPixel == 0 || metadata.SamplesPerPixel > 3 {
+		return pixeldata.Frames{}, fmt.Errorf("%w: SamplesPerPixel=%d", ErrUnsupportedSamplesPerPixel, metadata.SamplesPerPixel)
+	}
+	if metadata.PixelRepresentation != 0 && metadata.PixelRepresentation != 1 {
+		return pixeldata.Frames{}, fmt.Errorf("%w: PixelRepresentation=%d", pixeldata.ErrUnsupportedPixelRepresentation, metadata.PixelRepresentation)
+	}
+	if !supportedPhotometricInterpretation(metadata) {
+		return pixeldata.Frames{}, fmt.Errorf(
+			"%w: PhotometricInterpretation=%s SamplesPerPixel=%d",
+			pixeldata.ErrUnsupportedPhotometricInterpretation,
+			strings.TrimSpace(metadata.PhotometricInterpretation),
+			metadata.SamplesPerPixel,
+		)
+	}
+	photometric := strings.ToUpper(strings.TrimSpace(metadata.PhotometricInterpretation))
+	if metadata.SamplesPerPixel == 1 && metadata.PlanarConfigurationPresent && metadata.PlanarConfiguration != 0 ||
+		metadata.SamplesPerPixel == 3 && (!metadata.PlanarConfigurationPresent || metadata.PlanarConfiguration != 0) {
+		return pixeldata.Frames{}, fmt.Errorf("%w: invalid PlanarConfiguration", pixeldata.ErrUnsupportedPlanarConfiguration)
+	}
+	if metadata.PixelRepresentation == 1 && photometric != "MONOCHROME1" && photometric != "MONOCHROME2" {
+		return pixeldata.Frames{}, fmt.Errorf("%w: PixelRepresentation=%d", pixeldata.ErrUnsupportedPixelRepresentation, metadata.PixelRepresentation)
 	}
 
 	fragments := pixel.Sequence.Fragments
@@ -70,7 +110,11 @@ func (*Codec) Decode(pixel pixeldata.PixelData, obj *object.Object) (pixeldata.F
 
 	frames := make([][]byte, len(fragments))
 	for i, fragment := range fragments {
-		frame, err := decodeFragment(
+		if err := ctx.Err(); err != nil {
+			return pixeldata.Frames{}, err
+		}
+		frame, err := decodeFragmentContext(
+			ctx,
 			fragment,
 			int(metadata.Rows),
 			int(metadata.Columns),
@@ -88,6 +132,18 @@ func (*Codec) Decode(pixel pixeldata.PixelData, obj *object.Object) (pixeldata.F
 		Columns: int(metadata.Columns),
 		Data:    frames,
 	}, nil
+}
+
+func supportedPhotometricInterpretation(metadata pixeldata.Metadata) bool {
+	photometric := strings.ToUpper(strings.TrimSpace(metadata.PhotometricInterpretation))
+	switch metadata.SamplesPerPixel {
+	case 1:
+		return photometric == "MONOCHROME1" || photometric == "MONOCHROME2" || photometric == "PALETTE COLOR"
+	case 3:
+		return photometric == "RGB"
+	default:
+		return false
+	}
 }
 
 func parseHeader(fragment []byte) ([]uint32, error) {
@@ -119,9 +175,19 @@ func parseHeader(fragment []byte) ([]uint32, error) {
 	return offsets, nil
 }
 
-func decodePackBits(segment []byte) ([]byte, error) {
-	var out []byte
-	for i := 0; i < len(segment); {
+func decodePackBits(segment []byte, expectedSize int) ([]byte, error) {
+	return decodePackBitsContext(context.Background(), segment, expectedSize)
+}
+
+func decodePackBitsContext(ctx context.Context, segment []byte, expectedSize int) ([]byte, error) {
+	if expectedSize < 0 {
+		return nil, fmt.Errorf("%w: invalid expected size %d", ErrSegmentDecodeFailed, expectedSize)
+	}
+	out := make([]byte, 0, expectedSize)
+	for i := 0; i < len(segment) && len(out) < expectedSize; {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		h := int(int8(segment[i]))
 		i++
 
@@ -130,6 +196,9 @@ func decodePackBits(segment []byte) ([]byte, error) {
 			n := h + 1
 			if i+n > len(segment) {
 				return nil, fmt.Errorf("%w: truncated literal run", ErrSegmentDecodeFailed)
+			}
+			if n > expectedSize-len(out) {
+				return nil, fmt.Errorf("%w: literal run exceeds expected size", ErrSegmentDecodeFailed)
 			}
 			out = append(out, segment[i:i+n]...)
 			i += n
@@ -140,6 +209,9 @@ func decodePackBits(segment []byte) ([]byte, error) {
 			n := 1 - h
 			value := segment[i]
 			i++
+			if n > expectedSize-len(out) {
+				return nil, fmt.Errorf("%w: repeat run exceeds expected size", ErrSegmentDecodeFailed)
+			}
 			for range n {
 				out = append(out, value)
 			}
@@ -147,11 +219,21 @@ func decodePackBits(segment []byte) ([]byte, error) {
 			// h == -128 is a no-op in PackBits.
 		}
 	}
+	if len(out) != expectedSize {
+		return nil, fmt.Errorf("%w: decoded %d bytes, expected %d", ErrSegmentDecodeFailed, len(out), expectedSize)
+	}
 
 	return out, nil
 }
 
 func decodeFragment(fragment []byte, rows, cols, samplesPerPixel, bitsAllocated int) ([]byte, error) {
+	return decodeFragmentContext(context.Background(), fragment, rows, cols, samplesPerPixel, bitsAllocated)
+}
+
+func decodeFragmentContext(ctx context.Context, fragment []byte, rows, cols, samplesPerPixel, bitsAllocated int) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if bitsAllocated != 8 && bitsAllocated != 16 {
 		return nil, fmt.Errorf("%w: BitsAllocated=%d", ErrUnsupportedBitsAllocated, bitsAllocated)
 	}
@@ -194,13 +276,16 @@ func decodeFragment(fragment []byte, rows, cols, samplesPerPixel, bitsAllocated 
 	frameSize := int(frameSize64)
 	decodedSegments := make([][]byte, expectedSegments)
 	for segmentIndex := range expectedSegments {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		segmentStart := int(offsets[segmentIndex])
 		segmentEnd := int(offsets[segmentIndex+1])
 		if segmentEnd < segmentStart {
 			return nil, fmt.Errorf("%w: segment %d offset range %d..%d", ErrInvalidSegmentOffset, segmentIndex, segmentStart, segmentEnd)
 		}
 
-		decoded, err := decodePackBits(fragment[segmentStart:segmentEnd])
+		decoded, err := decodePackBitsContext(ctx, fragment[segmentStart:segmentEnd], pixelsPerSegment)
 		if err != nil {
 			return nil, fmt.Errorf("%w: segment %d", err, segmentIndex)
 		}
@@ -220,6 +305,9 @@ func decodeFragment(fragment []byte, rows, cols, samplesPerPixel, bitsAllocated 
 	segmentIndex := 0
 	for sample := 0; sample < samplesPerPixel; sample++ {
 		for byteOffset := bytesPerSample - 1; byteOffset >= 0; byteOffset-- {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 			decoded := decodedSegments[segmentIndex]
 			start := sample*bytesPerSample + byteOffset
 			step := samplesPerPixel * bytesPerSample

@@ -142,7 +142,7 @@ func TestRunTextOutputMatchesGolden(t *testing.T) {
 
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
-	exitCode := Run([]string{"-max-value=64", "-show-offsets", fixturePath}, &stdout, &stderr)
+	exitCode := Run([]string{"-max-value=64", fixturePath}, &stdout, &stderr)
 
 	if exitCode != 0 {
 		t.Fatalf("Run() exit code = %d, want 0, stderr=%q", exitCode, stderr.String())
@@ -151,6 +151,64 @@ func TestRunTextOutputMatchesGolden(t *testing.T) {
 		t.Fatalf("unexpected stderr: %q", stderr.String())
 	}
 	assertGolden(t, "basic_text.golden", stdout.Bytes())
+}
+
+func TestRunTextOutputWithOffsets(t *testing.T) {
+	fixturePath := writeFixturePath(t, primitiveFixture(t))
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	exitCode := Run([]string{"-max-value=64", "-show-offsets", fixturePath}, &stdout, &stderr)
+
+	if exitCode != 0 {
+		t.Fatalf("Run() exit code = %d, want 0, stderr=%q", exitCode, stderr.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("unexpected stderr: %q", stderr.String())
+	}
+	text := stdout.String()
+	for _, want := range []string{
+		"00000084  (0002,0000) UL",
+		"0000013E  (0008,0016) UI",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("offset dump missing %q:\n%s", want, text)
+		}
+	}
+	if strings.Contains(text, "currently has no effect") {
+		t.Fatalf("offset dump should not include stale no-op wording:\n%s", text)
+	}
+}
+
+func TestRunTextOutputListsDeferredEncapsulatedPixelData(t *testing.T) {
+	pixel := dicomtest.NewFragmentSequenceElement(
+		core.TagPixelData,
+		[]byte{0x00, 0x00, 0x00, 0x00},
+		bytes.Repeat([]byte{0xAB}, 256),
+		[]byte{0x01, 0x02, 0x03, 0x00},
+	)
+	data, err := dicomtest.Part10File(
+		transfer.EncapsulatedUncompressedExplicitVRLittleEndian,
+		append(dicomtest.MinimalDataset(), pixel)...,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixturePath := writeFixturePath(t, data)
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	exitCode := Run([]string{fixturePath}, &stdout, &stderr)
+
+	if exitCode != 0 {
+		t.Fatalf("Run() exit code = %d, want 0, stderr=%q", exitCode, stderr.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("unexpected stderr: %q", stderr.String())
+	}
+	if got := stdout.String(); !strings.Contains(got, "(7FE0,0010) OB UNDEFINED PixelData") {
+		t.Fatalf("stdout missing deferred Pixel Data metadata line:\n%s", got)
+	}
 }
 
 func TestRunJSONOutputMatchesGolden(t *testing.T) {
@@ -167,6 +225,81 @@ func TestRunJSONOutputMatchesGolden(t *testing.T) {
 		t.Fatalf("unexpected stderr: %q", stderr.String())
 	}
 	assertGolden(t, "json_output.golden", stdout.Bytes())
+}
+
+func TestRunRecoversRawDataSetOnlyWithExplicitFlag(t *testing.T) {
+	raw := dicomtest.EncodeElements(transfer.ExplicitVRBigEndian, dicomtest.MinimalDataset()...)
+	fixturePath := writeFixturePath(t, raw)
+
+	var strictStdout bytes.Buffer
+	var strictStderr bytes.Buffer
+	if code := Run([]string{fixturePath}, &strictStdout, &strictStderr); code != 1 {
+		t.Fatalf("strict exit code = %d, want 1; stderr=%q", code, strictStderr.String())
+	}
+	if !strings.Contains(strictStderr.String(), "missing Part 10 preamble") {
+		t.Fatalf("strict stderr = %q, want missing preamble", strictStderr.String())
+	}
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	if code := Run([]string{"-recover-transfer-syntax", fixturePath}, &stdout, &stderr); code != 0 {
+		t.Fatalf("recovery exit code = %d, want 0; stderr=%q", code, stderr.String())
+	}
+	for _, want := range []string{
+		"Transfer Syntax: Explicit VR Big Endian",
+		"[inferred; confidence=",
+		"(0010,0010) PN",
+	} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("stdout missing %q:\n%s", want, stdout.String())
+		}
+	}
+	for _, want := range []string{
+		"dcmdump: warning: inferred transfer syntax",
+		transfer.ExplicitVRBigEndian.UID,
+		"source=inferred-missing-preamble",
+	} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Fatalf("stderr missing %q: %q", want, stderr.String())
+		}
+	}
+}
+
+func TestRunRecoveryJSONMarksInferredSyntaxWithoutChangingDatasetSchema(t *testing.T) {
+	data := buildRecoveryCLIFile("1.2.840.10008.999.630", transfer.ImplicitVRLittleEndian)
+	fixturePath := writeFixturePath(t, data)
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	if code := Run([]string{"-json", "-recover-transfer-syntax", fixturePath}, &stdout, &stderr); code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr=%q", code, stderr.String())
+	}
+	var got fileJSON
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if !got.TransferSyntax.Inferred || got.TransferSyntax.Source != string(object.TransferSyntaxSourceInferredUnknownUID) {
+		t.Fatalf("transfer syntax JSON = %+v, want inferred unknown UID", got.TransferSyntax)
+	}
+	if got.TransferSyntax.Confidence < 0.75 {
+		t.Fatalf("confidence = %.3f, want >= 0.75", got.TransferSyntax.Confidence)
+	}
+	if _, ok := got.DataSet["00100010"]; !ok {
+		t.Fatalf("recovered JSON dataset missing PatientName: %#v", got.DataSet)
+	}
+}
+
+func TestRunRecoveryRejectsOffsetsCombinationExplicitly(t *testing.T) {
+	fixturePath := writeFixturePath(t, primitiveFixture(t))
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	code := Run([]string{"-recover-transfer-syntax", "-show-offsets", fixturePath}, &stdout, &stderr)
+	if code != 2 {
+		t.Fatalf("exit code = %d, want 2; stderr=%q", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "cannot be combined") {
+		t.Fatalf("stderr = %q, want explicit combination error", stderr.String())
+	}
 }
 
 func TestRunErrors(t *testing.T) {
@@ -192,14 +325,14 @@ func TestRunErrors(t *testing.T) {
 			args:       []string{missingPath},
 			wantCode:   1,
 			wantStdout: "",
-			wantStderr: "no such file or directory",
+			wantStderr: "dcmdump: file:",
 		},
 		{
 			name:       "invalid corrupt dicom file",
 			args:       []string{corruptPath},
 			wantCode:   1,
 			wantStdout: "",
-			wantStderr: "missing Part 10 preamble",
+			wantStderr: "dcmdump: parse: dicom: missing Part 10 preamble",
 		},
 	}
 
@@ -239,6 +372,15 @@ func TestRunUsageErrorWithInvalidMaxValue(t *testing.T) {
 	if got := stderr.String(); !strings.Contains(got, "-max-value must be greater than zero") {
 		t.Fatalf("stderr missing max-value validation message: %q", got)
 	}
+}
+
+func buildRecoveryCLIFile(uid string, syntax transfer.Syntax) []byte {
+	var buf bytes.Buffer
+	buf.Write(make([]byte, 128))
+	buf.WriteString("DICM")
+	buf.Write(dicomtest.NewFileMetaBuilder().WithTransferSyntax(uid).Encode())
+	buf.Write(dicomtest.EncodeElements(syntax, dicomtest.MinimalDataset()...))
+	return buf.Bytes()
 }
 
 func assertTextGolden(t *testing.T, goldenName string, fixture func(*testing.T) []byte, maxValueLen int) {

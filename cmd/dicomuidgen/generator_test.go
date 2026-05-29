@@ -75,7 +75,10 @@ func TestGenerateSourceCompiles(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	goMod := "module generatedcheck\n\ngo 1.22\n"
+	repoRoot := filepath.Clean(filepath.Join(mustAbs(t, "."), "..", ".."))
+	repoRoot = filepath.ToSlash(repoRoot)
+
+	goMod := "module generatedcheck\n\ngo 1.22\n\nrequire github.com/ThalesMMS/dicom-go v0.0.0\n\nreplace github.com/ThalesMMS/dicom-go => " + repoRoot + "\n"
 	if err := os.WriteFile(filepath.Join(tempDir, "go.mod"), []byte(goMod), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -101,4 +104,14 @@ func TestGenerateSourceCompiles(t *testing.T) {
 	if !bytes.Contains(output, []byte("[no test files]")) {
 		t.Fatalf("unexpected go test output:\n%s", output)
 	}
+}
+
+func mustAbs(t *testing.T, path string) string {
+	t.Helper()
+
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return abs
 }

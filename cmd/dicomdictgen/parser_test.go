@@ -142,6 +142,33 @@ func TestParseDictionaryPrefersExactNonRetiredEntryOverOverlappingRange(t *testi
 	}
 }
 
+func TestParseDictionaryPreservesContextualVRToken(t *testing.T) {
+	input := strings.Join([]string{
+		"(0004,1200)\tup\tOffsetOfTheFirstDirectoryRecordOfTheRootDirectoryEntity\t1\tDICOM",
+		"(0014,3050)\tox\tDarkCurrentCounts\t1\tDICOM",
+		"(0028,0106)\txs\tSmallestImagePixelValue\t1\tDICOM",
+		"(0028,3006)\tlt\tLUTData\t1-n\tDICOM",
+		"(7FE0,0010)\tpx\tPixelData\t1\tDICOM",
+	}, "\n")
+
+	entries, err := parseDictionary(bufio.NewScanner(strings.NewReader(input)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[core.Tag]string{
+		core.NewTag(0x0004, 0x1200): "dictionary.ContextualVRUP",
+		core.NewTag(0x0014, 0x3050): "dictionary.ContextualVROX",
+		core.NewTag(0x0028, 0x0106): "dictionary.ContextualVRXS",
+		core.NewTag(0x0028, 0x3006): "dictionary.ContextualVRLT",
+		core.NewTag(0x7FE0, 0x0010): "dictionary.ContextualVRPX",
+	}
+	for _, entry := range entries {
+		if got := entry.ContextualVRExpr; got != want[entry.Tag] {
+			t.Fatalf("contextual VR for %v = %q, want %q", entry.Tag, got, want[entry.Tag])
+		}
+	}
+}
+
 func TestKeywordToName(t *testing.T) {
 	tests := map[string]string{
 		"PatientName":                 "Patient Name",

@@ -8,6 +8,10 @@ import (
 // Class UID for the Study Root information model.
 const StudyRootFindSOPClassUID = "1.2.840.10008.5.1.4.1.2.2.1"
 
+// PatientRootFindSOPClassUID is the Query/Retrieve Information Model - FIND SOP
+// Class UID for the Patient Root information model.
+const PatientRootFindSOPClassUID = "1.2.840.10008.5.1.4.1.2.1.1"
+
 // DefaultFindTransferSyntaxes are the transfer syntaxes proposed for C-FIND
 // identifier datasets.
 //
@@ -18,8 +22,11 @@ var DefaultFindTransferSyntaxes = []string{ul.ImplicitVRLittleEndian, ul.Explici
 // StudyRootFindPresentationContext returns a presentation context proposal for
 // Study Root Query/Retrieve Information Model - FIND.
 func StudyRootFindPresentationContext() ul.PresentationContext {
-	return ul.PresentationContext{
-		AbstractSyntaxUID:  StudyRootFindSOPClassUID,
-		TransferSyntaxUIDs: append([]string(nil), DefaultFindTransferSyntaxes...),
-	}
+	return presentationContextFor(StudyRootFindSOPClassUID, DefaultFindTransferSyntaxes)
+}
+
+// PatientRootFindPresentationContext returns a presentation context proposal
+// for Patient Root Query/Retrieve Information Model - FIND.
+func PatientRootFindPresentationContext() ul.PresentationContext {
+	return presentationContextFor(PatientRootFindSOPClassUID, DefaultFindTransferSyntaxes)
 }

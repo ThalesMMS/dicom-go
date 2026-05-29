@@ -25,6 +25,16 @@ func BenchmarkWriterWriteElement(b *testing.B) {
 		})
 	}
 
+	b.Run("native_pixeldata_8MiB/"+transfer.ExplicitVRLittleEndian.Name, func(b *testing.B) {
+		const payloadSize = 8 << 20
+		b.SetBytes(payloadSize)
+		benchmarkWriteElement(
+			b,
+			core.NewRawElement(core.TagPixelData, core.VROW, make([]byte, payloadSize)),
+			transfer.ExplicitVRLittleEndian,
+		)
+	})
+
 	b.Run("encapsulated_pixeldata/"+transfer.JPEGBaseline.Name, func(b *testing.B) {
 		benchmarkWriteElement(
 			b,

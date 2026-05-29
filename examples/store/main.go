@@ -67,7 +67,7 @@ func sendStore(address, filePath string) error {
 		Context:        ctx,
 		Contexts: []ul.PresentationContext{{
 			AbstractSyntaxUID:  sopClassUID,
-			TransferSyntaxUIDs: proposedTransferSyntaxes(fileTransferSyntaxUID),
+			TransferSyntaxUIDs: transfer.ProposedStoreTransferSyntaxUIDs(fileTransferSyntaxUID, transfer.NativeStoreSourceFirst),
 		}},
 	})
 	if err != nil {
@@ -140,24 +140,6 @@ func transferSyntaxUID(file *object.File) (string, error) {
 		return file.TransferSyntax.UID, nil
 	}
 	return "", object.ErrMissingTransferSyntax
-}
-
-func proposedTransferSyntaxes(fileTransferSyntaxUID string) []string {
-	seen := map[string]bool{}
-	var out []string
-	for _, uid := range []string{
-		fileTransferSyntaxUID,
-		transfer.ExplicitVRLittleEndian.UID,
-		transfer.ImplicitVRLittleEndian.UID,
-	} {
-		uid = transfer.NormalizeUID(uid)
-		if uid == "" || seen[uid] {
-			continue
-		}
-		seen[uid] = true
-		out = append(out, uid)
-	}
-	return out
 }
 
 func normalizeArgs(args []string) []string {

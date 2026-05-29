@@ -1,10 +1,35 @@
 package dimse
 
 import (
+	"math"
 	"testing"
 
 	"github.com/ThalesMMS/dicom-go/core"
+	"github.com/ThalesMMS/dicom-go/net/ul"
 )
+
+func TestPeerMaxPDUWithHeaderCapsOutboundFragmentSize(t *testing.T) {
+	defaultWithHeader := int(ul.DefaultMaxPDU + ul.PDUHeaderSize)
+	tests := []struct {
+		name  string
+		assoc *ul.Association
+		want  int
+	}{
+		{name: "nil association", want: defaultWithHeader},
+		{name: "unspecified", assoc: &ul.Association{}, want: defaultWithHeader},
+		{name: "smaller peer limit", assoc: &ul.Association{PeerMaxPDU: 4096}, want: 4096 + int(ul.PDUHeaderSize)},
+		{name: "default peer limit", assoc: &ul.Association{PeerMaxPDU: ul.DefaultMaxPDU}, want: defaultWithHeader},
+		{name: "larger peer limit", assoc: &ul.Association{PeerMaxPDU: ul.DefaultMaxPDU + 1}, want: defaultWithHeader},
+		{name: "unlimited peer", assoc: &ul.Association{PeerMaxPDU: math.MaxUint32}, want: defaultWithHeader},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := peerMaxPDUWithHeader(tt.assoc); got != tt.want {
+				t.Fatalf("peerMaxPDUWithHeader() = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
 
 func TestCEchoRequestCommandSet(t *testing.T) {
 	req := CEchoRequest{MessageID: 9}

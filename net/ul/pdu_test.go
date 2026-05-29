@@ -30,7 +30,9 @@ func TestAssociationRQRoundTrip(t *testing.T) {
 			ImplementationClassUIDItem{UID: "1.2.3.4"},
 			ImplementationVersionNameItem{Name: "DICOM_GO"},
 			MaxLengthItem{Value: DefaultMaxPDU},
+			AsynchronousOperationsWindow{MaximumInvoked: 0, MaximumPerformed: 7},
 			SopClassExtendedNegotiationItem{SopClassUID: "1.2.840.10008.1.1", Data: []byte{1, 0, 1, 1}},
+			RoleSelectionItem{SopClassUID: "1.2.840.10008.1.1", SCURole: true, SCPRole: true},
 			UserIdentityItem{
 				Type:                      UserIdentityUsernamePassword,
 				PositiveResponseRequested: true,
@@ -51,6 +53,64 @@ func TestAssociationRQRoundTrip(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, &pdu) {
 		t.Fatalf("round-trip mismatch:\ngot  %#v\nwant %#v", got, pdu)
+	}
+}
+
+func TestAsynchronousOperationsWindowUserItemRoundTripPreservesZero(t *testing.T) {
+	pdu := AssociationRQ{
+		ProtocolVersion:        1,
+		CalledAETitle:          "SCP",
+		CallingAETitle:         "SCU",
+		ApplicationContextName: ApplicationContextName,
+		PresentationContexts: []PresentationContextProposed{{
+			ID: 1, AbstractSyntaxUID: "1.2.840.10008.1.1", TransferSyntaxUIDs: []string{ImplicitVRLittleEndian},
+		}},
+		UserInfo: []UserVariableItem{AsynchronousOperationsWindow{MaximumInvoked: 0, MaximumPerformed: 9}},
+	}
+	var buf bytes.Buffer
+	if err := WritePDU(&buf, pdu); err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := ReadPDU(bytes.NewReader(buf.Bytes()), DefaultMaxPDU)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rq := decoded.(*AssociationRQ)
+	if len(rq.UserInfo) != 1 {
+		t.Fatalf("UserInfo length = %d, want 1", len(rq.UserInfo))
+	}
+	window, ok := rq.UserInfo[0].(AsynchronousOperationsWindow)
+	if !ok || window.MaximumInvoked != 0 || window.MaximumPerformed != 9 {
+		t.Fatalf("window = %#v (%T)", rq.UserInfo[0], rq.UserInfo[0])
+	}
+}
+
+func TestReadAsynchronousOperationsWindowValidatesLengthAndIgnoresReserved(t *testing.T) {
+	tests := []struct {
+		name    string
+		data    []byte
+		wantErr bool
+	}{
+		{name: "reserved non-zero", data: []byte{SubItemAsynchronousOperations, 0x7f, 0, 4, 0, 2, 0, 3}},
+		{name: "short", data: []byte{SubItemAsynchronousOperations, 0, 0, 3, 0, 2, 0}, wantErr: true},
+		{name: "long", data: []byte{SubItemAsynchronousOperations, 0, 0, 5, 0, 2, 0, 3, 0}, wantErr: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			items, err := readUserInformation(test.data)
+			if test.wantErr {
+				if !errors.Is(err, ErrInvalidUserItem) {
+					t.Fatalf("error = %v, want ErrInvalidUserItem", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(items) != 1 || items[0] != (AsynchronousOperationsWindow{MaximumInvoked: 2, MaximumPerformed: 3}) {
+				t.Fatalf("items = %#v", items)
+			}
+		})
 	}
 }
 
@@ -83,6 +143,7 @@ func TestPDURoundTripTable(t *testing.T) {
 					ImplementationClassUIDItem{UID: "1.2.826.0.1.3680043.10.100"},
 					ImplementationVersionNameItem{Name: "DICOM_GO"},
 					SopClassExtendedNegotiationItem{SopClassUID: "1.2.840.10008.1.1", Data: []byte{1, 0, 1, 1}},
+					RoleSelectionItem{SopClassUID: "1.2.840.10008.1.1", SCURole: true, SCPRole: false},
 					UserIdentityItem{Type: UserIdentityUsernamePassword, PrimaryField: []byte("user"), SecondaryField: []byte("pass")},
 				},
 			},
@@ -99,6 +160,22 @@ func TestPDURoundTripTable(t *testing.T) {
 					{ID: 3, Result: PresentationContextNoReason, TransferSyntaxUID: "1.2.840.10008.1.2.1"},
 				},
 				UserInfo: []UserVariableItem{MaxLengthItem{Value: 4096}},
+			},
+		},
+		{
+			name: "associate accept with user identity response",
+			pdu: AssociationAC{
+				ProtocolVersion:        1,
+				CalledAETitle:          "SCP_AE",
+				CallingAETitle:         "SCU_AE",
+				ApplicationContextName: "1.2.840.10008.3.1.1.1",
+				PresentationContexts: []PresentationContextResult{
+					{ID: 1, Result: PresentationContextAcceptance, TransferSyntaxUID: "1.2.840.10008.1.2"},
+				},
+				UserInfo: []UserVariableItem{
+					MaxLengthItem{Value: 4096},
+					UserIdentityResponseItem{ServerResponse: []byte("accepted")},
+				},
 			},
 		},
 		{
@@ -649,6 +726,56 @@ func TestReadPDUSizeLimit(t *testing.T) {
 	}
 }
 
+func TestReadPDUAllowsAssociationRequestAbovePDataMax(t *testing.T) {
+	contexts := make([]PresentationContextProposed, 40)
+	for i := range contexts {
+		contexts[i] = PresentationContextProposed{
+			ID:                 byte(2*i + 1),
+			AbstractSyntaxUID:  "1.2.840.10008.5.1.4.1.1.2",
+			TransferSyntaxUIDs: []string{ImplicitVRLittleEndian, ExplicitVRLittleEndian},
+		}
+	}
+	rq := AssociationRQ{
+		ProtocolVersion:        1,
+		CalledAETitle:          "SCP",
+		CallingAETitle:         "SCU",
+		ApplicationContextName: ApplicationContextName,
+		PresentationContexts:   contexts,
+		UserInfo: []UserVariableItem{
+			MaxLengthItem{Value: DefaultMaxPDU},
+			ImplementationClassUIDItem{UID: ImplementationClassUID},
+		},
+	}
+
+	var buf bytes.Buffer
+	if err := WritePDU(&buf, rq); err != nil {
+		t.Fatalf("WritePDU() error = %v", err)
+	}
+	pduLength := uint32(buf.Len()) - PDUHeaderSize
+	if pduLength <= MinimumPDUSize {
+		t.Fatalf("test request PDU length = %d, want above small P-DATA max %d", pduLength, MinimumPDUSize)
+	}
+
+	got, err := ReadPDU(bytes.NewReader(buf.Bytes()), MinimumPDUSize)
+	if err != nil {
+		t.Fatalf("ReadPDU() error = %v", err)
+	}
+	if _, ok := got.(*AssociationRQ); !ok {
+		t.Fatalf("ReadPDU() = %T, want *AssociationRQ", got)
+	}
+}
+
+func TestReadPDURejectsAssociationRequestAboveAssociationReadLimit(t *testing.T) {
+	var header [PDUHeaderSize]byte
+	header[0] = byte(PDUAssociateRQ)
+	binary.BigEndian.PutUint32(header[2:], maxAssociationPDU+1)
+
+	_, err := ReadPDU(bytes.NewReader(header[:]), MinimumPDUSize)
+	if !errors.Is(err, ErrPDUTooLarge) {
+		t.Fatalf("ReadPDU() error = %v, want ErrPDUTooLarge", err)
+	}
+}
+
 func TestAssociationWriterRequiresMandatoryItems(t *testing.T) {
 	tests := []struct {
 		name string
@@ -831,6 +958,19 @@ func TestRejectsMalformedFields(t *testing.T) {
 			pdu: PDataTF{Values: []PDataValue{
 				{PresentationContextID: 2, IsCommand: true, IsLast: true, Data: []byte{1}},
 			}},
+			want: ErrInvalidPCID,
+		},
+		{
+			name: "duplicate presentation context id",
+			pdu: AssociationRQ{
+				ProtocolVersion: DefaultProtocolVersion, CalledAETitle: "SCP", CallingAETitle: "SCU",
+				ApplicationContextName: ApplicationContextName,
+				PresentationContexts: []PresentationContextProposed{
+					{ID: 1, AbstractSyntaxUID: "1.2.3", TransferSyntaxUIDs: []string{ImplicitVRLittleEndian}},
+					{ID: 1, AbstractSyntaxUID: "1.2.4", TransferSyntaxUIDs: []string{ImplicitVRLittleEndian}},
+				},
+				UserInfo: []UserVariableItem{MaxLengthItem{Value: 4096}},
+			},
 			want: ErrInvalidPCID,
 		},
 	}

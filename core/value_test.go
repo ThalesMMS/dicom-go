@@ -41,12 +41,59 @@ func TestStringValueKindAndEncodedLength(t *testing.T) {
 	}
 }
 
+func TestTypedNumericValueKindsAndEncodedLengths(t *testing.T) {
+	tests := []struct {
+		value Value
+		kind  ValueKind
+		want  Length
+	}{
+		{Uint16Value{1, 2}, ValueUint16, 4},
+		{Int16Value{-1, 2}, ValueInt16, 4},
+		{Uint32Value{1, 2}, ValueUint32, 8},
+		{Int32Value{-1, 2}, ValueInt32, 8},
+		{Uint64Value{1, 2}, ValueUint64, 16},
+		{Int64Value{-1, 2}, ValueInt64, 16},
+		{Float32Value{1, 2}, ValueFloat32, 8},
+		{Float64Value{1, 2}, ValueFloat64, 16},
+		{TagValue{NewTag(0x0010, 0x0020), NewTag(0x0020, 0x000D)}, ValueTag, 8},
+	}
+	for _, tt := range tests {
+		if got := tt.value.Kind(); got != tt.kind {
+			t.Errorf("%T.Kind() = %v, want %v", tt.value, got, tt.kind)
+		}
+		if got, ok := tt.value.EncodedLength(); !ok || got != tt.want {
+			t.Errorf("%T.EncodedLength() = %v,%v, want %v,true", tt.value, got, ok, tt.want)
+		}
+	}
+}
+
+func BenchmarkStringValueEncodedLengthManyComponents(b *testing.B) {
+	value := make(StringValue, 256)
+	for i := range value {
+		value[i] = "ABCDE"
+	}
+
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		length, ok := value.EncodedLength()
+		if !ok || length == 0 {
+			b.Fatalf("EncodedLength() = (%v, %v), want nonzero defined length", length, ok)
+		}
+	}
+}
+
 func TestUndefinedLengthValues(t *testing.T) {
+	if got := (SequenceValue{}).Kind(); got != ValueSequence {
+		t.Fatalf("SequenceValue.Kind() = %v, want %v", got, ValueSequence)
+	}
 	sequenceLength, sequenceOK := SequenceValue{}.EncodedLength()
 	if sequenceOK || sequenceLength != UndefinedLength {
 		t.Fatalf("SequenceValue.EncodedLength() = (%v, %v), want (%v, false)", sequenceLength, sequenceOK, UndefinedLength)
 	}
 
+	if got := (FragmentSequence{}).Kind(); got != ValueFragments {
+		t.Fatalf("FragmentSequence.Kind() = %v, want %v", got, ValueFragments)
+	}
 	fragmentsLength, fragmentsOK := FragmentSequence{}.EncodedLength()
 	if fragmentsOK || fragmentsLength != UndefinedLength {
 		t.Fatalf("FragmentSequence.EncodedLength() = (%v, %v), want (%v, false)", fragmentsLength, fragmentsOK, UndefinedLength)

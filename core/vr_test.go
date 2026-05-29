@@ -48,7 +48,8 @@ func TestVRString(t *testing.T) {
 func TestVRUsesLongExplicitLength(t *testing.T) {
 	longVRs := map[VR]bool{
 		VROB: true, VROD: true, VROF: true, VROL: true, VROV: true, VROW: true,
-		VRSQ: true, VRUC: true, VRUR: true, VRUT: true, VRUN: true,
+		VRSQ: true, VRSV: true, VRUC: true, VRUR: true, VRUT: true, VRUN: true,
+		VRUV: true,
 	}
 
 	for _, vr := range allKnownVRs {
@@ -70,6 +71,19 @@ func TestVRIsStringLike(t *testing.T) {
 		want := stringLikeVRs[vr]
 		if got := vr.IsStringLike(); got != want {
 			t.Fatalf("%s.IsStringLike() = %v, want %v", vr, got, want)
+		}
+	}
+}
+
+func TestVRUsesSpecificCharacterSet(t *testing.T) {
+	charsetVRs := map[VR]bool{
+		VRLO: true, VRLT: true, VRPN: true, VRSH: true, VRST: true, VRUC: true, VRUT: true,
+	}
+
+	for _, vr := range allKnownVRs {
+		want := charsetVRs[vr]
+		if got := vr.UsesSpecificCharacterSet(); got != want {
+			t.Fatalf("%s.UsesSpecificCharacterSet() = %v, want %v", vr, got, want)
 		}
 	}
 }

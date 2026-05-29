@@ -3,12 +3,14 @@ package parser
 import (
 	"bytes"
 	"errors"
+	"io"
+	"strings"
+	"testing"
+
 	"github.com/ThalesMMS/dicom-go/core"
 	"github.com/ThalesMMS/dicom-go/dictionary/std"
 	"github.com/ThalesMMS/dicom-go/internal/dicomtest"
 	"github.com/ThalesMMS/dicom-go/transfer"
-	"strings"
-	"testing"
 )
 
 func TestWriterFragmentSequenceEncodingByteForByte(t *testing.T) {
@@ -53,6 +55,43 @@ func TestWriterFragmentSequenceUsesOBHeaderForExplicitSyntax(t *testing.T) {
 		t.Fatalf("fragment sequence contains unexpected item delimiter: % X", got)
 	}
 }
+
+func TestWriterDeferredEncapsulatedPixelDataPreservesOWHeader(t *testing.T) {
+	t.Parallel()
+
+	elem := core.Element{
+		Header: core.ElementHeader{
+			Tag:       core.TagPixelData,
+			VR:        core.VROW,
+			Length:    core.UndefinedLength,
+			LengthSet: true,
+		},
+	}
+	value := []byte{
+		0xFE, 0xFF, 0x00, 0xE0, 0x04, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00,
+		0xFE, 0xFF, 0xDD, 0xE0, 0x00, 0x00, 0x00, 0x00,
+	}
+
+	var buf bytes.Buffer
+	err := NewWriter(&buf, transfer.ExplicitVRLittleEndian).WriteDeferredElement(elem, func(w io.Writer) (int64, error) {
+		n, err := w.Write(value)
+		return int64(n), err
+	})
+	if err != nil {
+		t.Fatalf("WriteDeferredElement() error = %v", err)
+	}
+
+	got := buf.Bytes()
+	wantHeader := []byte{0xE0, 0x7F, 0x10, 0x00, 'O', 'W', 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF}
+	if !bytes.Equal(got[:len(wantHeader)], wantHeader) {
+		t.Fatalf("pixel data header = % X, want % X", got[:len(wantHeader)], wantHeader)
+	}
+	if !bytes.Equal(got[len(wantHeader):], value) {
+		t.Fatalf("deferred value = % X, want % X", got[len(wantHeader):], value)
+	}
+}
+
 func TestWriterRejectsBasicOffsetTableWithNonU32Length(t *testing.T) {
 	t.Parallel()
 

@@ -1,0 +1,232 @@
+[
+  {
+    "name": "regular",
+    "classification": "regular",
+    "disposition": "regular-fast-path",
+    "issues": [],
+    "positions": [
+      0,
+      1,
+      2
+    ],
+    "reversed_input": false,
+    "input_reordered": false,
+    "requires_resampling": false,
+    "source_affine": true,
+    "regularized_depth": 3,
+    "maximum_normal_angle_deg": 0,
+    "maximum_affine_residual_mm": 0
+  },
+  {
+    "name": "reversed",
+    "classification": "regular",
+    "disposition": "regularizable",
+    "primary_issue": "reversed-stack",
+    "issues": [
+      "reversed-stack"
+    ],
+    "positions": [
+      0,
+      1,
+      2
+    ],
+    "reversed_input": true,
+    "input_reordered": true,
+    "requires_resampling": false,
+    "source_affine": true,
+    "regularized_depth": 3,
+    "maximum_normal_angle_deg": 0,
+    "maximum_affine_residual_mm": 0
+  },
+  {
+    "name": "oblique",
+    "classification": "regular",
+    "disposition": "regular-fast-path",
+    "issues": [],
+    "positions": [
+      0,
+      2,
+      4
+    ],
+    "reversed_input": false,
+    "input_reordered": false,
+    "requires_resampling": false,
+    "source_affine": true,
+    "regularized_depth": 3,
+    "maximum_normal_angle_deg": 0,
+    "maximum_affine_residual_mm": 0
+  },
+  {
+    "name": "tilted",
+    "classification": "gantry-tilted",
+    "disposition": "regularizable",
+    "primary_issue": "gantry-tilt",
+    "issues": [
+      "gantry-tilt"
+    ],
+    "positions": [
+      0,
+      1,
+      2
+    ],
+    "reversed_input": false,
+    "input_reordered": false,
+    "requires_resampling": true,
+    "source_affine": true,
+    "regularized_depth": 3,
+    "maximum_normal_angle_deg": 0,
+    "maximum_affine_residual_mm": 0
+  },
+  {
+    "name": "inconsistent-shear",
+    "classification": "gantry-tilted",
+    "disposition": "unsupported",
+    "primary_issue": "inconsistent-gantry-shear",
+    "issues": [
+      "gantry-tilt",
+      "inconsistent-gantry-shear"
+    ],
+    "positions": [
+      0,
+      1,
+      2
+    ],
+    "reversed_input": false,
+    "input_reordered": false,
+    "requires_resampling": true,
+    "source_affine": false,
+    "regularized_depth": 3,
+    "maximum_normal_angle_deg": 0,
+    "maximum_affine_residual_mm": 0.25,
+    "maximum_shear_deviation": 0.25
+  },
+  {
+    "name": "gapped",
+    "classification": "missing-slices",
+    "disposition": "regularizable",
+    "primary_issue": "slice-gaps",
+    "issues": [
+      "slice-gaps"
+    ],
+    "positions": [
+      0,
+      1,
+      3
+    ],
+    "reversed_input": false,
+    "input_reordered": false,
+    "requires_resampling": true,
+    "source_affine": false,
+    "regularized_depth": 4,
+    "maximum_normal_angle_deg": 0,
+    "maximum_affine_residual_mm": 0.5
+  },
+  {
+    "name": "irregular",
+    "classification": "irregular-spacing",
+    "disposition": "regularizable",
+    "primary_issue": "irregular-spacing",
+    "issues": [
+      "irregular-spacing"
+    ],
+    "positions": [
+      0,
+      1,
+      2.4,
+      3
+    ],
+    "reversed_input": false,
+    "input_reordered": false,
+    "requires_resampling": true,
+    "source_affine": false,
+    "regularized_depth": 4,
+    "maximum_normal_angle_deg": 0,
+    "maximum_affine_residual_mm": 0.4
+  },
+  {
+    "name": "mixed-iop",
+    "classification": "mixed-orientation",
+    "disposition": "unsupported",
+    "primary_issue": "mixed-orientation",
+    "issues": [
+      "mixed-orientation"
+    ],
+    "positions": [
+      0,
+      1,
+      2
+    ],
+    "reversed_input": false,
+    "input_reordered": false,
+    "requires_resampling": true,
+    "source_affine": false,
+    "regularized_depth": 3,
+    "maximum_normal_angle_deg": 0,
+    "maximum_affine_residual_mm": 0
+  },
+  {
+    "name": "inconsistent-normals",
+    "classification": "inconsistent-normals",
+    "disposition": "unsupported",
+    "primary_issue": "inconsistent-normals",
+    "issues": [
+      "inconsistent-normals"
+    ],
+    "positions": [
+      0,
+      1,
+      2
+    ],
+    "reversed_input": false,
+    "input_reordered": false,
+    "requires_resampling": true,
+    "source_affine": false,
+    "regularized_depth": 3,
+    "maximum_normal_angle_deg": 20,
+    "maximum_affine_residual_mm": 0
+  },
+  {
+    "name": "duplicate",
+    "classification": "duplicate-positions",
+    "disposition": "unsupported",
+    "primary_issue": "duplicate-positions",
+    "issues": [
+      "duplicate-positions"
+    ],
+    "positions": [
+      0,
+      0,
+      1
+    ],
+    "reversed_input": false,
+    "input_reordered": false,
+    "requires_resampling": true,
+    "source_affine": false,
+    "regularized_depth": 2,
+    "maximum_normal_angle_deg": 0,
+    "maximum_affine_residual_mm": 0.5
+  },
+  {
+    "name": "temporal-interleaved",
+    "classification": "temporal-interleaving",
+    "disposition": "unsupported",
+    "primary_issue": "temporal-interleaving",
+    "issues": [
+      "duplicate-positions",
+      "temporal-interleaving"
+    ],
+    "positions": [
+      0,
+      0,
+      1,
+      1
+    ],
+    "reversed_input": false,
+    "input_reordered": false,
+    "requires_resampling": true,
+    "source_affine": false,
+    "regularized_depth": 2,
+    "maximum_normal_angle_deg": 0,
+    "maximum_affine_residual_mm": 0.333333333
+  }
+]

@@ -14,6 +14,7 @@ import (
 
 	"github.com/ThalesMMS/dicom-go/core"
 	"github.com/ThalesMMS/dicom-go/dictionary/std"
+	"github.com/ThalesMMS/dicom-go/internal/clidiag"
 	"github.com/ThalesMMS/dicom-go/internal/dcmdump"
 	"github.com/ThalesMMS/dicom-go/net/dimse"
 	"github.com/ThalesMMS/dicom-go/net/ul"
@@ -34,12 +35,12 @@ func run(args []string, stdout, stderr io.Writer) int {
 		if errors.Is(err, errUsage) {
 			return 2
 		}
-		_, _ = fmt.Fprintln(stderr, err)
+		clidiag.Fprintln(stderr, "findscu", err)
 		return 1
 	}
 
 	if err := runFind(opts, stdout); err != nil {
-		_, _ = fmt.Fprintln(stderr, err)
+		clidiag.Fprintln(stderr, "findscu", err)
 		return 1
 	}
 	return 0

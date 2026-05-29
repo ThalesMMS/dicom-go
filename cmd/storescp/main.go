@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 
+	"github.com/ThalesMMS/dicom-go/internal/clidiag"
 	"github.com/ThalesMMS/dicom-go/internal/netstore"
 	"github.com/ThalesMMS/dicom-go/net/dimse"
 	"github.com/ThalesMMS/dicom-go/net/ul"
@@ -16,6 +17,7 @@ import (
 	"github.com/ThalesMMS/dicom-go/transfer"
 )
 
+// Main starts the storescp DICOM storage SCP server.
 func main() {
 	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
 }
@@ -29,11 +31,11 @@ func run(args []string, stdout, stderr io.Writer) int {
 		if errors.Is(err, errUsage) {
 			return 2
 		}
-		_, _ = fmt.Fprintln(stderr, err)
+		clidiag.Fprintln(stderr, "storescp", err)
 		return 1
 	}
 	if err := runServer(opts, stdout, stderr); err != nil {
-		_, _ = fmt.Fprintln(stderr, err)
+		clidiag.Fprintln(stderr, "storescp", err)
 		return 1
 	}
 	return 0
@@ -55,6 +57,8 @@ const (
 	statusCannotUnderstand    = 0xC000
 )
 
+var errUnsupportedDIMSECommand = errors.New("storescp: unsupported DIMSE command")
+
 func parseArgs(args []string, stderr io.Writer) (options, error) {
 	opts := options{
 		address: defaultListenAddress,
@@ -69,7 +73,7 @@ func parseArgs(args []string, stderr io.Writer) (options, error) {
 	fs.StringVar(&opts.outDir, "output", opts.outDir, "directory for received Part 10 files")
 	fs.BoolVar(&opts.single, "single", false, "handle one association and exit")
 	fs.Usage = func() {
-		_, _ = fmt.Fprintf(stderr, "Usage: %s [flags]\n\nServe DICOM C-STORE requests and save received Part 10 files.\n\nFlags:\n", fs.Name())
+		_, _ = fmt.Fprintf(stderr, "Usage: %s [flags]\n\nServe DICOM C-STORE requests, answer C-ECHO verification, and save received Part 10 files.\nUnsupported DIMSE commands abort only the affected association.\n\nFlags:\n", fs.Name())
 		fs.PrintDefaults()
 	}
 
@@ -120,7 +124,7 @@ func runServer(opts options, stdout, stderr io.Writer) error {
 			if opts.single {
 				return err
 			}
-			_, _ = fmt.Fprintln(stderr, err)
+			clidiag.Fprintln(stderr, "storescp", err)
 			continue
 		}
 
@@ -132,7 +136,7 @@ func runServer(opts options, stdout, stderr io.Writer) error {
 		}
 		go func() {
 			if err := handleAssociation(assoc, opts.outDir, stdout); err != nil {
-				_, _ = fmt.Fprintln(stderr, err)
+				clidiag.Fprintln(stderr, "storescp", err)
 			}
 		}()
 	}
@@ -165,8 +169,68 @@ func handleAssociation(assoc *ul.Association, outDir string, stdout io.Writer) e
 				return err
 			}
 		default:
-			return fmt.Errorf("unsupported DIMSE command field 0x%04X", field)
+			return handleUnsupportedDIMSECommand(assoc, field, stdout)
 		}
+	}
+}
+
+func handleUnsupportedDIMSECommand(assoc *ul.Association, field uint16, stdout io.Writer) error {
+	command := dimseCommandName(field)
+	_, _ = fmt.Fprintf(stdout, "unsupported DIMSE command %s (0x%04X); storescp supports only C-ECHO-RQ and C-STORE-RQ; aborting association\n", command, field)
+	if err := assoc.Abort(ul.AbortReasonNotSpecified); err != nil {
+		return fmt.Errorf("%w: %s (0x%04X); abort failed: %v", errUnsupportedDIMSECommand, command, field, err)
+	}
+	return fmt.Errorf("%w: %s (0x%04X); storescp supports only C-ECHO-RQ and C-STORE-RQ; association aborted", errUnsupportedDIMSECommand, command, field)
+}
+
+func dimseCommandName(field uint16) string {
+	switch field {
+	case dimse.CStoreRQ:
+		return "C-STORE-RQ"
+	case dimse.CStoreRSP:
+		return "C-STORE-RSP"
+	case dimse.CEchoRQ:
+		return "C-ECHO-RQ"
+	case dimse.CEchoRSP:
+		return "C-ECHO-RSP"
+	case dimse.CFindRQ:
+		return "C-FIND-RQ"
+	case dimse.CFindRSP:
+		return "C-FIND-RSP"
+	case dimse.CGetRQ:
+		return "C-GET-RQ"
+	case dimse.CGetRSP:
+		return "C-GET-RSP"
+	case dimse.CMoveRQ:
+		return "C-MOVE-RQ"
+	case dimse.CMoveRSP:
+		return "C-MOVE-RSP"
+	case dimse.NActionRQ:
+		return "N-ACTION-RQ"
+	case dimse.NActionRSP:
+		return "N-ACTION-RSP"
+	case dimse.NEventReportRQ:
+		return "N-EVENT-REPORT-RQ"
+	case dimse.NEventReportRSP:
+		return "N-EVENT-REPORT-RSP"
+	case dimse.NGetRQ:
+		return "N-GET-RQ"
+	case dimse.NGetRSP:
+		return "N-GET-RSP"
+	case dimse.NSetRQ:
+		return "N-SET-RQ"
+	case dimse.NSetRSP:
+		return "N-SET-RSP"
+	case dimse.NCreateRQ:
+		return "N-CREATE-RQ"
+	case dimse.NCreateRSP:
+		return "N-CREATE-RSP"
+	case dimse.NDeleteRQ:
+		return "N-DELETE-RQ"
+	case dimse.NDeleteRSP:
+		return "N-DELETE-RSP"
+	default:
+		return "unknown"
 	}
 }
 
@@ -317,30 +381,8 @@ func acceptedContextByID(assoc *ul.Association, pcID byte) (ul.AcceptedContext, 
 
 func acceptedAbstractSyntaxes() []string {
 	uids := []string{dimse.VerificationSOPClassUID}
-	uids = append(uids, storageSOPClassUIDs()...)
+	uids = append(uids, dimse.DefaultStorageSOPClassUIDs()...)
 	return uids
-}
-
-func storageSOPClassUIDs() []string {
-	return []string{
-		"1.2.840.10008.5.1.4.1.1.1",     // Computed Radiography Image Storage
-		"1.2.840.10008.5.1.4.1.1.2",     // CT Image Storage
-		"1.2.840.10008.5.1.4.1.1.2.1",   // Enhanced CT Image Storage
-		"1.2.840.10008.5.1.4.1.1.4",     // MR Image Storage
-		"1.2.840.10008.5.1.4.1.1.4.1",   // Enhanced MR Image Storage
-		"1.2.840.10008.5.1.4.1.1.6.1",   // Ultrasound Image Storage
-		"1.2.840.10008.5.1.4.1.1.7",     // Secondary Capture Image Storage
-		"1.2.840.10008.5.1.4.1.1.7.1",   // Multi-frame Single Bit Secondary Capture Image Storage
-		"1.2.840.10008.5.1.4.1.1.7.2",   // Multi-frame Grayscale Byte Secondary Capture Image Storage
-		"1.2.840.10008.5.1.4.1.1.7.3",   // Multi-frame Grayscale Word Secondary Capture Image Storage
-		"1.2.840.10008.5.1.4.1.1.7.4",   // Multi-frame True Color Secondary Capture Image Storage
-		"1.2.840.10008.5.1.4.1.1.12.1",  // X-Ray Angiographic Image Storage
-		"1.2.840.10008.5.1.4.1.1.12.2",  // X-Ray Radiofluoroscopic Image Storage
-		"1.2.840.10008.5.1.4.1.1.20",    // Nuclear Medicine Image Storage
-		"1.2.840.10008.5.1.4.1.1.128",   // Positron Emission Tomography Image Storage
-		"1.2.840.10008.5.1.4.1.1.1.1",   // Digital X-Ray Image Storage - For Presentation
-		"1.2.840.10008.5.1.4.1.1.1.1.1", // Digital X-Ray Image Storage - For Processing
-	}
 }
 
 func supportedTransferSyntaxUIDs() []string {

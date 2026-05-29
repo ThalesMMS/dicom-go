@@ -33,17 +33,12 @@ func receiveCFindResponseWithContext(ctx context.Context, assoc *ul.Association,
 		return nil, nil, err
 	}
 
-	switch resp.CommandDataSetType {
-	case NoDataSet:
+	if resp.CommandDataSetType == NoDataSet {
 		return resp, nil, nil
-	case DataSetPresent:
-		id, err := receiveDataSetWithContext(ctx, assoc, pcID, identifierSyntax)
-		if err != nil {
-			return nil, nil, err
-		}
-		return resp, id, nil
-	default:
-		// Some implementations may send unexpected values. Treat as a protocol error.
-		return nil, nil, fmt.Errorf("dicom dimse: C-FIND response dataset type 0x%04X (expected 0x%04X or 0x%04X)", resp.CommandDataSetType, NoDataSet, DataSetPresent)
 	}
+	id, err := receiveIdentifierDataSetWithContext(ctx, assoc, pcID, identifierSyntax)
+	if err != nil {
+		return nil, nil, err
+	}
+	return resp, id, nil
 }

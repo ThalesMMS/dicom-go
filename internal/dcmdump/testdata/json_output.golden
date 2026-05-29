@@ -84,11 +84,15 @@
       "vr": "UI"
     },
     "00280010": {
-      "InlineBinary": "CAA=",
+      "Value": [
+        8
+      ],
       "vr": "US"
     },
     "00280011": {
-      "InlineBinary": "CAA=",
+      "Value": [
+        8
+      ],
       "vr": "US"
     }
   }

@@ -10,7 +10,7 @@ import (
 	"strings"
 )
 
-func renderFrame(frame Frame, window Window) (*image.Gray, error) {
+func renderFrame(frame Frame, window Window) (image.Image, error) {
 	if frame.DecodeErr != nil {
 		return blankImage(512, 512), frame.DecodeErr
 	}
@@ -20,13 +20,22 @@ func renderFrame(frame Frame, window Window) (*image.Gray, error) {
 	if rows <= 0 || cols <= 0 {
 		return blankImage(512, 512), fmt.Errorf("viewer: invalid frame size %dx%d", cols, rows)
 	}
-	if metadata.SamplesPerPixel != 1 {
+	photometric := normalizedPhotometric(metadata.PhotometricInterpretation)
+	switch metadata.SamplesPerPixel {
+	case 1:
+		return renderGrayscaleFrame(frame, photometric, rows, cols, window)
+	case 3:
+		return renderRGBFrame(frame, photometric, rows, cols)
+	default:
 		return blankImage(cols, rows), fmt.Errorf("viewer: SamplesPerPixel=%d is not supported", metadata.SamplesPerPixel)
 	}
+}
+
+func renderGrayscaleFrame(frame Frame, photometric string, rows, cols int, window Window) (*image.Gray, error) {
+	metadata := frame.Metadata
 	if metadata.BitsAllocated != 8 && metadata.BitsAllocated != 16 {
 		return blankImage(cols, rows), fmt.Errorf("viewer: BitsAllocated=%d is not supported", metadata.BitsAllocated)
 	}
-	photometric := normalizedPhotometric(metadata.PhotometricInterpretation)
 	if photometric != "MONOCHROME1" && photometric != "MONOCHROME2" {
 		return blankImage(cols, rows), fmt.Errorf("viewer: PhotometricInterpretation=%q is not supported", metadata.PhotometricInterpretation)
 	}
@@ -56,6 +65,39 @@ func renderFrame(frame Frame, window Window) (*image.Gray, error) {
 		out.Pix[pixelIndex] = gray
 	}
 
+	return out, nil
+}
+
+func renderRGBFrame(frame Frame, photometric string, rows, cols int) (image.Image, error) {
+	metadata := frame.Metadata
+	if metadata.BitsAllocated != 8 {
+		return nil, fmt.Errorf("viewer: BitsAllocated=%d is not supported for RGB", metadata.BitsAllocated)
+	}
+	if metadata.PixelRepresentation != 0 {
+		return nil, fmt.Errorf("viewer: PixelRepresentation=%d is not supported for RGB", metadata.PixelRepresentation)
+	}
+	if metadata.PlanarConfigurationPresent && metadata.PlanarConfiguration != 0 {
+		return nil, fmt.Errorf("viewer: PlanarConfiguration=%d is not supported for RGB", metadata.PlanarConfiguration)
+	}
+	if photometric != "RGB" {
+		return nil, fmt.Errorf("viewer: PhotometricInterpretation=%q is not supported for SamplesPerPixel=3", metadata.PhotometricInterpretation)
+	}
+
+	const samplesPerPixel = 3
+	expected := rows * cols * samplesPerPixel
+	if len(frame.PixelBytes) < expected {
+		return blankImage(cols, rows), fmt.Errorf("viewer: pixel data too short: got %d bytes, want %d", len(frame.PixelBytes), expected)
+	}
+
+	out := image.NewRGBA(image.Rect(0, 0, cols, rows))
+	for pixelIndex := 0; pixelIndex < rows*cols; pixelIndex++ {
+		src := pixelIndex * samplesPerPixel
+		dst := pixelIndex * 4
+		out.Pix[dst] = frame.PixelBytes[src]
+		out.Pix[dst+1] = frame.PixelBytes[src+1]
+		out.Pix[dst+2] = frame.PixelBytes[src+2]
+		out.Pix[dst+3] = 255
+	}
 	return out, nil
 }
 

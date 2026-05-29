@@ -26,6 +26,22 @@ func TestMemoryRegistryNormalizesUIDs(t *testing.T) {
 	}
 }
 
+func TestNormalizeUID(t *testing.T) {
+	tests := map[string]string{
+		"1.2.3 \x00":     "1.2.3",
+		"1.2.3\x00 \x00": "1.2.3",
+		" \x00":          "",
+		" 1.2.3":         " 1.2.3",
+		"1.2\x003 4":     "1.2\x003 4",
+	}
+
+	for input, want := range tests {
+		if got := NormalizeUID(input); got != want {
+			t.Fatalf("NormalizeUID(%q) = %q, want %q", input, got, want)
+		}
+	}
+}
+
 func TestMemoryRegistryRegisterIgnoresEmptyNormalizedUID(t *testing.T) {
 	r := NewRegistry()
 	r.Register(Syntax{
@@ -96,6 +112,9 @@ func TestDefaultRegistryGetReturnsExpectedSyntaxes(t *testing.T) {
 		JPEG2000,
 		JPEG2000Part2Lossless,
 		JPEG2000Part2,
+		HTJ2KLossless,
+		HTJ2KLosslessRPCL,
+		HTJ2K,
 		RLELossless,
 		EncapsulatedUncompressedExplicitVRLittleEndian,
 	}
@@ -110,6 +129,21 @@ func TestDefaultRegistryGetReturnsExpectedSyntaxes(t *testing.T) {
 		}
 		if got.UID != want.UID {
 			t.Fatalf("unexpected syntax UID for %q: got %q want %q", want.Name, got.UID, want.UID)
+		}
+	}
+}
+
+func TestDefaultRegistryIncludesSupportedJPEGSyntaxes(t *testing.T) {
+	for _, want := range []Syntax{JPEGBaseline, JPEGExtended, JPEGLosslessNonHierarchical, JPEGLosslessSV1} {
+		got, ok := DefaultRegistry.Get(want.UID + " \x00")
+		if !ok {
+			t.Fatalf("expected JPEG transfer syntax %q to be registered", want.UID)
+		}
+		if got.Name != want.Name {
+			t.Fatalf("unexpected syntax name for %q: got %q want %q", want.UID, got.Name, want.Name)
+		}
+		if !got.Supported || !got.Encapsulated || !got.CodecAvailable || !got.RequiresCodec() {
+			t.Fatalf("JPEG transfer syntax flags = %#v, want supported encapsulated codec syntax", got)
 		}
 	}
 }
@@ -133,16 +167,16 @@ func TestDefaultRegistryIncludesKnownUnsupportedSyntaxes(t *testing.T) {
 		{
 			uid:           "1.2.840.10008.1.2.4.95",
 			wantName:      "JPIP Referenced Deflate",
-			wantSupported: false,
+			wantSupported: true,
+		},
+		{
+			uid:           JPIPHTJ2KReferenced.UID,
+			wantName:      JPIPHTJ2KReferenced.Name,
+			wantSupported: true,
 		},
 		{
 			uid:           "1.2.840.10008.1.2.6.2",
 			wantName:      "XML Encoding (Retired)",
-			wantSupported: false,
-		},
-		{
-			uid:           MPEG2MPML.UID,
-			wantName:      MPEG2MPML.Name,
 			wantSupported: false,
 		},
 		{
@@ -153,12 +187,22 @@ func TestDefaultRegistryIncludesKnownUnsupportedSyntaxes(t *testing.T) {
 		{
 			uid:           HTJ2KLossless.UID,
 			wantName:      HTJ2KLossless.Name,
-			wantSupported: false,
+			wantSupported: true,
 		},
 		{
 			uid:           JPEGXLLossless.UID,
 			wantName:      JPEGXLLossless.Name,
-			wantSupported: false,
+			wantSupported: true,
+		},
+		{
+			uid:           JPEGXLJPEGRecompression.UID,
+			wantName:      JPEGXLJPEGRecompression.Name,
+			wantSupported: true,
+		},
+		{
+			uid:           JPEGXL.UID,
+			wantName:      JPEGXL.Name,
+			wantSupported: true,
 		},
 	}
 
@@ -172,6 +216,24 @@ func TestDefaultRegistryIncludesKnownUnsupportedSyntaxes(t *testing.T) {
 		}
 		if got.Supported != tt.wantSupported {
 			t.Fatalf("unexpected supported flag for %q: got %v want %v", tt.uid, got.Supported, tt.wantSupported)
+		}
+	}
+}
+
+func TestDefaultRegistryIncludesKnownVideoMediaSyntaxes(t *testing.T) {
+	for _, want := range []Syntax{MPEG2MPML, MPEG4HP41, HEVCMP51} {
+		got, ok := DefaultRegistry.Get(want.UID + " \x00")
+		if !ok {
+			t.Fatalf("expected video transfer syntax %q to be registered", want.UID)
+		}
+		if got.Name != want.Name {
+			t.Fatalf("unexpected syntax name for %q: got %q want %q", want.UID, got.Name, want.Name)
+		}
+		if !got.Supported {
+			t.Fatalf("expected video transfer syntax %q to be metadata/payload-readable", want.UID)
+		}
+		if !got.Encapsulated || got.CodecAvailable || got.RequiresCodec() {
+			t.Fatalf("video transfer syntax flags = %#v, want encapsulated media without still-image codec", got)
 		}
 	}
 }

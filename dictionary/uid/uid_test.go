@@ -26,6 +26,43 @@ func TestDictionaryByUIDCriticalEntries(t *testing.T) {
 	}
 }
 
+func TestNormalizeUID(t *testing.T) {
+	tests := map[string]string{
+		"1.2.3 \x00":     "1.2.3",
+		"1.2.3\x00 \x00": "1.2.3",
+		" \x00":          "",
+		" 1.2.3":         " 1.2.3",
+		"1.2\x003 4":     "1.2\x003 4",
+	}
+
+	for input, want := range tests {
+		if got := uiddict.NormalizeUID(input); got != want {
+			t.Fatalf("NormalizeUID(%q) = %q, want %q", input, got, want)
+		}
+	}
+}
+
+func TestParseTypeAndString(t *testing.T) {
+	got, err := uiddict.ParseType(" Transfer Syntax ")
+	if err != nil {
+		t.Fatalf("ParseType() error = %v", err)
+	}
+	if got != uiddict.TransferSyntax {
+		t.Fatalf("ParseType() = %v, want %v", got, uiddict.TransferSyntax)
+	}
+	if got.String() != "Transfer Syntax" {
+		t.Fatalf("TransferSyntax.String() = %q, want Transfer Syntax", got.String())
+	}
+
+	_, err = uiddict.ParseType("Made Up Type")
+	if err == nil || !strings.Contains(err.Error(), `unknown UID type "Made Up Type"`) {
+		t.Fatalf("ParseType(unknown) error = %v, want unknown UID type message", err)
+	}
+	if got := uiddict.Type(255).String(); got != "Type(255)" {
+		t.Fatalf("Type(255).String() = %q, want Type(255)", got)
+	}
+}
+
 func TestDictionaryByKeywordIsCaseInsensitive(t *testing.T) {
 	lower, ok := uiddict.Dictionary.ByKeyword("ctimagestorage")
 	if !ok {

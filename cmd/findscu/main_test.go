@@ -94,52 +94,19 @@ func TestRunFindSmokeAgainstLocalSCP(t *testing.T) {
 			return
 		}
 
-		// Receive request command set.
-		cmd, err := dimse.ReceiveCommandSet(assoc, pc.ID)
-		if err != nil {
-			serverDone <- err
-			return
-		}
-		req, err := dimse.ParseCFindRequest(cmd)
-		if err != nil {
-			serverDone <- err
-			return
-		}
-		// Identifier dataset should follow.
-		identifier, err := dimse.ReceiveDataSet(assoc, pc.ID, transfer.ImplicitVRLittleEndian)
-		if err != nil {
-			serverDone <- err
-			return
-		}
-		if req.AffectedSOPClassUID != dimse.StudyRootFindSOPClassUID {
-			serverDone <- errors.New("unexpected AffectedSOPClassUID")
-			return
-		}
-		// Basic check identifier contains QueryRetrieveLevel (0008,0052).
-		if _, ok := identifier.Get(core.NewTag(0x0008, 0x0052)); !ok {
-			serverDone <- errors.New("missing QueryRetrieveLevel")
-			return
-		}
-
-		// Send one pending match
-		match := object.FromElements([]core.Element{
-			{Header: core.ElementHeader{Tag: core.NewTag(0x0010, 0x0020), VR: core.VRLO}, Value: core.StringValue{"123"}},
-			{Header: core.ElementHeader{Tag: core.NewTag(0x0020, 0x000D), VR: core.VRUI}, Value: core.StringValue{"1.2.3"}},
-		}, std.Dictionary)
-		if err := sendCFindResponse(assoc, pc.ID, dimse.CFindResponse{
-			AffectedSOPClassUID:       dimse.StudyRootFindSOPClassUID,
-			MessageIDBeingRespondedTo: req.MessageID,
-			Status:                    0xFF00,
-		}, match, transfer.ImplicitVRLittleEndian); err != nil {
-			serverDone <- err
-			return
-		}
-		// Final success
-		if err := sendCFindResponse(assoc, pc.ID, dimse.CFindResponse{
-			AffectedSOPClassUID:       dimse.StudyRootFindSOPClassUID,
-			MessageIDBeingRespondedTo: req.MessageID,
-			Status:                    dimse.StatusSuccess,
-		}, nil, transfer.ImplicitVRLittleEndian); err != nil {
+		if err := dimse.ServeStudyRootCFind(ctx, assoc, pc.ID, dimse.CFindHandlerFunc(func(_ context.Context, req dimse.CFindRequestContext) ([]*object.Object, error) {
+			if req.Request.AffectedSOPClassUID != dimse.StudyRootFindSOPClassUID {
+				return nil, errors.New("unexpected AffectedSOPClassUID")
+			}
+			if _, ok := req.Identifier.Get(core.NewTag(0x0008, 0x0052)); !ok {
+				return nil, errors.New("missing QueryRetrieveLevel")
+			}
+			match := object.FromElements([]core.Element{
+				{Header: core.ElementHeader{Tag: core.NewTag(0x0010, 0x0020), VR: core.VRLO}, Value: core.StringValue{"123"}},
+				{Header: core.ElementHeader{Tag: core.NewTag(0x0020, 0x000D), VR: core.VRUI}, Value: core.StringValue{"1.2.3"}},
+			}, std.Dictionary)
+			return []*object.Object{match}, nil
+		})); err != nil {
 			serverDone <- err
 			return
 		}

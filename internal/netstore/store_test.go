@@ -1,6 +1,7 @@
 package netstore
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -24,6 +25,12 @@ func TestSafeFileBaseAvoidsHiddenNames(t *testing.T) {
 func TestSafeFileBaseFallback(t *testing.T) {
 	if got := SafeFileBase(" \x00"); got != "instance" {
 		t.Fatalf("SafeFileBase(blank) = %q, want instance", got)
+	}
+	if got := SafeFileBase("1.2.3 \x00"); got != "1.2.3" {
+		t.Fatalf("SafeFileBase(padded UID) = %q, want 1.2.3", got)
+	}
+	if got := SafeFileBase("1.2\x003 \x00"); got != "1.2_3" {
+		t.Fatalf("SafeFileBase(interior NUL) = %q, want 1.2_3", got)
 	}
 }
 
@@ -77,12 +84,34 @@ func TestCreateInstanceFileUsesOwnerOnlyPermissions(t *testing.T) {
 	if err := f.Close(); err != nil {
 		t.Fatalf("Close() error = %v", err)
 	}
-	info, err := os.Stat(path)
+	private, err := isPrivateInstanceFile(path)
 	if err != nil {
-		t.Fatalf("Stat() error = %v", err)
+		t.Fatalf("inspect file protection: %v", err)
 	}
-	if got := info.Mode().Perm(); got != 0o600 {
-		t.Fatalf("file mode = %v, want 0600", got)
+	if !private {
+		t.Fatal("instance file does not have effective owner-only protection")
+	}
+}
+
+func TestCreateInstanceFileRemovesFileWhenProtectionFails(t *testing.T) {
+	dir := t.TempDir()
+	protectionErr := errors.New("injected protection failure")
+
+	path, f, err := createInstanceFile(dir, "1.2.3", func(string) error {
+		return protectionErr
+	})
+	if !errors.Is(err, protectionErr) {
+		t.Fatalf("createInstanceFile() error = %v, want protection failure", err)
+	}
+	if path != "" || f != nil {
+		t.Fatalf("createInstanceFile() = %q, %v; want empty path and nil file", path, f)
+	}
+	entries, readErr := os.ReadDir(dir)
+	if readErr != nil {
+		t.Fatalf("ReadDir() error = %v", readErr)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("protection failure left partial files: %v", entries)
 	}
 }
 

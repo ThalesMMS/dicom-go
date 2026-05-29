@@ -434,3 +434,95 @@ func TestReadHeaderImplicitVRUsesDictionaryForNormalElements(t *testing.T) {
 		t.Fatalf("dictionary call count = %d, want 1", dict.byTagCalls)
 	}
 }
+
+func TestReadDataSetDefersNestedWaveformDataAndRecordsAllLocations(t *testing.T) {
+	waveformSequenceTag := core.NewTag(0x5400, 0x0100)
+	waveformDataTag := core.NewTag(0x5400, 0x1010)
+	groupLabelTag := core.NewTag(0x003A, 0x0020)
+	groupData := [][]byte{
+		{0x01, 0x00, 0x02, 0x00},
+		{0x10, 0x00, 0x20, 0x00, 0x30, 0x00},
+	}
+	data := dicomtest.EncodeElements(
+		transfer.ExplicitVRLittleEndian,
+		dicomtest.NewSequenceElement(
+			waveformSequenceTag,
+			core.DataSet{Elements: []core.Element{
+				dicomtest.NewStringElement(groupLabelTag, core.VRSH, "GROUP 1"),
+				core.NewRawElement(waveformDataTag, core.VROW, groupData[0]),
+			}},
+			core.DataSet{Elements: []core.Element{
+				dicomtest.NewStringElement(groupLabelTag, core.VRSH, "GROUP 2"),
+				core.NewRawElement(waveformDataTag, core.VROW, groupData[1]),
+			}},
+		),
+	)
+
+	reader := NewReader(bytes.NewReader(data), transfer.ExplicitVRLittleEndian, ReaderOptions{
+		Dictionary:        std.Dictionary,
+		DeferWaveformData: true,
+	})
+	dataset, err := reader.ReadDataSet()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(dataset.Elements) != 1 {
+		t.Fatalf("dataset element count = %d, want 1", len(dataset.Elements))
+	}
+	sequence, ok := dataset.Elements[0].Value.(core.SequenceValue)
+	if !ok || len(sequence.Items) != len(groupData) {
+		t.Fatalf("WaveformSequence value = %#v, want %d items", dataset.Elements[0].Value, len(groupData))
+	}
+	for index, item := range sequence.Items {
+		if len(item.Elements) != 2 {
+			t.Fatalf("item %d element count = %d, want 2", index, len(item.Elements))
+		}
+		if item.Elements[0].Value == nil {
+			t.Fatalf("item %d metadata was unexpectedly deferred", index)
+		}
+		if item.Elements[1].Tag() != waveformDataTag || item.Elements[1].Value != nil {
+			t.Fatalf("item %d WaveformData = %#v, want deferred nil", index, item.Elements[1])
+		}
+	}
+
+	if _, ok := reader.ValueLocation(waveformDataTag); ok {
+		t.Fatal("ValueLocation returned a tag-only location for duplicate WaveformData")
+	}
+	locations := reader.ValueLocations(waveformDataTag)
+	if len(locations) != len(groupData) {
+		t.Fatalf("ValueLocations count = %d, want %d", len(locations), len(groupData))
+	}
+	for index, location := range locations {
+		if location.Tag != waveformDataTag {
+			t.Fatalf("location %d tag = %s, want %s", index, location.Tag, waveformDataTag)
+		}
+		if location.Length != int64(len(groupData[index])) {
+			t.Fatalf("location %d length = %d, want %d", index, location.Length, len(groupData[index]))
+		}
+		if !location.ItemOffsetSet || location.ItemOffset != sequence.Items[index].ItemOffset {
+			t.Fatalf(
+				"location %d item offset = %d/%v, want %d/true",
+				index,
+				location.ItemOffset,
+				location.ItemOffsetSet,
+				sequence.Items[index].ItemOffset,
+			)
+		}
+		if index > 0 && location.ValueOffset <= locations[index-1].ValueOffset {
+			t.Fatalf("locations are not in source order: %#v", locations)
+		}
+		var got bytes.Buffer
+		if _, err := reader.CopyElementValueAt(location, &got); err != nil {
+			t.Fatalf("CopyElementValueAt(%d): %v", index, err)
+		}
+		if !bytes.Equal(got.Bytes(), groupData[index]) {
+			t.Fatalf("CopyElementValueAt(%d) = % X, want % X", index, got.Bytes(), groupData[index])
+		}
+	}
+
+	locations[0].Length = 0
+	fresh := reader.ValueLocations(waveformDataTag)
+	if fresh[0].Length != int64(len(groupData[0])) {
+		t.Fatalf("ValueLocations returned aliased storage: first length = %d", fresh[0].Length)
+	}
+}

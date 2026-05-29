@@ -90,56 +90,106 @@ func SendCMove(ctx context.Context, assoc *ul.Association, pcID byte, req CMoveR
 	return last, nil
 }
 
+// SendCMoveWithOptions is like SendCMove but uses OperationOptions for
+// cancellation, overall timeout, per-response timeout, and association cleanup
+// policy after uncertain errors.
+func SendCMoveWithOptions(options OperationOptions, assoc *ul.Association, pcID byte, req CMoveRequest, identifier *object.Object, identifierSyntax transfer.Syntax) (*CMoveResponse, error) {
+	ch, err := SendCMoveWithProgressWithOptions(options, assoc, pcID, req, identifier, identifierSyntax)
+	if err != nil {
+		return nil, err
+	}
+	var last *CMoveResponse
+	for p := range ch {
+		if p.Err != nil {
+			return nil, p.Err
+		}
+		if p.Response != nil {
+			last = p.Response
+		}
+	}
+	if last == nil {
+		return nil, fmt.Errorf("dicom dimse: C-MOVE: no response received")
+	}
+	return last, nil
+}
+
 // SendCMoveWithProgress is like SendCMove but returns a channel of progress
 // events for each received response.
 //
-// The ctx.Done check is observed between ReceiveCMoveResponse calls. It does
-// not abort a currently blocking ReceiveCMoveResponse call because the
-// underlying transport API does not support receive cancellation.
+// The ctx.Done check is observed between response reads. Receive cancellation
+// and per-response deadlines are available through
+// SendCMoveWithProgressWithOptions.
 //
 // The returned channel is closed after a final response is received.
 func SendCMoveWithProgress(ctx context.Context, assoc *ul.Association, pcID byte, req CMoveRequest, identifier *object.Object, identifierSyntax transfer.Syntax) (<-chan CMoveProgress, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
+	return SendCMoveWithProgressWithOptions(OperationOptions{Context: ctx}, assoc, pcID, req, identifier, identifierSyntax)
+}
+
+// SendCMoveWithProgressWithOptions is like SendCMoveWithProgress but uses
+// OperationOptions for cancellation, overall timeout, per-response timeout, and
+// association cleanup policy after uncertain errors.
+func SendCMoveWithProgressWithOptions(options OperationOptions, assoc *ul.Association, pcID byte, req CMoveRequest, identifier *object.Object, identifierSyntax transfer.Syntax) (<-chan CMoveProgress, error) {
+	options = operationOptionsWithDefaultPolicy(options, OperationErrorPolicyAbort)
+
+	ctx, cancel := operationContext(options)
 	if identifier == nil {
+		cancel()
 		return nil, fmt.Errorf("dicom dimse: C-MOVE: identifier dataset is required")
 	}
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		cancel()
+		return nil, newOperationError("C-MOVE", err, false)
 	}
+
+	releaseOperation, err := beginAssociationOperation(assoc)
+	if err != nil {
+		cancel()
+		return nil, newOperationError("C-MOVE", err, false)
+	}
+
 	if err := SendCMoveRequest(assoc, pcID, req); err != nil {
-		return nil, err
+		releaseOperation()
+		cancel()
+		return nil, applyOperationErrorPolicy(assoc, options.ErrorPolicy, newOperationError("C-MOVE", err, true))
 	}
 	if err := ctx.Err(); err != nil {
-		_ = abortCMoveAssociation(assoc, err)
-		return nil, err
+		releaseOperation()
+		cancel()
+		return nil, applyOperationErrorPolicy(assoc, options.ErrorPolicy, newOperationError("C-MOVE", err, true))
 	}
 	if err := SendDataSet(assoc, pcID, identifier, identifierSyntax); err != nil {
-		return nil, abortCMoveAssociation(assoc, err)
+		releaseOperation()
+		cancel()
+		return nil, applyOperationErrorPolicy(assoc, options.ErrorPolicy, newOperationError("C-MOVE", err, true))
 	}
 
 	out := make(chan CMoveProgress, 1)
 	go func() {
 		defer close(out)
+		defer releaseOperation()
+		defer cancel()
 		for {
 			select {
 			case <-ctx.Done():
-				err := abortCMoveAssociation(assoc, ctx.Err())
-				out <- CMoveProgress{Final: true, Err: err}
+				err := applyOperationErrorPolicy(assoc, options.ErrorPolicy, newOperationError("C-MOVE", ctx.Err(), true))
+				emitCMoveProgress(ctx, out, CMoveProgress{Final: true, Err: err})
 				return
 			default:
 			}
 
-			rsp, err := ReceiveCMoveResponse(assoc, pcID)
+			responseCtx, responseCancel := operationResponseContext(ctx, options.ResponseTimeout)
+			rsp, err := receiveCMoveResponseWithContext(responseCtx, assoc, pcID)
+			responseCancel()
 			if err != nil {
-				out <- CMoveProgress{Final: true, Err: abortCMoveAssociation(assoc, err)}
+				emitCMoveProgress(ctx, out, CMoveProgress{Final: true, Err: applyOperationErrorPolicy(assoc, options.ErrorPolicy, newOperationError("C-MOVE", err, true))})
 				return
 			}
 
 			cls := ClassifyCMoveStatus(rsp.Status)
 			final := cls != CMoveStatusPending
-			out <- CMoveProgress{Response: rsp, Identifier: rsp.Identifier, Final: final, StatusClass: cls}
+			if !emitCMoveProgress(ctx, out, CMoveProgress{Response: rsp, Identifier: rsp.Identifier, Final: final, StatusClass: cls}) {
+				return
+			}
 			if final {
 				return
 			}
@@ -148,12 +198,16 @@ func SendCMoveWithProgress(ctx context.Context, assoc *ul.Association, pcID byte
 	return out, nil
 }
 
-func abortCMoveAssociation(assoc *ul.Association, err error) error {
-	if assoc == nil {
-		return err
+func emitCMoveProgress(ctx context.Context, out chan<- CMoveProgress, progress CMoveProgress) bool {
+	select {
+	case out <- progress:
+		return true
+	default:
 	}
-	if abortErr := assoc.Abort(ul.AbortReasonNotSpecified); abortErr != nil {
-		return fmt.Errorf("%w; abort association failed: %v", err, abortErr)
+	select {
+	case <-ctx.Done():
+		return false
+	case out <- progress:
+		return true
 	}
-	return err
 }

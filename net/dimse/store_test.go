@@ -34,12 +34,69 @@ func TestCStoreRequestCommandSet(t *testing.T) {
 	}
 }
 
+func TestCStoreRequestCommandSetWithMoveOriginator(t *testing.T) {
+	originatorMessageID := uint16(42)
+	req := CStoreRequest{
+		AffectedSOPClassUID:          dicomtest.TestSOPClassUID,
+		MessageID:                    9,
+		Priority:                     PriorityHigh,
+		AffectedSOPInstanceUID:       dicomtest.TestSOPInstanceUID,
+		MoveOriginatorAETitle:        "MOVESCU",
+		MoveOriginatorMessageIDOrNil: &originatorMessageID,
+	}
+	reqObj, err := DecodeCommandSet(mustEncodeCommandSet(t, req.CommandSet()))
+	if err != nil {
+		t.Fatalf("DecodeCommandSet(request) error = %v", err)
+	}
+	parsed, err := ParseCStoreRequest(reqObj)
+	if err != nil {
+		t.Fatalf("ParseCStoreRequest() error = %v", err)
+	}
+	if parsed.AffectedSOPClassUID != req.AffectedSOPClassUID ||
+		parsed.MessageID != req.MessageID ||
+		parsed.Priority != req.Priority ||
+		parsed.AffectedSOPInstanceUID != req.AffectedSOPInstanceUID ||
+		parsed.MoveOriginatorAETitle != req.MoveOriginatorAETitle {
+		t.Fatalf("ParseCStoreRequest() = %#v, want %#v", parsed, req)
+	}
+	if parsed.MoveOriginatorMessageIDOrNil == nil || *parsed.MoveOriginatorMessageIDOrNil != originatorMessageID {
+		t.Fatalf("MoveOriginatorMessageIDOrNil = %v, want %d", parsed.MoveOriginatorMessageIDOrNil, originatorMessageID)
+	}
+}
+
+func TestParseCStoreRequestAllowsNonstandardDatasetPresentType(t *testing.T) {
+	req := CStoreRequest{
+		AffectedSOPClassUID:    dicomtest.TestSOPClassUID,
+		MessageID:              9,
+		Priority:               1,
+		AffectedSOPInstanceUID: dicomtest.TestSOPInstanceUID,
+	}
+	command := req.CommandSet()
+	for i := range command {
+		if command[i].Header.Tag == CommandDataSetType {
+			command[i] = newUSCommandElement(CommandDataSetType, 0x0001)
+		}
+	}
+	reqObj, err := DecodeCommandSet(mustEncodeCommandSet(t, command))
+	if err != nil {
+		t.Fatalf("DecodeCommandSet(request) error = %v", err)
+	}
+	parsed, err := ParseCStoreRequest(reqObj)
+	if err != nil {
+		t.Fatalf("ParseCStoreRequest() error = %v", err)
+	}
+	if *parsed != req {
+		t.Fatalf("ParseCStoreRequest() = %#v, want %#v", parsed, req)
+	}
+}
+
 func TestCStoreResponseCommandSet(t *testing.T) {
 	resp := CStoreResponse{
 		AffectedSOPClassUID:       dicomtest.TestSOPClassUID,
 		MessageIDBeingRespondedTo: 9,
 		AffectedSOPInstanceUID:    dicomtest.TestSOPInstanceUID,
 		Status:                    StatusSuccess,
+		ErrorComment:              "incoming compression JPEG codec path is not available",
 	}
 	respObj, err := DecodeCommandSet(mustEncodeCommandSet(t, resp.CommandSet()))
 	if err != nil {

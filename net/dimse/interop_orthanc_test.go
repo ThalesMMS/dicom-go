@@ -19,6 +19,51 @@ import (
 //
 // Enable with:
 //
+//	DICOMGO_INTEGRATION=1 ORTHANC_HOST=127.0.0.1 ORTHANC_PORT=4242 go test ./... -run TestInteropOrthancCEcho
+func TestInteropOrthancCEcho(t *testing.T) {
+	testutil.SkipIfIntegration(t)
+
+	orthancHost := getenvDefault("ORTHANC_HOST", "127.0.0.1")
+	orthancPort := getenvDefault("ORTHANC_PORT", "4242")
+	remoteAddr := fmt.Sprintf("%s:%s", orthancHost, orthancPort)
+
+	callingAET := getenvDefault("CALLING_AET", "DICOMGO")
+	calledAET := getenvDefault("CALLED_AET", "ORTHANC")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	assoc, err := ul.DialContext(ctx, remoteAddr, ul.DialOptions{
+		CallingAETitle: callingAET,
+		CalledAETitle:  calledAET,
+		Contexts: []ul.PresentationContext{{
+			ID:                 1,
+			AbstractSyntaxUID:  VerificationSOPClassUID,
+			TransferSyntaxUIDs: []string{ul.ImplicitVRLittleEndian},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("DialContext: %v", err)
+	}
+	defer func() {
+		if err := assoc.Release(ctx); err != nil {
+			t.Errorf("assoc.Release failed: %v", err)
+		}
+	}()
+
+	pc, err := AcceptedContextForSOPClass(assoc, VerificationSOPClassUID)
+	if err != nil {
+		t.Fatalf("AcceptedContextForSOPClass: %v", err)
+	}
+	if _, err := SendCEcho(assoc, pc.ID, 1); err != nil {
+		t.Fatalf("SendCEcho: %v", err)
+	}
+}
+
+// This is an opt-in integration test that runs against a real Orthanc instance.
+//
+// Enable with:
+//
 //	DICOMGO_INTEGRATION=1 ORTHANC_HOST=127.0.0.1 ORTHANC_PORT=4242 STUDY_UID=... go test ./... -run TestInteropOrthancCMoveStudy
 //
 // Requires a C-STORE SCP listening under MOVE_DEST_AET (see docs/INTEROP_ORTHANC.md).

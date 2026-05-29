@@ -5,15 +5,21 @@ A pure Go implementation of the DICOM medical imaging standard.
 `dicom-go` uses idiomatic Go packages, concrete value
 types and explicit registries. The `v0.1.0` release provides a practical subset
 for reading and writing Part 10 files, converting datasets to/from DICOM JSON,
-extracting pixel data, and running minimal C-ECHO/C-STORE workflows.
+extracting pixel data, running reusable DIMSE network workflows, defining the
+DICOMweb client/protocol boundary, and using headless clinical-viewer primitives
+such as rendering, ROI, DICOMDIR reference resolution and small
+de-identification helpers.
 
 This project does not claim full DICOM conformance. See
 [docs/CONFORMANCE.md](./docs/CONFORMANCE.md) for the exact `v0.1.0` capability
 scope and limitations.
 
 Security note: the network stack and CLI tools are intended for trusted networks
-only. There is no TLS, authentication, or user identity negotiation. Do not
-expose these tools directly to untrusted peers.
+by default. The UL library can opt into TLS with caller-supplied `tls.Config`
+values and can convey DICOM User Identity items through caller-supplied
+callbacks, but the CLI defaults remain plain TCP and there is no built-in
+authentication, authorization or audit-log backend. Do not expose these tools
+directly to untrusted peers.
 
 ## Installation
 
@@ -91,6 +97,39 @@ _ = limitedFile
 
 Example: [`examples/readfile`](./examples/readfile).
 
+### Private Dictionary Overlays
+
+Implicit VR parsing uses the configured `dictionary.DataDictionary` to resolve
+element VRs. For private or site-specific tags, compose an overlay before the
+standard dictionary so unknown standard tags still resolve normally:
+
+```go
+type privateDictionary struct {
+	byTag map[core.Tag]dictionary.Entry
+}
+
+func (d privateDictionary) ByTag(tag core.Tag) (dictionary.Entry, bool) {
+	entry, ok := d.byTag[tag]
+	return entry, ok
+}
+
+func (d privateDictionary) ByKeyword(string) (dictionary.Entry, bool) {
+	return dictionary.Entry{}, false
+}
+
+private := privateDictionary{byTag: map[core.Tag]dictionary.Entry{
+	core.NewTag(0x0011, 0x1001): {Tag: core.NewTag(0x0011, 0x1001), VR: core.VRLO},
+}}
+dict := dictionary.Chain{private, std.Dictionary}
+
+file, err := object.OpenFileWithOptions("implicit.dcm", object.ReadFileOptions{
+	Dictionary: dict,
+})
+```
+
+Unknown private tags still fall back to `UN`, preserving defined-length values
+as raw bytes instead of guessing a VR.
+
 ### File Writing
 
 Writing is provided by the `object` package. Build or modify an `object.File`,
@@ -132,6 +171,26 @@ external bulk data.
 
 Example: [`examples/json`](./examples/json).
 
+### SOP Class Validation Hooks
+
+SOP Class-specific validation is opt-in. Applications can attach narrow hooks
+for required attributes without changing parse/read behavior:
+
+```go
+rule := object.RequiredAttributeRule{
+	SOPClassUID: "1.2.840.10008.5.1.4.1.1.2", // CT Image Storage
+	Attributes: []object.RequiredAttribute{
+		{Tag: core.NewTag(0x0010, 0x0020), Keyword: "PatientID"},
+	},
+}
+err := file.Dataset.ValidateSOPClass(object.ValidationOptions{
+	Hooks: []object.SOPClassValidationHook{rule},
+})
+```
+
+The library provides hooks and small helpers only; it does not ship a complete
+SOP Class conformance rule set.
+
 ### Pixel Data
 
 Native uncompressed frame extraction:
@@ -140,12 +199,49 @@ Native uncompressed frame extraction:
 frames, err := pixeldata.ExtractNativeFrames(file.Dataset)
 ```
 
-RLE Lossless decoding is available as an optional codec and must be registered:
+Encapsulated Uncompressed Explicit VR Little Endian
+(`1.2.840.10008.1.2.1.98`) is assembled into native frame bytes without a pixel
+codec. Compressed encapsulated transfer syntaxes require an optional codec to be
+registered before decoding. JPEG Baseline/Extended, JPEG Lossless, RLE Lossless,
+JPEG-LS, and JPEG 2000/HTJ2K codecs are available in optional packages. The
+`jpeglscodec` and `jpeg2000codec` aliases below refer to the nested optional
+modules under `github.com/ThalesMMS/dicom-go/examples/codec-adapters/`:
+
+The dependency policy is documented in
+[`docs/CODEC_DEPENDENCY_POLICY.md`](docs/CODEC_DEPENDENCY_POLICY.md). The
+default profile stays pure Go and permissive-only; LGPL/GPL/AGPL codec code is
+not accepted. Native or CGO codec adapters must be explicit opt-ins behind build
+tags or nested optional modules, and must not become base-module dependencies.
+Synthetic codec fixture and conformance workflows are documented in
+[`docs/CODEC_FIXTURE_WORKFLOW.md`](docs/CODEC_FIXTURE_WORKFLOW.md).
 
 ```go
+if err := jpegcodec.RegisterDefault(); err != nil {
+	panic(err)
+}
+if err := jpeglossless.RegisterDefault(); err != nil {
+	panic(err)
+}
 if err := rle.RegisterDefault(); err != nil {
 	panic(err)
 }
+// The JPEG-LS adapter is dependency-injected. Applications supply a
+// dependency-specific decoder; nil registers the boundary but returns
+// jpegls.ErrDecoderUnavailable during decode.
+var jpeglsDecoder jpeglscodec.Decoder // supplied by an optional decoder package
+if err := jpeglscodec.RegisterDefault(jpeglsDecoder); err != nil {
+	panic(err)
+}
+// Choose one JPEG 2000 / HTJ2K backend. The pure-Go adapter is a nested
+// optional module so the base module does not pull the JPEG 2000 dependency
+// unless applications opt in.
+if err := jpeg2000codec.RegisterDefault(); err != nil {
+	panic(err)
+}
+// OpenJPEG-backed fallback builds can instead use RegisterOpenJPEGDefault.
+// That path requires the jpeg2000_openjpeg build tag and OpenJPEG's
+// opj_decompress executable. It uses OpenJPEG for JPEG 2000 Part 1 and keeps
+// JPEG 2000 Part 2 / HTJ2K on the pure-Go fallback path.
 pixels, err := pixeldata.Extract(file.Dataset)
 if err != nil {
 	panic(err)
@@ -155,20 +251,89 @@ if err != nil {
 	panic(err)
 }
 _ = frames
+
+nativeFile, err := pixeldata.DecompressFile(file, pixeldata.DecompressOptions{})
+if err != nil {
+	panic(err)
+}
+_ = nativeFile // Explicit VR Little Endian by default.
 ```
 
-Example: [`examples/pixeldata`](./examples/pixeldata).
+If no codec is registered for a compressed encapsulated transfer syntax,
+`DecodeFrames` returns an error wrapping `pixeldata.ErrCodecNotFound` with the
+transfer syntax UID, name, registration hint and currently registered codec UIDs
+when available. JPEG-LS, JPEG 2000/HTJ2K, and JPEG XL syntaxes remain
+metadata/payload-readable even when their optional decoder is absent. JPEG XL
+decoding is supplied only by the nested opt-in adapter; the base module does
+not ship a JPEG XL decoder or native runtime. The `codecfull` release profile
+qualifies that adapter with its pinned `libjxl`/`djxl` runtime and external
+fixture evidence. MPEG,
+H.264, and HEVC syntaxes can be inspected and streamed with the `video` package
+for an application-owned native media pipeline; they deliberately remain
+outside the still-image decoder registry. The `jpip` package resolves JPIP
+references only through an explicit host/scheme policy, scopes credentials to
+their exact origin, revalidates redirects, and provides cancellable bounded
+retrieval plus an LRU of full, ranged, and progressive representations.
+`jpip.Client.DecodeFrame` feeds complete `image/jp2`, `image/jph`, or
+`image/jphc` responses through the caller's registered JPEG 2000/HTJ2K codec;
+JPP/JPT data-bin responses return a typed assembly limitation.
 
-### Streaming large element values (native Pixel Data)
+`pixeldata.DecompressFile` and `pixeldata.DecompressDataSet` are convenience
+APIs for export and receive workflows that need native uncompressed Pixel Data.
+They decode through the same registered codecs and return Explicit VR Little
+Endian by default, or Implicit VR Little Endian when configured. They do not
+perform compression, lossy recompression or arbitrary transfer-syntax
+transcoding.
+
+For display-oriented helpers, `render` builds on `pixeldata/display` and
+`pixeldata/frame` to render 8/16-bit monochrome frames and 8-bit interleaved RGB
+frames, sample pixels, auto-window stacks, build volumes, and produce MPR/MIP/
+slab/oblique/VR/CPR images. `roi` provides raster/vector ROI, measurements,
+segmentation operations and 2D/3D statistics. Planar RGB, 16-bit RGB, palette
+color, YBR conversion and full VOI/presentation-state pipelines remain outside
+the supported rendering subset.
+
+The VR renderer treats transfer-function color stops as display sRGB, bakes them
+to linear RGB for front-to-back compositing, and converts back to sRGB for the
+output image. STL iso-surface export intentionally writes the watertight
+thresholded voxel boundary rather than a smoothed marching-cubes mesh, preserving
+the exact selected voxel support for deterministic measurement/export workflows.
+
+Examples: [`examples/pixeldata`](./examples/pixeldata) and
+[`examples/render-roi`](./examples/render-roi).
+
+### DICOMDIR and de-identification helpers
+
+Small reusable utilities are exposed as public packages:
+
+- `dicomdir` extracts and resolves referenced file paths from DICOMDIR media
+  indexes.
+- `deid` applies a small in-place anonymization subset for common patient tags,
+  recursive sequence items, policy-driven private tags, hierarchy UID remapping
+  and burned-in pixel risk reporting.
+- `gsps` reads and writes grayscale softcopy presentation states for referenced
+  images, displayed area, window/level and simple graphic annotations.
+- `rtstruct` reads and writes RT Structure Sets, including helper conversion
+  from pixel-space vector ROIs to patient-space closed planar contours with
+  frame-of-reference and source image references.
+
+These packages are not a full media-import workflow and do not claim full DICOM
+Basic Profile de-identification. Applications remain responsible for their
+import/export policy, PHI review and compliance requirements.
+
+Example: [`examples/dicom-utilities`](./examples/dicom-utilities).
+
+### Streaming large values and deferred Pixel Data
 
 By default, `dicom-go` materializes defined-length element values into memory.
-For large values (notably native/uncompressed Pixel Data, tag `(7FE0,0010)`), you
-can opt into a mode that *skips materialization* and then stream the raw encoded
-value bytes on demand.
+For large values, you can opt into modes that *skip materialization* and then
+stream the raw encoded value bytes on demand.
 
-Enable skipping by setting `InlineValueBytesThreshold` (bytes). Any defined-length
-*primitive* element whose length is **strictly greater** than the threshold is
-not stored in memory (the parsed element will have no inline value).
+Use `InlineValueBytesThreshold` for defined-length primitive values. Any
+defined-length *primitive* element whose length is **strictly greater** than the
+threshold is not stored in memory (the parsed element will have no inline
+value), and can later be streamed with `CopyValueTo` when the reader has a
+seekable source.
 
 ```go
 file, err := object.OpenFileWithOptions("image.dcm", object.ReadFileOptions{
@@ -193,14 +358,24 @@ if err != nil {
 _ = n
 ```
 
+Use `DeferPixelData` when Pixel Data itself should be consumed without
+materializing, including encapsulated/fragmented Pixel Data. With a seekable
+source, `CopyValueTo` can stream the raw Pixel Data value bytes, and
+`object.WriteFile` can round-trip deferred Pixel Data without loading the value
+into memory.
+
 Notes/limitations:
 
-- Streaming uses an underlying seekable input (an `io.ReadSeeker`).
-  When you read from a file path via `object.OpenFileWithOptions`, this is
-  supported.
-- Only **defined-length primitive** values are eligible for this skip/stream path.
-  Undefined-length values, sequences, and encapsulated/compressed Pixel Data are
-  parsed normally (and are not currently streamable via `CopyValueTo`).
+- Streaming skipped/deferred values uses an underlying seekable input (an
+  `io.ReadSeeker`). Reading from a file path via `object.OpenFileWithOptions` or
+  `object.OpenDataSetWithOptions` provides this and keeps the source open until
+  `Close()`.
+- `InlineValueBytesThreshold` applies to defined-length primitive values.
+  General SQ replay is intentionally unsupported, so sequence item values are
+  materialized. Duplicate deferred tags are treated as ambiguous.
+- `DeferPixelData` applies to Pixel Data and requires a seekable source. For
+  encapsulated Pixel Data, `CopyValueTo` streams the encoded Pixel Data value
+  bytes (Basic Offset Table, fragments and delimiters), not the element header.
 - `InlineValueBytesThreshold = 0` preserves historical behavior (always
   materialize, subject to `MaxElementBytes`).
 
@@ -209,8 +384,9 @@ Notes/limitations:
 Inspect files:
 
 ```sh
-go run ./cmd/dcmdump -- image.dcm
-go run ./cmd/dcmdump -- -json image.dcm
+go run ./cmd/dcmdump image.dcm
+go run ./cmd/dcmdump -show-offsets image.dcm
+go run ./cmd/dcmdump -json image.dcm
 ```
 
 Verification:
@@ -220,12 +396,23 @@ go run ./cmd/echoscp -- -port 11112 -single
 go run ./cmd/echoscu -- -host 127.0.0.1 -port 11112
 ```
 
+For longer-running echo tests, `echoscp` also exposes bounded service controls:
+`-max-associations`, `-max-active-operations`, `-queue-depth` and
+`-enqueue-timeout`.
+
 Storage:
 
 ```sh
 go run ./cmd/storescp -- -address 127.0.0.1:11112 -output ./received
 go run ./cmd/storescu -- 127.0.0.1:11112 image.dcm
 ```
+
+`storescp` serves C-STORE and C-ECHO verification only. Other DIMSE commands
+on an accepted association are logged as unsupported and abort that association.
+
+CLI errors use `tool: category: detail` formatting for runtime failures. Common
+categories are `file`, `parse`, `transfer`, `codec` and `network`; usage errors
+still print command help and exit with code 2.
 
 Query (Study Root C-FIND SCU):
 
@@ -326,9 +513,10 @@ Notes:
   host/port; the remote peer must have that AE Title registered in its AE
   configuration so it can resolve the destination host/port and open the C-STORE
   association to your Storage SCP.
-- See [`docs/INTEROP_ORTHANC.md`](./docs/INTEROP_ORTHANC.md) and
-  [`scripts/interop_retrieve_orthanc.sh`](./scripts/interop_retrieve_orthanc.sh) for a
-  reproducible Orthanc setup.
+- See [`docs/INTEROP_ORTHANC.md`](./docs/INTEROP_ORTHANC.md),
+  [`docs/INTEROP_MATRIX.md`](./docs/INTEROP_MATRIX.md) and
+  [`scripts/interop_orthanc_matrix.sh`](./scripts/interop_orthanc_matrix.sh) for
+  reproducible opt-in Orthanc checks.
 
 Network examples: [`examples/echo`](./examples/echo) and
 [`examples/store`](./examples/store). Query/Retrieve examples are currently
@@ -339,12 +527,24 @@ provided via `cmd/findscu` and `cmd/dicom-go-retrieve`.
 - DICOM Part 10 read/write.
 - Native transfer syntaxes: Implicit VR Little Endian, Explicit VR Little
   Endian, Explicit VR Big Endian.
-- Encapsulated Pixel Data preservation for supported fragment-only workflows.
+- Deflated Explicit VR Little Endian dataset read/write.
+- Encapsulated Uncompressed Explicit VR Little Endian frame assembly without a
+  pixel codec, plus encapsulated Pixel Data preservation for supported
+  fragment-only workflows.
 - DICOM JSON marshal/unmarshal.
 - Native pixel data extraction.
-- Optional RLE Lossless pixel codec.
-- DICOM UL association negotiation over plain TCP.
-- Minimal DIMSE C-ECHO, C-STORE and Study Root C-FIND (SCU).
+- Still-image decompression-to-native API for supported registered codecs.
+- Optional JPEG Baseline and RLE Lossless pixel codecs.
+- DICOM UL association negotiation over plain TCP, with optional TLS configured
+  by callers.
+- Minimal DIMSE C-ECHO, C-STORE, Study Root C-FIND (SCU/SCP),
+  Study Root C-MOVE (SCU/SCP workflow helpers) and Study/Patient Root
+  Query/Retrieve model helper primitives.
+- DICOMweb is a library responsibility: reusable QIDO-RS, WADO-RS and STOW-RS
+  request/response helpers belong here rather than in application backends. The
+  `net/dicomweb` package boundary/scaffold exists, while full Twin migration is
+  tracked by #126-#130; applications remain responsible for endpoint profiles,
+  credentials, jobs, archive import/export and UI state.
 - CLI tools for dump, echo, store, find and UID generation.
 
 ## Limitations / production-readiness warnings
@@ -355,20 +555,61 @@ explicitly documented.
 
 Not implemented / out of scope in `v0.1.0`:
 
-- Most compressed pixel codecs (JPEG/JPEG-LS/JPEG 2000/MPEG/HEVC, etc.).
-- Deflated transfer syntaxes.
-- TLS (DICOM over TLS) and security/auditing profiles.
+- Most still-image compressed pixel codecs beyond the optional JPEG
+  Baseline/Extended, JPEG Lossless, RLE Lossless, JPEG-LS boundary, and JPEG
+  2000/HTJ2K subsets. JPEG XL is not implemented in the base module; it is
+  available through a nested opt-in adapter and is qualified separately by the
+  `codecfull` release profile.
+- Built-in video frame decoding, JPIP JPP/JPT data-bin assembly, deflated
+  image-frame compression, and SMPTE ST 2110 media syntaxes.
+  The `video` package does provide bounded validation and streaming extraction
+  for DICOM MPEG, MPEG-4 AVC/H.264, and HEVC/H.265 payloads so applications can
+  hand them to a native media backend without copying the complete payload into
+  memory. The `jpip` package provides policy-bound remote retrieval and decoding
+  for complete JPEG 2000/HTJ2K responses when the corresponding optional codec
+  is registered.
+- Security/auditing profiles.
 - Many DIMSE services.
+- A complete reusable DICOMweb client/helper surface. Applications may still have
+  temporary adapters, but protocol semantics should move here instead of becoming
+  permanent application-owned networking code.
+
+These broad gaps are tracked as scoped backlog items in
+[docs/ROADMAP.md](./docs/ROADMAP.md#tracked-v010-limitation-backlog).
+The still-image codec adapter policy is tracked separately in
+[docs/ROADMAP.md](./docs/ROADMAP.md#optional-still-image-codec-adapter-plan).
 
 Networking cautions:
 
-- Query/Retrieve support is **limited** (implemented: Study Root C-FIND SCU and
-  Study Root C-MOVE SCU only).
-- Storage Commitment is currently exposed as **building blocks** (N-ACTION / N-EVENT-REPORT
-  primitives + in-memory transaction correlation), not as a production-ready long-lived
-  service.
-- The library does **not** support asynchronous/concurrent DIMSE operations on a single
-  association.
+- Query/Retrieve support is **limited** (implemented: Study Root C-FIND SCU/SCP,
+  Study Root C-MOVE SCU/SCP workflow helpers, a Study Root C-GET SCU workflow
+  helper and Patient Root SCU presentation-context/identifier helpers). The
+  C-MOVE SCP and C-GET storage APIs use caller-provided callbacks; there is no
+  built-in archive.
+- Storage Commitment is exposed as N-ACTION / N-EVENT-REPORT primitives, an
+  in-memory transaction tracker, event/action dataset helpers and a minimal
+  single-request SCP API. It is not a production service with persistence,
+  retries or audit integration.
+- DICOMweb helpers should cover reusable QIDO-RS, WADO-RS and STOW-RS protocol
+  behavior. Application code owns node stores, URL/profile configuration,
+  credential retrieval, retry policy, job progress, archive integration,
+  receiver policy, operation history, UI summaries and auto-query.
+- Current DIMSE helpers assume **one outstanding operation per association**.
+  They do not negotiate asynchronous operation windows, multiplex independent
+  operations or retry DIMSE commands automatically. Bounded SCP worker queues
+  are available through `dimse.ServiceQueue` and the `echoscp` queue flags;
+  larger service workflows still need to wire those controls explicitly.
+- TLS transport is opt-in at the UL library boundary through
+  `ul.DialOptions.TLSConfig` and `ul.AcceptOptions.TLSConfig`. Plain TCP remains
+  the default and the CLIs do not expose TLS flags yet.
+- User Identity negotiation is opt-in through `ul.DialOptions.UserIdentity` and
+  `ul.AcceptOptions.UserIdentityHandler`. Accepting an identity item only gives
+  application code material for its own policy decision; it is not built-in
+  authentication or authorization.
+- Authentication, authorization, audit-log persistence, PHI detection and
+  de-identification are deployment responsibilities. The `net/audit` package
+  provides opt-in local event hooks for service wrappers; it does not implement
+  ATNA formatting, secure log transport or retention policy.
 
 Read [docs/CONFORMANCE.md](./docs/CONFORMANCE.md) before using this module with
 untrusted files, large studies, or production network peers.
@@ -388,9 +629,12 @@ untrusted files, large studies, or production network peers.
 | `object` | High-level object model and Part 10 file read/write APIs. |
 | `dicomjson` | DICOM JSON marshal/unmarshal helpers. |
 | `pixeldata` | Pixel metadata, native frame extraction and codec registry. |
+| `pixeldata/jpeg` | Optional pure Go JPEG Baseline decoder. |
 | `pixeldata/rle` | Optional pure Go RLE Lossless decoder. |
 | `net/ul` | DICOM Upper Layer PDU codec and association negotiation. |
+| `net/audit` | Optional structured audit event model for network service wrappers. |
 | `net/dimse` | Minimal C-ECHO, C-STORE, C-FIND, C-MOVE and Storage Commitment command/data helpers. |
+| `net/dicomweb` | Package boundary/scaffold for reusable QIDO-RS, WADO-RS and STOW-RS helpers; full Twin migration remains tracked by #126-#130. |
 | `cmd/*` | Runnable command line tools. |
 | `examples/*` | Runnable examples by feature area. |
 
@@ -407,6 +651,8 @@ make check
 ```
 
 `make check` runs formatting, `go vet`, `go test ./...` and `go build ./...`.
+Longer fuzz campaigns for parser, JSON and UL PDU decoding are documented in
+[`docs/FUZZING.md`](./docs/FUZZING.md).
 
 Regenerate the standard dictionary:
 

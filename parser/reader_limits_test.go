@@ -216,6 +216,38 @@ func TestReaderLimitsRejectPartialElementEOF(t *testing.T) {
 	}
 }
 
+func TestReaderLimitsReadsDefinedValueIncrementallyOnTruncatedLength(t *testing.T) {
+	var stream bytes.Buffer
+	_ = binary.Write(&stream, binary.LittleEndian, uint16(0x0010))
+	_ = binary.Write(&stream, binary.LittleEndian, uint16(0x0020))
+	_ = binary.Write(&stream, binary.LittleEndian, uint32(1<<20))
+	source := &maxReadSizeReader{r: bytes.NewReader(stream.Bytes())}
+	reader := NewReader(source, transfer.ImplicitVRLittleEndian, ReaderOptions{Dictionary: std.Dictionary})
+
+	_, err := reader.Next()
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("expected unexpected EOF, got %v", err)
+	}
+	if source.maxReadSize > 64<<10 {
+		t.Fatalf("largest value read buffer = %d bytes, want <= 64 KiB", source.maxReadSize)
+	}
+}
+
+type maxReadSizeReader struct {
+	r           *bytes.Reader
+	maxReadSize int
+}
+
+func (r *maxReadSizeReader) Read(p []byte) (int, error) {
+	if len(p) > r.maxReadSize {
+		r.maxReadSize = len(p)
+	}
+	return r.r.Read(p)
+}
+
 func TestReaderLimitsRejectUnterminatedItem(t *testing.T) {
 	stream := bytes.Join([][]byte{
 		explicitLongHeaderBytes(binary.LittleEndian, core.NewTag(0x0008, 0x1111), core.VRSQ, [2]byte{}, 0xFFFFFFFF),

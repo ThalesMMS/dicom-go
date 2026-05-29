@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/ThalesMMS/dicom-go/internal/clidiag"
 	"github.com/ThalesMMS/dicom-go/net/dimse"
 	"github.com/ThalesMMS/dicom-go/net/ul"
 )
@@ -28,11 +29,11 @@ func run(args []string, stdout, stderr io.Writer) int {
 		if errors.Is(err, errUsage) {
 			return 2
 		}
-		_, _ = fmt.Fprintln(stderr, err)
+		clidiag.Fprintln(stderr, "echoscu", err)
 		return 1
 	}
 	if err := runEcho(opts, stdout, stderr); err != nil {
-		_, _ = fmt.Fprintln(stderr, err)
+		clidiag.Fprintln(stderr, "echoscu", err)
 		return 1
 	}
 	return 0

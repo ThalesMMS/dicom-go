@@ -1,15 +1,25 @@
 package object
 
 import (
+	"bytes"
+	"encoding/binary"
 	"errors"
+	"io"
 	"strings"
 	"testing"
 
 	"github.com/ThalesMMS/dicom-go/core"
+	"github.com/ThalesMMS/dicom-go/dcmtime"
 	"github.com/ThalesMMS/dicom-go/dictionary/std"
 	dicomenc "github.com/ThalesMMS/dicom-go/encoding"
 	"github.com/ThalesMMS/dicom-go/internal/dicomtest"
 )
+
+type staticValueProvider []byte
+
+func (p staticValueProvider) CopyValueTo(_ core.Tag, w io.Writer) (int64, error) {
+	return io.Copy(w, bytes.NewReader(p))
+}
 
 func TestFromDataSetToDataSetPreservesOrder(t *testing.T) {
 	seqTag := core.NewTag(0x0008, 0x1111)
@@ -85,6 +95,67 @@ func TestFromDataSetDuplicateTagsUseLastWinsAndLastPosition(t *testing.T) {
 	}
 	if diff := dicomtest.DiffDataSet(obj.ToDataSet(), want); diff != "" {
 		t.Fatalf("dataset mismatch:\n%s", diff)
+	}
+}
+
+func TestPutUpdateClearsDeferredAmbiguityAndReconcilesCount(t *testing.T) {
+	tag := core.NewTag(0x7FE0, 0x0010)
+	deferred := core.Element{
+		Header: core.ElementHeader{Tag: tag, VR: core.VROB, Length: 4, LengthSet: true},
+		Value:  nil,
+	}
+	obj := New(std.Dictionary)
+	obj.setValueProvider(staticValueProvider{1, 2, 3, 4})
+
+	obj.Put(deferred)
+	if obj.deferredCount != 1 || obj.ambiguousDeferred[tag] {
+		t.Fatalf("initial deferred state = count %d ambiguous %v, want 1/false", obj.deferredCount, obj.ambiguousDeferred[tag])
+	}
+
+	obj.Put(core.NewRawElement(tag, core.VROB, []byte{9, 8, 7, 6}))
+	if obj.deferredCount != 0 || obj.ambiguousDeferred[tag] {
+		t.Fatalf("materialized update state = count %d ambiguous %v, want 0/false", obj.deferredCount, obj.ambiguousDeferred[tag])
+	}
+
+	obj.Put(deferred)
+	if obj.deferredCount != 1 || obj.ambiguousDeferred[tag] {
+		t.Fatalf("second deferred state = count %d ambiguous %v, want 1/false", obj.deferredCount, obj.ambiguousDeferred[tag])
+	}
+	var got bytes.Buffer
+	if _, err := obj.CopyValueTo(tag, &got); err != nil {
+		t.Fatalf("CopyValueTo() error = %v", err)
+	}
+	if !bytes.Equal(got.Bytes(), []byte{1, 2, 3, 4}) {
+		t.Fatalf("CopyValueTo() = %v, want provider bytes", got.Bytes())
+	}
+}
+
+func TestPutResolvesParsedDeferredDuplicateAmbiguity(t *testing.T) {
+	tag := core.NewTag(0x7FE0, 0x0010)
+	deferred := func(length core.Length) core.Element {
+		return core.Element{
+			Header: core.ElementHeader{Tag: tag, VR: core.VROB, Length: length, LengthSet: true},
+			Value:  nil,
+		}
+	}
+	obj := fromParsedDataSetWithTextOptions(core.DataSet{Elements: []core.Element{
+		deferred(4),
+		deferred(8),
+	}}, std.Dictionary, TextOptions{})
+	if !obj.ambiguousDeferred[tag] || obj.deferredCount != 0 {
+		t.Fatalf("parsed duplicate state = ambiguous %v count %d, want true/0", obj.ambiguousDeferred[tag], obj.deferredCount)
+	}
+
+	obj.Put(core.NewRawElement(tag, core.VROB, []byte{9, 8, 7, 6}))
+	if obj.ambiguousDeferred[tag] || obj.deferredCount != 0 {
+		t.Fatalf("updated duplicate state = ambiguous %v count %d, want false/0", obj.ambiguousDeferred[tag], obj.deferredCount)
+	}
+	var got bytes.Buffer
+	if _, err := obj.CopyValueTo(tag, &got); err != nil {
+		t.Fatalf("CopyValueTo() error = %v", err)
+	}
+	if !bytes.Equal(got.Bytes(), []byte{9, 8, 7, 6}) {
+		t.Fatalf("CopyValueTo() = %v, want updated bytes", got.Bytes())
 	}
 }
 
@@ -168,11 +239,63 @@ func TestLookupStringsDecodesSpecificCharacterSet(t *testing.T) {
 	}
 }
 
+func TestLookupStringsSplitsMultiValueTextAfterCharsetDecode(t *testing.T) {
+	charset, err := dicomenc.ParseCharacterSet("ISO 2022 IR 13")
+	if err != nil {
+		t.Fatalf("ParseCharacterSet() error = %v", err)
+	}
+	first, err := charset.Encode("表")
+	if err != nil {
+		t.Fatalf("Encode(first) error = %v", err)
+	}
+	second, err := charset.Encode("裏")
+	if err != nil {
+		t.Fatalf("Encode(second) error = %v", err)
+	}
+	if !bytes.Contains(first, []byte{'\\'}) {
+		t.Fatalf("encoded first value = % X, want embedded 0x5C byte", first)
+	}
+
+	charsetTag := core.NewTag(0x0008, 0x0005)
+	loTag := core.NewTag(0x0008, 0x103E)
+	pnTag := core.NewTag(0x0010, 0x0010)
+
+	rawLO := append(append(append([]byte(nil), first...), '\\'), second...)
+	rawLO = append(rawLO, ' ')
+
+	rawPN := append(append([]byte(nil), first...), []byte("^Taro")...)
+	rawPN = append(rawPN, '\\')
+	rawPN = append(rawPN, second...)
+	rawPN = append(rawPN, []byte("^Jiro ")...)
+
+	obj := FromElements([]core.Element{
+		dicomtest.NewStringElement(charsetTag, core.VRCS, "ISO 2022 IR 13"),
+		core.NewRawElement(loTag, core.VRLO, rawLO),
+		core.NewRawElement(pnTag, core.VRPN, rawPN),
+	}, std.Dictionary)
+
+	loValues, err := obj.LookupStrings(loTag)
+	if err != nil {
+		t.Fatalf("LookupStrings(LO) error = %v", err)
+	}
+	if len(loValues) != 2 || loValues[0] != "表" || loValues[1] != "裏" {
+		t.Fatalf("LookupStrings(LO) = %v, want [表 裏]", loValues)
+	}
+
+	pnValues, err := obj.LookupStrings(pnTag)
+	if err != nil {
+		t.Fatalf("LookupStrings(PN) error = %v", err)
+	}
+	if len(pnValues) != 2 || pnValues[0] != "表^Taro" || pnValues[1] != "裏^Jiro" {
+		t.Fatalf("LookupStrings(PN) = %v, want [表^Taro 裏^Jiro]", pnValues)
+	}
+}
+
 func TestLookupStringsUnsupportedSpecificCharacterSet(t *testing.T) {
 	charsetTag := core.NewTag(0x0008, 0x0005)
 	nameTag := core.NewTag(0x0010, 0x0010)
 	obj := FromElements([]core.Element{
-		dicomtest.NewStringElement(charsetTag, core.VRCS, "ISO_IR 192"),
+		dicomtest.NewStringElement(charsetTag, core.VRCS, "UNKNOWN"),
 		core.NewRawElement(nameTag, core.VRPN, []byte("Jos\xe9^Silva")),
 	}, std.Dictionary)
 
@@ -189,7 +312,7 @@ func TestLookupStringsFallbackSpecificCharacterSet(t *testing.T) {
 	charsetTag := core.NewTag(0x0008, 0x0005)
 	nameTag := core.NewTag(0x0010, 0x0010)
 	obj := FromElements([]core.Element{
-		dicomtest.NewStringElement(charsetTag, core.VRCS, "ISO_IR 192"),
+		dicomtest.NewStringElement(charsetTag, core.VRCS, "UNKNOWN"),
 		core.NewRawElement(nameTag, core.VRPN, []byte("Jos\xe9^Silva")),
 	}, std.Dictionary)
 	obj.SetTextOptions(TextOptions{
@@ -203,6 +326,60 @@ func TestLookupStringsFallbackSpecificCharacterSet(t *testing.T) {
 	}
 	if len(values) != 1 || values[0] != "José^Silva" {
 		t.Fatalf("LookupStrings() = %v, want [José^Silva]", values)
+	}
+}
+
+func TestLookupStringsDecodesPersonNameComponentGroups(t *testing.T) {
+	charsetTag := core.NewTag(0x0008, 0x0005)
+	nameTag := core.NewTag(0x0010, 0x0010)
+	rawName := append([]byte("Jos\xe9^Silva="), []byte("山田^太郎")...)
+	rawName = append(rawName, '=')
+	rawName = append(rawName, 0xD6, 0xD0, 0xCE, 0xC4)
+	obj := FromElements([]core.Element{
+		core.NewRawElement(charsetTag, core.VRCS, []byte("ISO_IR 100\\ISO_IR 192\\GBK")),
+		core.NewRawElement(nameTag, core.VRPN, rawName),
+	}, std.Dictionary)
+
+	values, err := obj.LookupStrings(nameTag)
+	if err != nil {
+		t.Fatalf("LookupStrings() error = %v", err)
+	}
+	if len(values) != 1 || values[0] != "José^Silva=山田^太郎=中文" {
+		t.Fatalf("LookupStrings() = %v", values)
+	}
+	name, ok := obj.GetPersonName(nameTag)
+	if !ok || name.ToDICOMString() != "José^Silva=山田^太郎=中文" {
+		t.Fatalf("GetPersonName() = (%q, %v)", name.ToDICOMString(), ok)
+	}
+}
+
+func TestLookupStringsDecodesISO2022PersonNameComponentGroups(t *testing.T) {
+	charsetTag := core.NewTag(0x0008, 0x0005)
+	nameTag := core.NewTag(0x0010, 0x0010)
+	japanese := []byte{
+		0x1B, 0x24, 0x42, 0x3B, 0x33, 0x45, 0x44, 0x1B, 0x28, 0x42,
+		'^',
+		0x1B, 0x24, 0x42, 0x42, 0x40, 0x4F, 0x3A, 0x1B, 0x28, 0x42,
+	}
+	korean := []byte{0xC8, 0xAB, 0xB1, 0xE6, 0xB5, 0xBF}
+	rawName := append([]byte("Jos\xe9^Silva="), japanese...)
+	rawName = append(rawName, '=')
+	rawName = append(rawName, korean...)
+	obj := FromElements([]core.Element{
+		core.NewRawElement(charsetTag, core.VRCS, []byte("ISO_IR 100\\ISO 2022 IR 87\\ISO 2022 IR 149")),
+		core.NewRawElement(nameTag, core.VRPN, rawName),
+	}, std.Dictionary)
+
+	values, err := obj.LookupStrings(nameTag)
+	if err != nil {
+		t.Fatalf("LookupStrings() error = %v", err)
+	}
+	if len(values) != 1 || values[0] != "José^Silva=山田^太郎=홍길동" {
+		t.Fatalf("LookupStrings() = %v", values)
+	}
+	name, ok := obj.GetPersonName(nameTag)
+	if !ok || name.ToDICOMString() != "José^Silva=山田^太郎=홍길동" {
+		t.Fatalf("GetPersonName() = (%q, %v)", name.ToDICOMString(), ok)
 	}
 }
 
@@ -256,6 +433,52 @@ func TestObjectSetTextOptionsInvalidatesCharsetCache(t *testing.T) {
 	}
 	if charset.Name() != "ISO_IR 100" {
 		t.Fatalf("CharacterSet() after SetTextOptions = %q, want ISO_IR 100", charset.Name())
+	}
+}
+
+func TestLookupTemporalValues(t *testing.T) {
+	dateTag := core.NewTag(0x0008, 0x0020)
+	timeTag := core.NewTag(0x0008, 0x0030)
+	dateTimeTag := core.NewTag(0x0008, 0x002A)
+	obj := FromElements([]core.Element{
+		dicomtest.NewStringElement(dateTag, core.VRDA, "202405"),
+		dicomtest.NewStringElement(timeTag, core.VRTM, "143015.123"),
+		dicomtest.NewStringElement(dateTimeTag, core.VRDT, "20240528143015.123456-0300"),
+	}, std.Dictionary)
+
+	date, err := obj.LookupDate(dateTag)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if date.Precision != dcmtime.PrecisionMonth || date.DCM() != "202405" {
+		t.Fatalf("LookupDate() = precision %s DCM %q, want MONTH 202405", date.Precision, date.DCM())
+	}
+
+	tm, err := obj.LookupTime(timeTag)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tm.Precision != dcmtime.PrecisionMS3 || tm.DCM() != "143015.123" {
+		t.Fatalf("LookupTime() = precision %s DCM %q, want MS3 143015.123", tm.Precision, tm.DCM())
+	}
+
+	dt, err := obj.LookupDateTime(dateTimeTag)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dt.Precision != dcmtime.PrecisionFull || dt.NoOffset || dt.DCM() != "20240528143015.123456-0300" {
+		t.Fatalf("LookupDateTime() = precision %s noOffset %v DCM %q", dt.Precision, dt.NoOffset, dt.DCM())
+	}
+}
+
+func TestLookupTemporalValuesRejectWrongVR(t *testing.T) {
+	tag := core.NewTag(0x0008, 0x0020)
+	obj := FromElements([]core.Element{
+		dicomtest.NewStringElement(tag, core.VRLO, "20240528"),
+	}, std.Dictionary)
+
+	if _, err := obj.LookupDate(tag); err == nil {
+		t.Fatal("LookupDate() error = nil, want wrong-VR error")
 	}
 }
 
@@ -437,8 +660,81 @@ func TestGetSequence(t *testing.T) {
 	}
 }
 
+func TestGetSequenceCachedItemsRemainIndependentAcrossCalls(t *testing.T) {
+	sequenceTag := core.NewTag(0x0008, 0x1111)
+	nameTag := core.NewTag(0x0010, 0x0010)
+	idTag := core.NewTag(0x0010, 0x0020)
+	obj := FromElements([]core.Element{
+		dicomtest.NewSequenceElement(sequenceTag, core.DataSet{Elements: []core.Element{
+			dicomtest.NewPNElement(nameTag, "ORIGINAL^PATIENT"),
+			dicomtest.NewStringElement(idTag, core.VRLO, "PATIENT-001"),
+		}}),
+	}, std.Dictionary)
+
+	first, _ := obj.GetSequence(sequenceTag)
+	second, _ := obj.GetSequence(sequenceTag)
+	if first[0] == second[0] {
+		t.Fatal("repeated GetSequence() returned the same mutable item pointer")
+	}
+	first[0].Put(dicomtest.NewPNElement(nameTag, "CHANGED^PATIENT"))
+	if !first[0].Remove(idTag) {
+		t.Fatal("Remove() on first facade = false, want true")
+	}
+
+	if got, _ := first[0].GetString(nameTag); got != "CHANGED^PATIENT" {
+		t.Fatalf("mutated first item name = %q, want CHANGED^PATIENT", got)
+	}
+	if got, _ := second[0].GetString(nameTag); got != "ORIGINAL^PATIENT" {
+		t.Fatalf("second item name = %q, want ORIGINAL^PATIENT", got)
+	}
+	if !second[0].Has(idTag) {
+		t.Fatal("mutation of first facade removed Patient ID from second facade")
+	}
+	fresh, _ := obj.GetSequence(sequenceTag)
+	if got, _ := fresh[0].GetString(nameTag); got != "ORIGINAL^PATIENT" || !fresh[0].Has(idTag) {
+		t.Fatalf("fresh item = name %q hasID %v, want original/true", got, fresh[0].Has(idTag))
+	}
+}
+
+func TestGetSequenceCacheInvalidatesWhenSequenceOrTextConfigurationChanges(t *testing.T) {
+	sequenceTag := core.NewTag(0x0008, 0x1111)
+	nameTag := core.NewTag(0x0010, 0x0010)
+	sequence := func(name string) core.Element {
+		return dicomtest.NewSequenceElement(sequenceTag, core.DataSet{Elements: []core.Element{
+			dicomtest.NewPNElement(nameTag, name),
+		}})
+	}
+	obj := FromElements([]core.Element{sequence("FIRST^PATIENT")}, std.Dictionary)
+
+	obj.GetSequence(sequenceTag)
+	if len(obj.sequenceCache) != 1 {
+		t.Fatalf("sequence cache size = %d, want 1", len(obj.sequenceCache))
+	}
+	obj.Put(sequence("SECOND^PATIENT"))
+	if _, cached := obj.sequenceCache[sequenceTag]; cached {
+		t.Fatal("Put(sequence) did not invalidate cached items")
+	}
+	items, _ := obj.GetSequence(sequenceTag)
+	if got, _ := items[0].GetString(nameTag); got != "SECOND^PATIENT" {
+		t.Fatalf("item after Put = %q, want SECOND^PATIENT", got)
+	}
+
+	obj.SetTextOptions(TextOptions{})
+	if len(obj.sequenceCache) != 0 {
+		t.Fatalf("SetTextOptions() left %d cached sequences, want 0", len(obj.sequenceCache))
+	}
+	obj.GetSequence(sequenceTag)
+	obj.SetValueByteOrder(binary.BigEndian)
+	if len(obj.sequenceCache) != 0 {
+		t.Fatalf("SetValueByteOrder() left %d cached sequences, want 0", len(obj.sequenceCache))
+	}
+}
+
 func TestNilObjectAccessors(t *testing.T) {
 	var obj *Object
+	patientName := dicomtest.NewPNElement(core.NewTag(0x0010, 0x0010), "IGNORED^PATIENT")
+	obj.Put(patientName)
+	obj.put(patientName, true)
 
 	if obj.Has(core.NewTag(0x0010, 0x0010)) {
 		t.Fatal("Has() on nil object = true, want false")

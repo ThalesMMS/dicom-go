@@ -2,6 +2,9 @@ package main
 
 import (
 	"encoding/binary"
+	"image"
+	"image/color"
+	"strings"
 	"testing"
 
 	"github.com/ThalesMMS/dicom-go/pixeldata"
@@ -20,14 +23,15 @@ func TestRenderUnsigned16Monochrome2(t *testing.T) {
 	if err != nil {
 		t.Fatalf("renderFrame() error = %v", err)
 	}
-	if img.Pix[0] != 102 {
-		t.Fatalf("first pixel = %d, want 102", img.Pix[0])
+	gray := requireGray(t, img)
+	if gray.Pix[0] != 102 {
+		t.Fatalf("first pixel = %d, want 102", gray.Pix[0])
 	}
-	if img.Pix[1] < 127 || img.Pix[1] > 128 {
-		t.Fatalf("center pixel = %d, want mid gray", img.Pix[1])
+	if gray.Pix[1] < 127 || gray.Pix[1] > 128 {
+		t.Fatalf("center pixel = %d, want mid gray", gray.Pix[1])
 	}
-	if img.Pix[3] != 255 {
-		t.Fatalf("last pixel = %d, want 255", img.Pix[3])
+	if gray.Pix[3] != 255 {
+		t.Fatalf("last pixel = %d, want 255", gray.Pix[3])
 	}
 }
 
@@ -55,11 +59,12 @@ func TestRenderSigned16AppliesRescale(t *testing.T) {
 	if err != nil {
 		t.Fatalf("renderFrame() error = %v", err)
 	}
-	if img.Pix[0] != 0 {
-		t.Fatalf("rescaled low pixel = %d, want 0", img.Pix[0])
+	gray := requireGray(t, img)
+	if gray.Pix[0] != 0 {
+		t.Fatalf("rescaled low pixel = %d, want 0", gray.Pix[0])
 	}
-	if img.Pix[1] < 127 || img.Pix[1] > 128 {
-		t.Fatalf("rescaled center pixel = %d, want mid gray", img.Pix[1])
+	if gray.Pix[1] < 127 || gray.Pix[1] > 128 {
+		t.Fatalf("rescaled center pixel = %d, want mid gray", gray.Pix[1])
 	}
 }
 
@@ -69,11 +74,79 @@ func TestRenderMonochrome1Inverts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("renderFrame() error = %v", err)
 	}
-	if img.Pix[0] != 255 {
-		t.Fatalf("first pixel = %d, want inverted white", img.Pix[0])
+	gray := requireGray(t, img)
+	if gray.Pix[0] != 255 {
+		t.Fatalf("first pixel = %d, want inverted white", gray.Pix[0])
 	}
-	if img.Pix[1] != 0 {
-		t.Fatalf("second pixel = %d, want inverted black", img.Pix[1])
+	if gray.Pix[1] != 0 {
+		t.Fatalf("second pixel = %d, want inverted black", gray.Pix[1])
+	}
+}
+
+func TestRenderRGB8(t *testing.T) {
+	frame := Frame{
+		Metadata: pixeldata.Metadata{
+			Rows:                       1,
+			Columns:                    3,
+			SamplesPerPixel:            3,
+			BitsAllocated:              8,
+			BitsStored:                 8,
+			HighBit:                    7,
+			PixelRepresentation:        0,
+			PlanarConfiguration:        0,
+			PlanarConfigurationPresent: true,
+			PhotometricInterpretation:  "RGB",
+		},
+		PixelBytes: []byte{
+			255, 0, 0,
+			0, 255, 0,
+			0, 0, 255,
+		},
+		Rescale: Rescale{Slope: 1},
+	}
+
+	img, err := renderFrame(frame, Window{Center: 128, Width: 256})
+	if err != nil {
+		t.Fatalf("renderFrame() error = %v", err)
+	}
+	rgba := requireRGBA(t, img)
+	for _, tc := range []struct {
+		x    int
+		want color.RGBA
+	}{
+		{x: 0, want: color.RGBA{R: 255, A: 255}},
+		{x: 1, want: color.RGBA{G: 255, A: 255}},
+		{x: 2, want: color.RGBA{B: 255, A: 255}},
+	} {
+		if got := rgba.RGBAAt(tc.x, 0); got != tc.want {
+			t.Fatalf("pixel %d = %#v, want %#v", tc.x, got, tc.want)
+		}
+	}
+}
+
+func TestRenderRejectsPlanarRGB(t *testing.T) {
+	frame := Frame{
+		Metadata: pixeldata.Metadata{
+			Rows:                       1,
+			Columns:                    1,
+			SamplesPerPixel:            3,
+			BitsAllocated:              8,
+			BitsStored:                 8,
+			HighBit:                    7,
+			PlanarConfiguration:        1,
+			PlanarConfigurationPresent: true,
+			PhotometricInterpretation:  "RGB",
+		},
+		PixelBytes: []byte{255, 0, 0},
+		Rescale:    Rescale{Slope: 1},
+	}
+
+	_, err := renderFrame(frame, Window{Center: 128, Width: 256})
+	if err == nil {
+		t.Fatal("renderFrame() error = nil, want planar RGB rejection")
+	}
+	if !strings.Contains(err.Error(), "PlanarConfiguration=1") {
+		t.Fatalf("renderFrame() error = %v, want PlanarConfiguration detail", err)
 	}
 }
 
@@ -91,6 +164,24 @@ func TestStoredPixelValueUsesHighBit(t *testing.T) {
 	if got != 0xF00 {
 		t.Fatalf("storedPixelValue() = %#x, want 0xf00", got)
 	}
+}
+
+func requireGray(t *testing.T, img image.Image) *image.Gray {
+	t.Helper()
+	gray, ok := img.(*image.Gray)
+	if !ok {
+		t.Fatalf("image type = %T, want *image.Gray", img)
+	}
+	return gray
+}
+
+func requireRGBA(t *testing.T, img image.Image) *image.RGBA {
+	t.Helper()
+	rgba, ok := img.(*image.RGBA)
+	if !ok {
+		t.Fatalf("image type = %T, want *image.RGBA", img)
+	}
+	return rgba
 }
 
 func testFrame(values []uint16, signed bool, photometric string) Frame {

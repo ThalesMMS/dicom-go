@@ -9,8 +9,16 @@ import (
 )
 
 const (
-	// Storage Commitment Push Model uses Event Type ID = 1 for commitment result.
-	StorageCommitmentEventTypeID uint16 = 1
+	// StorageCommitmentEventTypeSuccess reports that commitment succeeded for
+	// every SOP Instance in the request.
+	StorageCommitmentEventTypeSuccess uint16 = 1
+	// StorageCommitmentEventTypeFailures reports that the request completed but
+	// commitment failed for one or more SOP Instances.
+	StorageCommitmentEventTypeFailures uint16 = 2
+	// StorageCommitmentEventTypeID preserves the original success-event name for
+	// source compatibility. New code should select one of the explicit event
+	// type constants above.
+	StorageCommitmentEventTypeID = StorageCommitmentEventTypeSuccess
 )
 
 // NEventReportRequest represents an N-EVENT-REPORT-RQ command.
@@ -29,9 +37,10 @@ const (
 //
 // AffectedSOPClassUID and AffectedSOPInstanceUID must match the Storage
 // Commitment Push Model UIDs.
-// MessageID must be non-zero.
-// EventTypeID must be StorageCommitmentEventTypeID.
-// CommandDataSetType is expected to be DataSetPresent for Storage Commitment.
+// MessageID is any US value not already outstanding on the association.
+// EventTypeID must be StorageCommitmentEventTypeSuccess or
+// StorageCommitmentEventTypeFailures.
+// CommandDataSetType must be any non-null value for Storage Commitment.
 //
 // Status is not included in the request.
 //
@@ -56,14 +65,13 @@ type NEventReportRequest struct {
 }
 
 func (r NEventReportRequest) CommandSet() []core.Element {
-	return []core.Element{
-		newUIElement(AffectedSOPClassUID, r.AffectedSOPClassUID),
-		newUSCommandElement(CommandField, NEventReportRQ),
-		newUSCommandElement(MessageID, r.MessageID),
-		newUIElement(AffectedSOPInstanceUID, r.AffectedSOPInstanceUID),
-		newUSCommandElement(EventTypeID, r.EventTypeID),
-		newUSCommandElement(CommandDataSetType, DataSetPresent),
-	}
+	return (NormalizedEventReportRequest{
+		AffectedSOPClassUID:    r.AffectedSOPClassUID,
+		MessageID:              r.MessageID,
+		CommandDataSetType:     DataSetPresent,
+		AffectedSOPInstanceUID: r.AffectedSOPInstanceUID,
+		EventTypeID:            r.EventTypeID,
+	}).CommandSet()
 }
 
 // NEventReportResponse represents an N-EVENT-REPORT-RSP command.
@@ -81,134 +89,81 @@ type NEventReportResponse struct {
 }
 
 func (r NEventReportResponse) CommandSet() []core.Element {
-	datasetType := NoDataSet
+	var eventTypeID *uint16
 	if r.HasEventReply {
-		datasetType = DataSetPresent
+		value := StorageCommitmentEventTypeID
+		eventTypeID = &value
 	}
-	return []core.Element{
-		newUIElement(AffectedSOPClassUID, r.AffectedSOPClassUID),
-		newUSCommandElement(CommandField, NEventReportRSP),
-		newUSCommandElement(MessageIDBeingRespondedTo, r.MessageIDBeingRespondedTo),
-		newUIElement(AffectedSOPInstanceUID, r.AffectedSOPInstanceUID),
-		newUSCommandElement(CommandDataSetType, datasetType),
-		newUSCommandElement(Status, r.Status),
-	}
+	return (NormalizedEventReportResponse{
+		AffectedSOPClassUID:       r.AffectedSOPClassUID,
+		MessageIDBeingRespondedTo: r.MessageIDBeingRespondedTo,
+		CommandDataSetType:        normalizedDataSetType(r.HasEventReply),
+		Status:                    r.Status,
+		AffectedSOPInstanceUID:    r.AffectedSOPInstanceUID,
+		EventTypeIDOrNil:          eventTypeID,
+	}).CommandSet()
 }
 
 func ParseNEventReportRequest(obj *object.Object) (*NEventReportRequest, error) {
-	field, err := CommandUint16(obj, CommandField)
+	generic, err := ParseNormalizedEventReportRequest(obj)
 	if err != nil {
 		return nil, err
 	}
-	if field != NEventReportRQ {
-		return nil, fmt.Errorf("dicom dimse: command field 0x%04X, want N-EVENT-REPORT-RQ 0x%04X", field, NEventReportRQ)
+	if generic.AffectedSOPClassUID != StorageCommitmentPushModelSOPClassUID {
+		return nil, fmt.Errorf("dicom dimse: N-EVENT-REPORT request AffectedSOPClassUID %q, want %q", generic.AffectedSOPClassUID, StorageCommitmentPushModelSOPClassUID)
 	}
-	sopClassUID, err := commandUID(obj, AffectedSOPClassUID)
-	if err != nil {
-		return nil, err
+	if generic.AffectedSOPInstanceUID != StorageCommitmentPushModelSOPInstanceUID {
+		return nil, fmt.Errorf("dicom dimse: N-EVENT-REPORT request AffectedSOPInstanceUID %q, want %q", generic.AffectedSOPInstanceUID, StorageCommitmentPushModelSOPInstanceUID)
 	}
-	if sopClassUID != StorageCommitmentPushModelSOPClassUID {
-		return nil, fmt.Errorf("dicom dimse: N-EVENT-REPORT request AffectedSOPClassUID %q, want %q", sopClassUID, StorageCommitmentPushModelSOPClassUID)
+	if !validStorageCommitmentEventType(generic.EventTypeID) {
+		return nil, fmt.Errorf("dicom dimse: N-EVENT-REPORT request has unsupported EventTypeID")
 	}
-	msgID, err := CommandUint16(obj, MessageID)
-	if err != nil {
-		return nil, err
-	}
-	sopInstanceUID, err := commandUID(obj, AffectedSOPInstanceUID)
-	if err != nil {
-		return nil, err
-	}
-	if sopInstanceUID != StorageCommitmentPushModelSOPInstanceUID {
-		return nil, fmt.Errorf("dicom dimse: N-EVENT-REPORT request AffectedSOPInstanceUID %q, want %q", sopInstanceUID, StorageCommitmentPushModelSOPInstanceUID)
-	}
-	eventTypeID, err := CommandUint16(obj, EventTypeID)
-	if err != nil {
-		return nil, err
-	}
-	if eventTypeID != StorageCommitmentEventTypeID {
-		return nil, fmt.Errorf("dicom dimse: N-EVENT-REPORT request EventTypeID %d, want StorageCommitmentEventTypeID %d", eventTypeID, StorageCommitmentEventTypeID)
-	}
-	dataSetType, err := CommandUint16(obj, CommandDataSetType)
-	if err != nil {
-		return nil, err
-	}
-	if dataSetType != DataSetPresent {
-		return nil, fmt.Errorf("dicom dimse: N-EVENT-REPORT request dataset type 0x%04X, want dataset present 0x%04X", dataSetType, DataSetPresent)
+	if !normalizedHasDataSet(generic.CommandDataSetType) {
+		return nil, fmt.Errorf("dicom dimse: N-EVENT-REPORT request dataset type 0x%04X, want dataset present", generic.CommandDataSetType)
 	}
 	return &NEventReportRequest{
-		AffectedSOPClassUID:    sopClassUID,
-		AffectedSOPInstanceUID: sopInstanceUID,
-		MessageID:              msgID,
-		EventTypeID:            eventTypeID,
+		AffectedSOPClassUID:    generic.AffectedSOPClassUID,
+		AffectedSOPInstanceUID: generic.AffectedSOPInstanceUID,
+		MessageID:              generic.MessageID,
+		EventTypeID:            generic.EventTypeID,
 	}, nil
 }
 
 func ParseNEventReportResponse(obj *object.Object) (*NEventReportResponse, error) {
-	field, err := CommandUint16(obj, CommandField)
+	generic, err := ParseNormalizedEventReportResponse(obj)
 	if err != nil {
 		return nil, err
 	}
-	if field != NEventReportRSP {
-		return nil, fmt.Errorf("dicom dimse: command field 0x%04X, want N-EVENT-REPORT-RSP 0x%04X", field, NEventReportRSP)
+	if generic.AffectedSOPClassUID != StorageCommitmentPushModelSOPClassUID {
+		return nil, fmt.Errorf("dicom dimse: N-EVENT-REPORT response AffectedSOPClassUID %q, want %q", generic.AffectedSOPClassUID, StorageCommitmentPushModelSOPClassUID)
 	}
-	sopClassUID, err := commandUID(obj, AffectedSOPClassUID)
-	if err != nil {
-		return nil, err
-	}
-	if sopClassUID != StorageCommitmentPushModelSOPClassUID {
-		return nil, fmt.Errorf("dicom dimse: N-EVENT-REPORT response AffectedSOPClassUID %q, want %q", sopClassUID, StorageCommitmentPushModelSOPClassUID)
-	}
-	msgID, err := CommandUint16(obj, MessageIDBeingRespondedTo)
-	if err != nil {
-		return nil, err
-	}
-	sopInstanceUID, err := commandUID(obj, AffectedSOPInstanceUID)
-	if err != nil {
-		return nil, err
-	}
-	if sopInstanceUID != StorageCommitmentPushModelSOPInstanceUID {
-		return nil, fmt.Errorf("dicom dimse: N-EVENT-REPORT response AffectedSOPInstanceUID %q, want %q", sopInstanceUID, StorageCommitmentPushModelSOPInstanceUID)
-	}
-	dataSetType, err := CommandUint16(obj, CommandDataSetType)
-	if err != nil {
-		return nil, err
-	}
-	var hasEventReply bool
-	switch dataSetType {
-	case DataSetPresent:
-		hasEventReply = true
-	case DataSetAbsent:
-		hasEventReply = false
-	default:
-		return nil, fmt.Errorf("dicom dimse: N-EVENT-REPORT response dataset type 0x%04X, want 0x%04X or 0x%04X", dataSetType, DataSetPresent, DataSetAbsent)
-	}
-	status, err := CommandUint16(obj, Status)
-	if err != nil {
-		return nil, err
+	if generic.AffectedSOPInstanceUID != StorageCommitmentPushModelSOPInstanceUID {
+		return nil, fmt.Errorf("dicom dimse: N-EVENT-REPORT response AffectedSOPInstanceUID %q, want %q", generic.AffectedSOPInstanceUID, StorageCommitmentPushModelSOPInstanceUID)
 	}
 	return &NEventReportResponse{
-		AffectedSOPClassUID:       sopClassUID,
-		AffectedSOPInstanceUID:    sopInstanceUID,
-		MessageIDBeingRespondedTo: msgID,
-		Status:                    status,
-		HasEventReply:             hasEventReply,
+		AffectedSOPClassUID:       generic.AffectedSOPClassUID,
+		AffectedSOPInstanceUID:    generic.AffectedSOPInstanceUID,
+		MessageIDBeingRespondedTo: generic.MessageIDBeingRespondedTo,
+		Status:                    generic.Status,
+		HasEventReply:             normalizedHasDataSet(generic.CommandDataSetType),
 	}, nil
 }
 
 func SendNEventReportRequest(assoc *ul.Association, pcID byte, req NEventReportRequest) error {
-	if req.MessageID == 0 {
-		return fmt.Errorf("dicom dimse: N-EVENT-REPORT request MessageID must be non-zero")
-	}
 	if req.AffectedSOPClassUID != StorageCommitmentPushModelSOPClassUID {
 		return fmt.Errorf("dicom dimse: N-EVENT-REPORT request AffectedSOPClassUID %q, want %q", req.AffectedSOPClassUID, StorageCommitmentPushModelSOPClassUID)
 	}
 	if req.AffectedSOPInstanceUID != StorageCommitmentPushModelSOPInstanceUID {
 		return fmt.Errorf("dicom dimse: N-EVENT-REPORT request AffectedSOPInstanceUID %q, want %q", req.AffectedSOPInstanceUID, StorageCommitmentPushModelSOPInstanceUID)
 	}
-	if req.EventTypeID != StorageCommitmentEventTypeID {
-		return fmt.Errorf("dicom dimse: N-EVENT-REPORT request EventTypeID %d, want StorageCommitmentEventTypeID %d", req.EventTypeID, StorageCommitmentEventTypeID)
+	if !validStorageCommitmentEventType(req.EventTypeID) {
+		return fmt.Errorf("dicom dimse: N-EVENT-REPORT request has unsupported EventTypeID")
 	}
 	return SendCommandSet(assoc, pcID, req.CommandSet())
+}
+
+func validStorageCommitmentEventType(eventTypeID uint16) bool {
+	return eventTypeID == StorageCommitmentEventTypeSuccess || eventTypeID == StorageCommitmentEventTypeFailures
 }
 
 func ReceiveNEventReportRequest(assoc *ul.Association, pcID byte) (*NEventReportRequest, error) {
@@ -220,9 +175,6 @@ func ReceiveNEventReportRequest(assoc *ul.Association, pcID byte) (*NEventReport
 }
 
 func SendNEventReportResponse(assoc *ul.Association, pcID byte, rsp NEventReportResponse) error {
-	if rsp.MessageIDBeingRespondedTo == 0 {
-		return fmt.Errorf("dicom dimse: N-EVENT-REPORT response MessageIDBeingRespondedTo must be non-zero")
-	}
 	if rsp.AffectedSOPClassUID != StorageCommitmentPushModelSOPClassUID {
 		return fmt.Errorf("dicom dimse: N-EVENT-REPORT response AffectedSOPClassUID %q, want %q", rsp.AffectedSOPClassUID, StorageCommitmentPushModelSOPClassUID)
 	}

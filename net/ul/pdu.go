@@ -17,6 +17,10 @@ const (
 	PDUAbort       PDUType = 0x07
 )
 
+// MaxPresentationContexts is the number of unique odd presentation context
+// IDs available in one association (1, 3, ..., 255).
+const MaxPresentationContexts = 128
+
 const (
 	PDUHeaderSize  uint32 = 6
 	PDVHeaderSize  uint32 = 6
@@ -49,9 +53,12 @@ const (
 const (
 	SubItemMaxLength                   byte = 0x51
 	SubItemImplementationClassUID      byte = 0x52
+	SubItemAsynchronousOperations      byte = 0x53
+	SubItemRoleSelection               byte = 0x54
 	SubItemImplementationVersionName   byte = 0x55
 	SubItemSopClassExtendedNegotiation byte = 0x56
 	SubItemUserIdentity                byte = 0x58
+	SubItemUserIdentityResponse        byte = 0x59
 )
 
 const (
@@ -202,9 +209,23 @@ type ImplementationVersionNameItem struct {
 	Name string
 }
 
+// AsynchronousOperationsWindow is the PS3.7 User Information sub-item 0x53.
+// The fields are expressed from the association-requestor's perspective while
+// encoded in A-ASSOCIATE-RQ/AC. A zero value means unlimited, not unspecified.
+type AsynchronousOperationsWindow struct {
+	MaximumInvoked   uint16
+	MaximumPerformed uint16
+}
+
 type SopClassExtendedNegotiationItem struct {
 	SopClassUID string
 	Data        []byte
+}
+
+type RoleSelectionItem struct {
+	SopClassUID string
+	SCURole     bool
+	SCPRole     bool
 }
 
 type UserIdentityItem struct {
@@ -212,6 +233,10 @@ type UserIdentityItem struct {
 	PositiveResponseRequested bool
 	PrimaryField              []byte
 	SecondaryField            []byte
+}
+
+type UserIdentityResponseItem struct {
+	ServerResponse []byte
 }
 
 type UnknownUserItem struct {
@@ -230,8 +255,11 @@ func (AbortRQ) pduType() PDUType                          { return PDUAbort }
 func (MaxLengthItem) userVariableItem()                   {}
 func (ImplementationClassUIDItem) userVariableItem()      {}
 func (ImplementationVersionNameItem) userVariableItem()   {}
+func (AsynchronousOperationsWindow) userVariableItem()    {}
 func (SopClassExtendedNegotiationItem) userVariableItem() {}
+func (RoleSelectionItem) userVariableItem()               {}
 func (UserIdentityItem) userVariableItem()                {}
+func (UserIdentityResponseItem) userVariableItem()        {}
 func (UnknownUserItem) userVariableItem()                 {}
 
 func PDUTypeOf(pdu PDU) PDUType {

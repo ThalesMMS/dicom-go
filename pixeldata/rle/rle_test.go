@@ -17,11 +17,26 @@ import (
 	"github.com/ThalesMMS/dicom-go/pixeldata"
 )
 
+func TestDecodeContextHonorsCancellationDuringFrame(t *testing.T) {
+	metadata := encoderMetadata(2, 4, 1, 8, "MONOCHROME2")
+	encoded, err := NewEncoder().EncodeFrame(context.Background(), []byte{1, 2, 3, 4, 5, 6, 7, 8}, metadata)
+	if err != nil {
+		t.Fatal(err)
+	}
+	obj, pixel := rleObjectWithFragment(t, 2, 4, 1, 8, "MONOCHROME2", encoded.Data)
+	ctx := &cancelAfterErrorChecks{Context: context.Background(), cancelAt: 4}
+	_, err = New().DecodeContext(ctx, pixel, obj)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("DecodeContext() error = %v, want context.Canceled", err)
+	}
+}
+
 var (
 	tagRows                      = core.NewTag(0x0028, 0x0010)
 	tagColumns                   = core.NewTag(0x0028, 0x0011)
 	tagSamplesPerPixel           = core.NewTag(0x0028, 0x0002)
 	tagPhotometricInterpretation = core.NewTag(0x0028, 0x0004)
+	tagPlanarConfiguration       = core.NewTag(0x0028, 0x0006)
 	tagNumberOfFrames            = core.NewTag(0x0028, 0x0008)
 	tagBitsAllocated             = core.NewTag(0x0028, 0x0100)
 	tagBitsStored                = core.NewTag(0x0028, 0x0101)
@@ -100,12 +115,43 @@ func TestDecodePackBits(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := decodePackBits(tt.segment)
+			got, err := decodePackBits(tt.segment, len(tt.want))
 			if err != nil {
 				t.Fatal(err)
 			}
 			if !bytes.Equal(got, tt.want) {
 				t.Fatalf("decodePackBits() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestDecodePackBitsToleratesTrailingPadByteAfterExpectedSize(t *testing.T) {
+	got, err := decodePackBits([]byte{0x01, 0x10, 0x20, 0x00}, 2)
+	if err != nil {
+		t.Fatalf("decodePackBits() error = %v, want nil", err)
+	}
+	want := []byte{0x10, 0x20}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("decodePackBits() = %v, want %v", got, want)
+	}
+}
+
+func TestDecodePackBitsRejectsExpectedSizeMismatch(t *testing.T) {
+	tests := []struct {
+		name     string
+		segment  []byte
+		expected int
+	}{
+		{name: "literal crosses bound", segment: []byte{0x02, 0x10, 0x20, 0x30}, expected: 2},
+		{name: "repeat crosses bound", segment: []byte{0xFE, 0xAA}, expected: 2},
+		{name: "underfilled", segment: []byte{0x00, 0xAA}, expected: 2},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := decodePackBits(tt.segment, tt.expected); !errors.Is(err, ErrSegmentDecodeFailed) {
+				t.Fatalf("decodePackBits() error = %v, want ErrSegmentDecodeFailed", err)
 			}
 		})
 	}
@@ -122,7 +168,7 @@ func TestDecodePackBitsMalformedReturnsError(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if _, err := decodePackBits(tt.segment); !errors.Is(err, ErrSegmentDecodeFailed) {
+			if _, err := decodePackBits(tt.segment, 3); !errors.Is(err, ErrSegmentDecodeFailed) {
 				t.Fatalf("decodePackBits() error = %v, want ErrSegmentDecodeFailed", err)
 			}
 		})
@@ -135,6 +181,17 @@ func TestDecodeFragment8BitMonochrome(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := []byte{1, 2, 3, 4, 5, 6}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("decodeFragment() = %v, want %v", got, want)
+	}
+}
+
+func TestDecodeFragmentToleratesOddLengthSegmentPadByte(t *testing.T) {
+	got, err := decodeFragment(rleFragmentEncoded([]byte{0x01, 0x10, 0x20, 0x00}), 1, 2, 1, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []byte{0x10, 0x20}
 	if !bytes.Equal(got, want) {
 		t.Fatalf("decodeFragment() = %v, want %v", got, want)
 	}
@@ -186,6 +243,75 @@ func TestDecodeFramesRLE16BitGrayscale(t *testing.T) {
 	want := [][]byte{wordsLE(0x0102, 0x0304, 0xABCD, 0x1200)}
 	if !equalFrames(frames.Data, want) {
 		t.Fatalf("DecodeFrames() data = %v, want %v", frames.Data, want)
+	}
+}
+
+func TestDecodeFramesRLE16BitSignedMetadata(t *testing.T) {
+	obj := object.FromElements(append(
+		rleMetadataElementsWithOptions(1, 1, 1, 16, "MONOCHROME2", 1, rleMetadataOptions{pixelRepresentation: 1}),
+		dicomtest.NewFragmentSequenceElement(core.TagPixelData, nil, rleFragment([]byte{0xFF}, []byte{0x80})),
+	), nil)
+	pixel, err := pixeldata.Extract(obj)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	frames := decodeWithRegisteredCodec(t, obj, pixel)
+	want := [][]byte{wordsLE(0xFF80)}
+	if !equalFrames(frames.Data, want) {
+		t.Fatalf("DecodeFrames() data = %v, want %v", frames.Data, want)
+	}
+}
+
+func TestDecodeFramesRLEAcceptsTwelveStoredBits(t *testing.T) {
+	obj, pixel := rleObjectWithFragment(t, 1, 1, 1, 16, "MONOCHROME2", rleFragment([]byte{0x07}, []byte{0xFF}))
+	obj.Put(dicomtest.Uint16Element(tagBitsStored, core.VRUS, nil, 12))
+	obj.Put(dicomtest.Uint16Element(tagHighBit, core.VRUS, nil, 11))
+	frames := decodeWithRegisteredCodec(t, obj, pixel)
+	if !equalFrames(frames.Data, [][]byte{wordsLE(0x07FF)}) {
+		t.Fatalf("DecodeFrames() data = %v", frames.Data)
+	}
+}
+
+func TestDecodeFramesRLERejectsStoredBitAndPlanarMetadata(t *testing.T) {
+	tests := []struct {
+		name   string
+		change func(*object.Object)
+		want   error
+	}{
+		{name: "zero BitsStored", change: func(obj *object.Object) { obj.Put(dicomtest.Uint16Element(tagBitsStored, core.VRUS, nil, 0)) }, want: pixeldata.ErrIncompatiblePixelData},
+		{name: "BitsStored exceeds allocated", change: func(obj *object.Object) { obj.Put(dicomtest.Uint16Element(tagBitsStored, core.VRUS, nil, 17)) }, want: pixeldata.ErrIncompatiblePixelData},
+		{name: "HighBit mismatch", change: func(obj *object.Object) { obj.Put(dicomtest.Uint16Element(tagHighBit, core.VRUS, nil, 14)) }, want: pixeldata.ErrIncompatiblePixelData},
+		{name: "monochrome planar nonzero", change: func(obj *object.Object) { obj.Put(dicomtest.Uint16Element(tagPlanarConfiguration, core.VRUS, nil, 1)) }, want: pixeldata.ErrUnsupportedPlanarConfiguration},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			obj, pixel := rleObjectWithFragment(t, 1, 1, 1, 16, "MONOCHROME2", rleFragment([]byte{0}, []byte{0}))
+			test.change(obj)
+			_, err := New().Decode(pixel, obj)
+			if !errors.Is(err, test.want) {
+				t.Fatalf("Decode() error = %v, want %v", err, test.want)
+			}
+		})
+	}
+
+	monoWithPlanarZero, monoPixel := rleObjectWithFragment(t, 1, 1, 1, 16, "MONOCHROME2", rleFragment([]byte{0}, []byte{0}))
+	monoWithPlanarZero.Put(dicomtest.Uint16Element(tagPlanarConfiguration, core.VRUS, nil, 0))
+	if _, err := New().Decode(monoPixel, monoWithPlanarZero); err != nil {
+		t.Fatalf("monochrome PlanarConfiguration=0 error = %v", err)
+	}
+
+	obj := object.FromElements(append(
+		rleMetadataElementsWithOptions(1, 1, 3, 8, "RGB", 1, rleMetadataOptions{}),
+		dicomtest.NewFragmentSequenceElement(core.TagPixelData, nil, rleFragment([]byte{0}, []byte{0}, []byte{0})),
+	), nil)
+	pixel, extractErr := pixeldata.Extract(obj)
+	if extractErr != nil {
+		t.Fatal(extractErr)
+	}
+	_, err := New().Decode(pixel, obj)
+	if !errors.Is(err, pixeldata.ErrUnsupportedPlanarConfiguration) {
+		t.Fatalf("RGB without PlanarConfiguration error = %v", err)
 	}
 }
 
@@ -313,6 +439,89 @@ func TestDecodeFramesUnsupportedBitsAllocated(t *testing.T) {
 	}
 }
 
+func TestDecodeFramesRLERejectsUnsupportedMetadata(t *testing.T) {
+	tests := []struct {
+		name          string
+		samplesPixel  uint16
+		photometric   string
+		opts          rleMetadataOptions
+		fragment      []byte
+		want          error
+		wantSubstring string
+	}{
+		{
+			name:          "samples per pixel",
+			samplesPixel:  4,
+			photometric:   "RGB",
+			fragment:      rleFragment([]byte{0x00}),
+			want:          ErrUnsupportedSamplesPerPixel,
+			wantSubstring: "SamplesPerPixel=4",
+		},
+		{
+			name:          "photometric interpretation",
+			samplesPixel:  1,
+			photometric:   "RGB",
+			fragment:      rleFragment([]byte{0x00}),
+			want:          pixeldata.ErrUnsupportedPhotometricInterpretation,
+			wantSubstring: "PhotometricInterpretation=RGB",
+		},
+		{
+			name:          "pixel representation",
+			samplesPixel:  1,
+			photometric:   "MONOCHROME2",
+			opts:          rleMetadataOptions{pixelRepresentation: 2},
+			fragment:      rleFragment([]byte{0x00}),
+			want:          pixeldata.ErrUnsupportedPixelRepresentation,
+			wantSubstring: "PixelRepresentation=2",
+		},
+		{
+			name:          "signed RGB",
+			samplesPixel:  3,
+			photometric:   "RGB",
+			opts:          rleMetadataOptions{pixelRepresentation: 1, planarConfiguration: uint16Ptr(0)},
+			fragment:      rleFragment([]byte{0x00}, []byte{0x00}, []byte{0x00}),
+			want:          pixeldata.ErrUnsupportedPixelRepresentation,
+			wantSubstring: "PixelRepresentation=1",
+		},
+		{
+			name:         "planar configuration",
+			samplesPixel: 3,
+			photometric:  "RGB",
+			opts: rleMetadataOptions{
+				planarConfiguration: uint16Ptr(1),
+			},
+			fragment:      rleFragment([]byte{0x00}, []byte{0x00}, []byte{0x00}),
+			want:          pixeldata.ErrUnsupportedPlanarConfiguration,
+			wantSubstring: "PlanarConfiguration=1",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			obj := object.FromElements(append(
+				rleMetadataElementsWithOptions(1, 1, tt.samplesPixel, 8, tt.photometric, 1, tt.opts),
+				dicomtest.NewFragmentSequenceElement(core.TagPixelData, nil, tt.fragment),
+			), nil)
+			pixel, err := pixeldata.Extract(obj)
+			if err != nil {
+				t.Fatal(err)
+			}
+			registry := pixeldata.NewMemoryRegistry()
+			if err := Register(registry); err != nil {
+				t.Fatal(err)
+			}
+
+			_, err = registry.DecodeFrames(UID, pixel, obj)
+			if !errors.Is(err, tt.want) {
+				t.Fatalf("DecodeFrames() error = %v, want %v", err, tt.want)
+			}
+			if strings.Contains(err.Error(), tt.wantSubstring) {
+				t.Fatalf("DecodeFrames() error = %q leaked backend detail %q", err, tt.wantSubstring)
+			}
+		})
+	}
+}
+
 func TestDecodeRejectsNativePixelData(t *testing.T) {
 	obj := object.FromElements(rleMetadataElements(1, 1, 1, 8, "MONOCHROME2", 1), nil)
 	_, err := New().Decode(pixeldata.PixelData{Raw: []byte{0x01}}, obj)
@@ -371,8 +580,21 @@ func rleObjectWithFragments(t *testing.T, rows, columns, samplesPerPixel, bitsAl
 	return obj, pixel
 }
 
+type rleMetadataOptions struct {
+	pixelRepresentation uint16
+	planarConfiguration *uint16
+}
+
 func rleMetadataElements(rows, columns, samplesPerPixel, bitsAllocated uint16, photometricInterpretation string, numberOfFrames int) []core.Element {
-	return []core.Element{
+	opts := rleMetadataOptions{}
+	if samplesPerPixel > 1 {
+		opts.planarConfiguration = uint16Ptr(0)
+	}
+	return rleMetadataElementsWithOptions(rows, columns, samplesPerPixel, bitsAllocated, photometricInterpretation, numberOfFrames, opts)
+}
+
+func rleMetadataElementsWithOptions(rows, columns, samplesPerPixel, bitsAllocated uint16, photometricInterpretation string, numberOfFrames int, opts rleMetadataOptions) []core.Element {
+	elements := []core.Element{
 		dicomtest.Uint16Element(tagRows, core.VRUS, nil, rows),
 		dicomtest.Uint16Element(tagColumns, core.VRUS, nil, columns),
 		dicomtest.Uint16Element(tagSamplesPerPixel, core.VRUS, nil, samplesPerPixel),
@@ -381,8 +603,16 @@ func rleMetadataElements(rows, columns, samplesPerPixel, bitsAllocated uint16, p
 		dicomtest.Uint16Element(tagBitsAllocated, core.VRUS, nil, bitsAllocated),
 		dicomtest.Uint16Element(tagBitsStored, core.VRUS, nil, bitsAllocated),
 		dicomtest.Uint16Element(tagHighBit, core.VRUS, nil, bitsAllocated-1),
-		dicomtest.Uint16Element(tagPixelRepresentation, core.VRUS, nil, 0),
+		dicomtest.Uint16Element(tagPixelRepresentation, core.VRUS, nil, opts.pixelRepresentation),
 	}
+	if opts.planarConfiguration != nil {
+		elements = append(elements, dicomtest.Uint16Element(tagPlanarConfiguration, core.VRUS, nil, *opts.planarConfiguration))
+	}
+	return elements
+}
+
+func uint16Ptr(value uint16) *uint16 {
+	return &value
 }
 
 func rleFragment(segments ...[]byte) []byte {

@@ -14,12 +14,13 @@ import (
 )
 
 type parsedEntry struct {
-	Tag     core.Tag
-	VRExpr  string
-	Keyword string
-	Name    string
-	VM      string
-	Retired bool
+	Tag              core.Tag
+	VRExpr           string
+	ContextualVRExpr string
+	Keyword          string
+	Name             string
+	VM               string
+	Retired          bool
 }
 
 type parsedEntryCandidate struct {
@@ -149,17 +150,35 @@ func parseLine(line string) ([]parsedEntryCandidate, error) {
 	for _, tag := range tags {
 		entries = append(entries, parsedEntryCandidate{
 			entry: parsedEntry{
-				Tag:     tag,
-				VRExpr:  vrExpr,
-				Keyword: keyword,
-				Name:    keywordToName(keyword),
-				VM:      vmField,
-				Retired: retired,
+				Tag:              tag,
+				VRExpr:           vrExpr,
+				ContextualVRExpr: contextualVRExpression(vrField),
+				Keyword:          keyword,
+				Name:             keywordToName(keyword),
+				VM:               vmField,
+				Retired:          retired,
 			},
 			specificity: specificity,
 		})
 	}
 	return entries, nil
+}
+
+func contextualVRExpression(vr string) string {
+	switch vr {
+	case "xs":
+		return "dictionary.ContextualVRXS"
+	case "ox":
+		return "dictionary.ContextualVROX"
+	case "px":
+		return "dictionary.ContextualVRPX"
+	case "lt":
+		return "dictionary.ContextualVRLT"
+	case "up":
+		return "dictionary.ContextualVRUP"
+	default:
+		return ""
+	}
 }
 
 func vrExpression(vr string) (string, error) {

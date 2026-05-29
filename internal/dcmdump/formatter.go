@@ -2,6 +2,7 @@ package dcmdump
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -13,6 +14,7 @@ import (
 	"github.com/ThalesMMS/dicom-go/dictionary/std"
 	uiddict "github.com/ThalesMMS/dicom-go/dictionary/uid"
 	"github.com/ThalesMMS/dicom-go/object"
+	"github.com/ThalesMMS/dicom-go/parser"
 	"github.com/ThalesMMS/dicom-go/transfer"
 )
 
@@ -21,15 +23,25 @@ const sectionSeparator = "------------------------------------------------------
 type Formatter struct {
 	maxValueLen int
 	output      io.Writer
+	showOffsets bool
+}
+
+type FormatterOptions struct {
+	ShowOffsets bool
 }
 
 func NewFormatter(output io.Writer, maxValueLen int) *Formatter {
+	return NewFormatterWithOptions(output, maxValueLen, FormatterOptions{})
+}
+
+func NewFormatterWithOptions(output io.Writer, maxValueLen int, opts FormatterOptions) *Formatter {
 	if maxValueLen <= 0 {
 		maxValueLen = defaultMaxValueLen
 	}
 	return &Formatter{
 		maxValueLen: maxValueLen,
 		output:      output,
+		showOffsets: opts.ShowOffsets,
 	}
 }
 
@@ -38,7 +50,16 @@ func (f *Formatter) DumpFile(file *object.File) error {
 		return fmt.Errorf("dicom: nil file")
 	}
 
-	if _, err := fmt.Fprintf(f.output, "Transfer Syntax: %s (%s)\n\n# File Meta\n", file.TransferSyntax.Name, file.TransferSyntax.UID); err != nil {
+	resolution, recovered := file.TransferSyntaxResolution()
+	if _, err := fmt.Fprintf(f.output, "Transfer Syntax: %s (%s)", file.TransferSyntax.Name, file.TransferSyntax.UID); err != nil {
+		return err
+	}
+	if recovered && resolution.Inferred() {
+		if _, err := fmt.Fprintf(f.output, " [inferred; confidence=%.3f; source=%s]", resolution.Confidence, resolution.Source); err != nil {
+			return err
+		}
+	}
+	if _, err := fmt.Fprint(f.output, "\n\n# File Meta\n"); err != nil {
 		return err
 	}
 	if err := f.dump(file.Meta, transfer.ExplicitVRLittleEndian, 0); err != nil {
@@ -58,6 +79,50 @@ func (f *Formatter) DumpObject(obj *object.Object, syntax transfer.Syntax) error
 	return f.dump(obj, syntax, 0)
 }
 
+func (f *Formatter) DumpTokenStream(reader *parser.Reader, syntax transfer.Syntax, depth int) error {
+	if reader == nil {
+		return nil
+	}
+	for {
+		offset := reader.Position()
+		tok, err := reader.Next()
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+
+		switch tok.Kind {
+		case parser.TokenElement:
+			if err := f.dumpElementWithOffset(tok.Element, depth, syntax, offset); err != nil {
+				return err
+			}
+		case parser.TokenStartSequence, parser.TokenStartPixelSequence:
+			if err := f.dumpHeaderWithOffset(tok.Header, depth, offset, ""); err != nil {
+				return err
+			}
+			depth++
+		case parser.TokenStartItem:
+			if err := f.dumpHeaderWithOffset(tok.Header, depth, offset, "Item"); err != nil {
+				return err
+			}
+			depth++
+		case parser.TokenEndItem:
+			if depth > 0 {
+				depth--
+			}
+			if err := f.dumpHeaderWithOffset(tok.Header, depth, offset, "ItemDelimitationItem"); err != nil {
+				return err
+			}
+		case parser.TokenEndSequence:
+			if depth > 0 {
+				depth--
+			}
+		}
+	}
+}
+
 func (f *Formatter) dump(obj *object.Object, syntax transfer.Syntax, depth int) error {
 	if obj == nil {
 		return nil
@@ -71,7 +136,11 @@ func (f *Formatter) dump(obj *object.Object, syntax transfer.Syntax, depth int) 
 }
 
 func (f *Formatter) dumpElement(elem core.Element, depth int, syntax transfer.Syntax) error {
-	if _, err := fmt.Fprintln(f.output, f.formatLine(elem.Tag(), elem.VR().String(), elem.Length().String(), keywordForTag(elem.Tag()), f.formatValue(elem, syntax), depth)); err != nil {
+	return f.dumpElementWithOffset(elem, depth, syntax, -1)
+}
+
+func (f *Formatter) dumpElementWithOffset(elem core.Element, depth int, syntax transfer.Syntax, offset int64) error {
+	if _, err := fmt.Fprintln(f.output, f.formatLineWithOffset(elem.Tag(), elem.VR().String(), elem.Length().String(), keywordForTag(elem.Tag()), f.formatValue(elem, syntax), depth, offset)); err != nil {
 		return err
 	}
 
@@ -81,20 +150,32 @@ func (f *Formatter) dumpElement(elem core.Element, depth int, syntax transfer.Sy
 	}
 
 	for _, item := range seq.Items {
-		if _, err := fmt.Fprintln(f.output, f.formatLine(core.TagItem, "", core.UndefinedLength.String(), "Item", "", depth+1)); err != nil {
+		if _, err := fmt.Fprintln(f.output, f.formatLineWithOffset(core.TagItem, "", core.UndefinedLength.String(), "Item", "", depth+1, -1)); err != nil {
 			return err
 		}
 		if err := f.dump(object.FromDataSet(item, std.Dictionary), syntax, depth+2); err != nil {
 			return err
 		}
-		if _, err := fmt.Fprintln(f.output, f.formatLine(core.TagItemDelimitationItem, "", "0", "ItemDelimitationItem", "", depth+1)); err != nil {
+		if _, err := fmt.Fprintln(f.output, f.formatLineWithOffset(core.TagItemDelimitationItem, "", "0", "ItemDelimitationItem", "", depth+1, -1)); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
+func (f *Formatter) dumpHeaderWithOffset(header core.ElementHeader, depth int, offset int64, keyword string) error {
+	if keyword == "" {
+		keyword = keywordForTag(header.Tag)
+	}
+	_, err := fmt.Fprintln(f.output, f.formatLineWithOffset(header.Tag, header.VR.String(), header.Length.String(), keyword, "", depth, offset))
+	return err
+}
+
 func (f *Formatter) formatLine(tag core.Tag, vr, length, keyword, value string, depth int) string {
+	return f.formatLineWithOffset(tag, vr, length, keyword, value, depth, -1)
+}
+
+func (f *Formatter) formatLineWithOffset(tag core.Tag, vr, length, keyword, value string, depth int, offset int64) string {
 	indent := strings.Repeat("  ", depth)
 	if vr == "" {
 		vr = "--"
@@ -103,7 +184,11 @@ func (f *Formatter) formatLine(tag core.Tag, vr, length, keyword, value string, 
 	if value != "" {
 		line += " " + value
 	}
-	return strings.TrimRight(line, " ")
+	line = strings.TrimRight(line, " ")
+	if f.showOffsets && offset >= 0 {
+		line = fmt.Sprintf("%08X  %s", offset, line)
+	}
+	return line
 }
 
 func (f *Formatter) formatValue(elem core.Element, syntax transfer.Syntax) string {

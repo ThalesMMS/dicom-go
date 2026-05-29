@@ -7,6 +7,7 @@ import (
 	"github.com/ThalesMMS/dicom-go/dictionary/std"
 	"github.com/ThalesMMS/dicom-go/internal/dicomtest"
 	"github.com/ThalesMMS/dicom-go/transfer"
+	"strings"
 	"testing"
 )
 
@@ -43,6 +44,48 @@ func TestWriterSequenceUndefinedLengthEncodingByteForByte(t *testing.T) {
 
 	if !bytes.Equal(got, want) {
 		t.Fatalf("encoded bytes = % X, want % X", got, want)
+	}
+}
+
+func TestWriterPrivateUNSequenceByTransferSyntax(t *testing.T) {
+	privateTag := core.NewTag(0x0011, 0x1001)
+	dataset := core.DataSet{Elements: []core.Element{{
+		Header: core.ElementHeader{Tag: privateTag, VR: core.VRUN},
+		Value: core.SequenceValue{Items: []core.DataSet{{Elements: []core.Element{
+			dicomtest.NewPNElement(core.NewTag(0x0010, 0x0010), "PRIVATE^ITEM"),
+		}}}},
+	}}}
+	tests := []struct {
+		name      string
+		syntax    transfer.Syntax
+		roundTrip bool
+		errorText string
+	}{
+		{name: "implicit VR round trip", syntax: transfer.ImplicitVRLittleEndian, roundTrip: true},
+		{name: "explicit VR rejection", syntax: transfer.ExplicitVRLittleEndian, errorText: "UN in Implicit VR"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.roundTrip {
+				got := roundTripDataSet(t, tt.syntax, dataset, defaultWriterOptions(), std.Dictionary)
+				outer := onlyElement(t, got)
+				if outer.Tag() != privateTag || outer.VR() != core.VRUN {
+					t.Fatalf("round-trip private sequence = %s %s, want %s UN", outer.Tag(), outer.VR(), privateTag)
+				}
+				sequence, ok := outer.Value.(core.SequenceValue)
+				if !ok || len(sequence.Items) != 1 || len(sequence.Items[0].Elements) != 1 {
+					t.Fatalf("round-trip private sequence value = %#v", outer.Value)
+				}
+				if got := sequence.Items[0].Elements[0].StringValue(); got != "PRIVATE^ITEM" {
+					t.Fatalf("round-trip nested value = %q, want PRIVATE^ITEM", got)
+				}
+				return
+			}
+			err := NewWriter(&bytes.Buffer{}, tt.syntax).WriteElement(dataset.Elements[0])
+			if err == nil || !strings.Contains(err.Error(), tt.errorText) {
+				t.Fatalf("WriteElement() error = %v, want %q", err, tt.errorText)
+			}
+		})
 	}
 }
 func TestWriterEmptySequenceStillWritesSequenceDelimiter(t *testing.T) {

@@ -10,6 +10,8 @@ import (
 	dicomenc "github.com/ThalesMMS/dicom-go/encoding"
 )
 
+const maxAssociationPDU = 16 << 20
+
 func ReadPDU(r io.Reader, maxPDULength uint32) (PDU, error) {
 	if maxPDULength < MinimumPDUSize {
 		return nil, fmt.Errorf("%w: max PDU length %d is smaller than %d", ErrInvalidPDUSize, maxPDULength, MinimumPDUSize)
@@ -25,8 +27,8 @@ func ReadPDU(r io.Reader, maxPDULength uint32) (PDU, error) {
 	if err != nil {
 		return nil, fmt.Errorf("dicom ul: read PDU length: %w", err)
 	}
-	if pduLength > maxPDULength {
-		return nil, fmt.Errorf("%w: length %d exceeds max %d", ErrPDUTooLarge, pduLength, maxPDULength)
+	if err := validateReadPDULength(pduType, pduLength, maxPDULength); err != nil {
+		return nil, err
 	}
 
 	data := make([]byte, pduLength)
@@ -52,6 +54,17 @@ func ReadPDU(r io.Reader, maxPDULength uint32) (PDU, error) {
 	default:
 		return &UnknownPDU{Type: pduType, Data: append([]byte(nil), data...)}, nil
 	}
+}
+
+func validateReadPDULength(pduType PDUType, pduLength, maxPDULength uint32) error {
+	limit := maxPDULength
+	if pduType == PDUAssociateRQ || pduType == PDUAssociateAC {
+		limit = maxAssociationPDU
+	}
+	if pduLength > limit {
+		return fmt.Errorf("%w: length %d exceeds max %d", ErrPDUTooLarge, pduLength, limit)
+	}
+	return nil
 }
 
 func readAssociationRQ(data []byte) (*AssociationRQ, error) {
@@ -197,7 +210,13 @@ func readVariableItems(data []byte, forAC bool) (appContext string, presContexts
 		return "", nil, nil, fmt.Errorf("%w: application context name", ErrMissingPDUField)
 	}
 	if forAC {
+		if err := validatePresentationContextIDsResult(results); err != nil {
+			return "", nil, nil, err
+		}
 		return appContext, results, userVars, nil
+	}
+	if err := validatePresentationContextIDsProposed(proposed); err != nil {
+		return "", nil, nil, err
 	}
 	return appContext, proposed, userVars, nil
 }
@@ -278,6 +297,7 @@ func readUserInformation(data []byte) ([]UserVariableItem, error) {
 	r := bytes.NewReader(data)
 	dec := dicomenc.NewBasicDecoder(binary.BigEndian)
 	var items []UserVariableItem
+	asyncSeen := false
 	for r.Len() > 0 {
 		itemType, item, err := readItem(r)
 		if err != nil {
@@ -297,6 +317,23 @@ func readUserInformation(data []byte) ([]UserVariableItem, error) {
 			items = append(items, ImplementationClassUIDItem{UID: strings.TrimSpace(string(item))})
 		case SubItemImplementationVersionName:
 			items = append(items, ImplementationVersionNameItem{Name: strings.TrimSpace(string(item))})
+		case SubItemAsynchronousOperations:
+			if asyncSeen {
+				return nil, fmt.Errorf("%w: duplicate asynchronous operations window", ErrInvalidUserItem)
+			}
+			asyncSeen = true
+			if len(item) != 4 {
+				return nil, fmt.Errorf("%w: asynchronous operations window item length %d", ErrInvalidUserItem, len(item))
+			}
+			invoked, err := dec.ReadU16(bytes.NewReader(item[:2]))
+			if err != nil {
+				return nil, err
+			}
+			performed, err := dec.ReadU16(bytes.NewReader(item[2:]))
+			if err != nil {
+				return nil, err
+			}
+			items = append(items, AsynchronousOperationsWindow{MaximumInvoked: invoked, MaximumPerformed: performed})
 		case SubItemSopClassExtendedNegotiation:
 			if len(item) < 2 {
 				return nil, fmt.Errorf("%w: SOP class extended negotiation length %d", ErrInvalidUserItem, len(item))
@@ -312,17 +349,56 @@ func readUserInformation(data []byte) ([]UserVariableItem, error) {
 				SopClassUID: strings.TrimSpace(string(item[2 : 2+int(sopLen)])),
 				Data:        append([]byte(nil), item[2+int(sopLen):]...),
 			})
+		case SubItemRoleSelection:
+			role, err := readRoleSelection(item)
+			if err != nil {
+				return nil, err
+			}
+			items = append(items, role)
 		case SubItemUserIdentity:
 			userIdentity, err := readUserIdentity(item)
 			if err != nil {
 				return nil, err
 			}
 			items = append(items, userIdentity)
+		case SubItemUserIdentityResponse:
+			userIdentityResponse, err := readUserIdentityResponse(item)
+			if err != nil {
+				return nil, err
+			}
+			items = append(items, userIdentityResponse)
 		default:
 			items = append(items, UnknownUserItem{Type: itemType, Data: append([]byte(nil), item...)})
 		}
 	}
 	return items, nil
+}
+
+func readRoleSelection(data []byte) (RoleSelectionItem, error) {
+	if len(data) < 4 {
+		return RoleSelectionItem{}, fmt.Errorf("%w: role selection item length %d", ErrInvalidUserItem, len(data))
+	}
+	dec := dicomenc.NewBasicDecoder(binary.BigEndian)
+	sopLen, err := dec.ReadU16(bytes.NewReader(data[:2]))
+	if err != nil {
+		return RoleSelectionItem{}, err
+	}
+	if int(sopLen) > len(data)-4 {
+		return RoleSelectionItem{}, fmt.Errorf("%w: role selection SOP class UID length %d exceeds item length %d", ErrInvalidUserItem, sopLen, len(data))
+	}
+	if len(data) != 2+int(sopLen)+2 {
+		return RoleSelectionItem{}, fmt.Errorf("%w: role selection item length %d does not match SOP class UID length %d", ErrInvalidUserItem, len(data), sopLen)
+	}
+	scuRole := data[2+int(sopLen)]
+	scpRole := data[2+int(sopLen)+1]
+	if scuRole > 1 || scpRole > 1 {
+		return RoleSelectionItem{}, fmt.Errorf("%w: role selection role values %d/%d", ErrInvalidUserItem, scuRole, scpRole)
+	}
+	return RoleSelectionItem{
+		SopClassUID: strings.TrimSpace(string(data[2 : 2+int(sopLen)])),
+		SCURole:     scuRole == 1,
+		SCPRole:     scpRole == 1,
+	}, nil
 }
 
 func readUserIdentity(data []byte) (UserIdentityItem, error) {
@@ -354,6 +430,20 @@ func readUserIdentity(data []byte) (UserIdentityItem, error) {
 		PrimaryField:              primary,
 		SecondaryField:            append([]byte(nil), data[pos:]...),
 	}, nil
+}
+
+func readUserIdentityResponse(data []byte) (UserIdentityResponseItem, error) {
+	if len(data) < 2 {
+		return UserIdentityResponseItem{}, fmt.Errorf("%w: user identity response item length %d", ErrInvalidUserItem, len(data))
+	}
+	responseLen, err := dicomenc.NewBasicDecoder(binary.BigEndian).ReadU16(bytes.NewReader(data[:2]))
+	if err != nil {
+		return UserIdentityResponseItem{}, err
+	}
+	if int(responseLen) != len(data)-2 {
+		return UserIdentityResponseItem{}, fmt.Errorf("%w: server response length %d does not match remaining %d", ErrInvalidUserItem, responseLen, len(data)-2)
+	}
+	return UserIdentityResponseItem{ServerResponse: append([]byte(nil), data[2:]...)}, nil
 }
 
 func readPDataTF(data []byte) (*PDataTF, error) {

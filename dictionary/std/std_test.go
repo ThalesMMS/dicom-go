@@ -67,6 +67,35 @@ func TestDictionaryByKeywordUsesCanonicalEntry(t *testing.T) {
 	}
 }
 
+func TestDictionaryPreservesContextualVRAlternatives(t *testing.T) {
+	tests := []struct {
+		tag     core.Tag
+		context dictionary.ContextualVR
+		allowed []core.VR
+	}{
+		{core.NewTag(0x0004, 0x1200), dictionary.ContextualVRUP, []core.VR{core.VRUL}},
+		{core.NewTag(0x0014, 0x3050), dictionary.ContextualVROX, []core.VR{core.VROB, core.VROW}},
+		{core.NewTag(0x0028, 0x0106), dictionary.ContextualVRXS, []core.VR{core.VRUS, core.VRSS}},
+		{core.NewTag(0x0028, 0x3006), dictionary.ContextualVRLT, []core.VR{core.VRUS, core.VRSS, core.VROW}},
+		{core.NewTag(0x7FE0, 0x0010), dictionary.ContextualVRPX, []core.VR{core.VROB, core.VROW}},
+	}
+
+	for _, tt := range tests {
+		spec, ok := dictionary.LookupVRSpec(std.Dictionary, tt.tag)
+		if !ok {
+			t.Fatalf("LookupVRSpec(%v) did not find entry", tt.tag)
+		}
+		if spec.Context() != tt.context {
+			t.Fatalf("LookupVRSpec(%v) context = %q, want %q", tt.tag, spec.Context(), tt.context)
+		}
+		for _, vr := range tt.allowed {
+			if !spec.Contains(vr) {
+				t.Errorf("LookupVRSpec(%v) does not allow %s; got %v", tt.tag, vr, spec.Values())
+			}
+		}
+	}
+}
+
 func TestDictionaryRetiredEntryFlag(t *testing.T) {
 	want := dictionary.Entry{
 		Tag:     core.NewTag(0x0004, 0x1504),

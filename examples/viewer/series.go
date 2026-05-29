@@ -16,6 +16,7 @@ import (
 	"github.com/ThalesMMS/dicom-go/core"
 	"github.com/ThalesMMS/dicom-go/object"
 	"github.com/ThalesMMS/dicom-go/pixeldata"
+	jpegcodec "github.com/ThalesMMS/dicom-go/pixeldata/jpeg"
 	"github.com/ThalesMMS/dicom-go/pixeldata/rle"
 	"github.com/ThalesMMS/dicom-go/transfer"
 )
@@ -76,6 +77,9 @@ type sortKey struct {
 func loadSeries(input string) (*Series, error) {
 	if strings.TrimSpace(input) == "" {
 		return nil, errors.New("viewer: missing DICOM input")
+	}
+	if err := jpegcodec.RegisterDefault(); err != nil {
+		return nil, fmt.Errorf("register JPEG Baseline codec: %w", err)
 	}
 	if err := rle.RegisterDefault(); err != nil {
 		return nil, fmt.Errorf("register RLE codec: %w", err)

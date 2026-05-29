@@ -120,6 +120,61 @@ func TestReadDataSetBuildsFragmentSequenceWithMultipleFragments(t *testing.T) {
 		t.Fatalf("third fragment length = %d, want even padded length", len(seq.Fragments[2]))
 	}
 }
+
+func TestInlineThresholdDoesNotSkipEncapsulatedPixelFragments(t *testing.T) {
+	fragment := bytes.Repeat([]byte{0xAB}, 16)
+
+	tests := []struct {
+		name string
+		read func(*Reader) ([]core.Element, error)
+	}{
+		{
+			name: "ReadDataSet",
+			read: func(reader *Reader) ([]core.Element, error) {
+				dataset, err := reader.ReadDataSet()
+				return dataset.Elements, err
+			},
+		},
+		{
+			name: "ReadAll",
+			read: func(reader *Reader) ([]core.Element, error) {
+				return reader.ReadAll()
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			reader := NewReader(
+				bytes.NewReader(encapsulatedPixelDataBytes(nil, fragment)),
+				transfer.JPEGBaseline,
+				ReaderOptions{
+					Dictionary:                std.Dictionary,
+					InlineValueBytesThreshold: 4,
+				},
+			)
+
+			elements, err := tc.read(reader)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(elements) != 1 {
+				t.Fatalf("element count = %d, want 1", len(elements))
+			}
+			seq, ok := elements[0].Value.(core.FragmentSequence)
+			if !ok {
+				t.Fatalf("pixel value type = %T, want core.FragmentSequence", elements[0].Value)
+			}
+			if len(seq.Fragments) != 1 {
+				t.Fatalf("fragment count = %d, want 1", len(seq.Fragments))
+			}
+			if !bytes.Equal(seq.Fragments[0], fragment) {
+				t.Fatalf("fragment = % X, want % X", seq.Fragments[0], fragment)
+			}
+		})
+	}
+}
+
 func TestReadDataSetRejectsMaxFragments(t *testing.T) {
 	reader := NewReader(
 		bytes.NewReader(encapsulatedPixelDataBytes(nil, []byte{0x01, 0x02}, []byte{0x03, 0x04})),

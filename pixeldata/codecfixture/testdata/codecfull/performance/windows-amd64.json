@@ -1,0 +1,80 @@
+{
+  "schemaVersion": 1,
+  "profile": "codecfull",
+  "recordedAt": "2026-07-28T11:14:52Z",
+  "environment": {
+    "goos": "windows",
+    "goarch": "amd64",
+    "goVersion": "go1.26.4",
+    "logicalCPU": 28
+  },
+  "dependencies": {
+    "CharLS": "2.4.2",
+    "OpenJPEG": "2.5.4",
+    "OpenJPH": "0.31.0",
+    "libjxl": "0.11.2"
+  },
+  "memoryMeasurement": {
+    "metric": "peak-process-tree-working-set-bytes",
+    "scope": "measurement-process-and-descendants",
+    "samplingIntervalMicroseconds": 1000
+  },
+  "studies": [
+    {
+      "id": "jpeg2000-mr-10-frame",
+      "fixture": "pydicom/emri_small_jpeg_2k_lossless.dcm",
+      "sha256": "b2b4063359a08ed3b0afa9f4e4f72f84af79e5116515b446d9a30da9dc7f1888",
+      "frames": 10,
+      "iterations": 25,
+      "decodesPerIteration": 1,
+      "p50Microseconds": 156655,
+      "p95Microseconds": 175112.9,
+      "p99Microseconds": 234073,
+      "peakMemoryBytes": 66195456,
+      "peakHeapBytes": 2277376,
+      "peakTotalAllocBytes": 2460536
+    },
+    {
+      "id": "jpegls-mr-10-frame",
+      "fixture": "pydicom/emri_small_jpeg_ls_lossless.dcm",
+      "sha256": "24de03c9c0f8b5aa75d7fbcc894f94e612b66702175b4936589a0849ec9f87b4",
+      "frames": 10,
+      "iterations": 25,
+      "decodesPerIteration": 10,
+      "p50Microseconds": 905.16,
+      "p95Microseconds": 1340.41,
+      "p99Microseconds": 1512.23,
+      "peakMemoryBytes": 61530112,
+      "peakHeapBytes": 573440,
+      "peakTotalAllocBytes": 700984
+    },
+    {
+      "id": "rle-mr-10-frame",
+      "fixture": "pydicom/emri_small_RLE.dcm",
+      "sha256": "93c19bca3fb6b7202dcd067de8d16cb6b3f7c6e9a0632e474aab81175ee45266",
+      "frames": 10,
+      "iterations": 25,
+      "decodesPerIteration": 100,
+      "p50Microseconds": 100.181,
+      "p95Microseconds": 120.303,
+      "p99Microseconds": 123.689,
+      "peakMemoryBytes": 63401984,
+      "peakHeapBytes": 212992,
+      "peakTotalAllocBytes": 288144
+    },
+    {
+      "id": "htj2k-rgb-ultrasound",
+      "fixture": "pydicom/HTJ2KLossless_08_RGB.dcm",
+      "sha256": "38f8e8adf46b928a12f1905df1405bc8a32c10286733c47562c75be84ceae00e",
+      "frames": 1,
+      "iterations": 25,
+      "decodesPerIteration": 1,
+      "p50Microseconds": 25757.3,
+      "p95Microseconds": 31812.2,
+      "p99Microseconds": 33071.4,
+      "peakMemoryBytes": 70111232,
+      "peakHeapBytes": 2842624,
+      "peakTotalAllocBytes": 2886104
+    }
+  ]
+}

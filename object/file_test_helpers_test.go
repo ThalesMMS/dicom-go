@@ -2,11 +2,13 @@ package object
 
 import (
 	"bytes"
+	"compress/flate"
 	"encoding/binary"
 	"errors"
 	"github.com/ThalesMMS/dicom-go/core"
 	"github.com/ThalesMMS/dicom-go/internal/dicomtest"
 	"github.com/ThalesMMS/dicom-go/transfer"
+	"io"
 	"testing"
 )
 
@@ -18,6 +20,48 @@ func buildPart10FileWithTransferSyntaxUID(uid string) []byte {
 	buf.Write(dicomtest.EncodeElements(transfer.ExplicitVRLittleEndian, dicomtest.MinimalDataset()...))
 	return buf.Bytes()
 }
+func buildDeflatedPart10File(t *testing.T, dataset ...core.Element) []byte {
+	t.Helper()
+
+	return buildDeflatedPart10FileWithTransferSyntax(t, transfer.DeflatedExplicitVRLittleEndian, dataset...)
+}
+func buildDeflatedPart10FileWithTransferSyntax(t *testing.T, syntax transfer.Syntax, dataset ...core.Element) []byte {
+	t.Helper()
+
+	var buf bytes.Buffer
+	buf.Write(make([]byte, 128))
+	buf.WriteString("DICM")
+	buf.Write(dicomtest.NewFileMetaBuilder().WithTransferSyntax(syntax.UID).Encode())
+	buf.Write(deflateBytes(t, dicomtest.EncodeElements(transfer.ExplicitVRLittleEndian, dataset...)))
+	return buf.Bytes()
+}
+func deflateBytes(t *testing.T, data []byte) []byte {
+	t.Helper()
+
+	var buf bytes.Buffer
+	w, err := flate.NewWriter(&buf, flate.DefaultCompression)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write(data); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+func inflateBytes(t *testing.T, data []byte) []byte {
+	t.Helper()
+
+	r := flate.NewReader(bytes.NewReader(data))
+	defer func() { _ = r.Close() }()
+	got, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return got
+}
 func buildMalformedPart10File(meta, dataset []byte) []byte {
 	var buf bytes.Buffer
 	buf.Write(make([]byte, 128))
@@ -25,6 +69,49 @@ func buildMalformedPart10File(meta, dataset []byte) []byte {
 	buf.Write(meta)
 	buf.Write(dataset)
 	return buf.Bytes()
+}
+func videoMediaDataset(fragments ...[]byte) []core.Element {
+	elements := append([]core.Element(nil), dicomtest.MinimalDataset()...)
+	out := elements[:0]
+	for _, elem := range elements {
+		switch elem.Tag() {
+		case core.TagPixelData,
+			core.NewTag(0x0028, 0x0002), // SamplesPerPixel
+			core.NewTag(0x0028, 0x0004): // PhotometricInterpretation
+			continue
+		default:
+			out = append(out, elem)
+		}
+	}
+	out = append(out,
+		dicomtest.NewUShortElement(core.NewTag(0x0028, 0x0002), 3),
+		dicomtest.NewStringElement(core.NewTag(0x0028, 0x0004), core.VRCS, "YBR_PARTIAL_420"),
+		dicomtest.NewStringElement(core.NewTag(0x0028, 0x0008), core.VRIS, "1"),
+		dicomtest.NewFragmentSequenceElement(core.TagPixelData, nil, fragments...),
+	)
+	return out
+}
+func jpegXLDataset(fragments ...[]byte) []core.Element {
+	elements := append([]core.Element(nil), dicomtest.MinimalDataset()...)
+	out := elements[:0]
+	for _, elem := range elements {
+		if elem.Tag() == core.TagPixelData {
+			continue
+		}
+		out = append(out, elem)
+	}
+	return append(out, dicomtest.NewFragmentSequenceElement(core.TagPixelData, nil, fragments...))
+}
+func encapsulatedStillImageDataset(fragments ...[]byte) []core.Element {
+	elements := append([]core.Element(nil), dicomtest.MinimalDataset()...)
+	out := elements[:0]
+	for _, elem := range elements {
+		if elem.Tag() == core.TagPixelData {
+			continue
+		}
+		out = append(out, elem)
+	}
+	return append(out, dicomtest.NewFragmentSequenceElement(core.TagPixelData, nil, fragments...))
 }
 func requireMinimalFile(t *testing.T, file *File) {
 	t.Helper()

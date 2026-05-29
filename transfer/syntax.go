@@ -3,13 +3,17 @@ package transfer
 import "encoding/binary"
 
 type Syntax struct {
-	UID            string
-	Name           string
-	ExplicitVR     bool
-	ByteOrder      binary.ByteOrder
-	Supported      bool
-	Encapsulated   bool
-	Deflated       bool
+	UID          string
+	Name         string
+	ExplicitVR   bool
+	ByteOrder    binary.ByteOrder
+	Supported    bool
+	Encapsulated bool
+	Deflated     bool
+	MediaPayload bool
+	// CodecRequired marks metadata/payload-readable still-image syntaxes that
+	// still require an optional pixel codec adapter for frame decoding.
+	CodecRequired  bool
 	CodecAvailable bool
 }
 
@@ -18,7 +22,10 @@ func (s Syntax) IsLittleEndian() bool {
 }
 
 func (s Syntax) RequiresCodec() bool {
-	return s.Deflated || (s.Encapsulated && !s.Supported)
+	if s.MediaPayload {
+		return false
+	}
+	return s.Deflated || s.CodecRequired || (s.Encapsulated && (!s.Supported || s.CodecAvailable))
 }
 
 func (s Syntax) HasCodec() bool {
@@ -47,9 +54,9 @@ var (
 		Name:           "Deflated Explicit VR Little Endian",
 		ExplicitVR:     true,
 		ByteOrder:      binary.LittleEndian,
-		Supported:      false,
+		Supported:      true,
 		Deflated:       true,
-		CodecAvailable: false,
+		CodecAvailable: true,
 	}
 	ExplicitVRBigEndian = Syntax{
 		UID:            "1.2.840.10008.1.2.2",
@@ -63,152 +70,157 @@ var (
 		"1.2.840.10008.1.2.1.98",
 		"Encapsulated Uncompressed Explicit VR Little Endian",
 	)
-	JPEGBaseline = newEncapsulatedSyntax(
+	JPEGBaseline = newSupportedEncapsulatedSyntax(
 		"1.2.840.10008.1.2.4.50",
 		"JPEG Baseline (Process 1)",
+		true,
 	)
-	JPEGExtended = newEncapsulatedSyntax(
+	JPEGExtended = newSupportedEncapsulatedSyntax(
 		"1.2.840.10008.1.2.4.51",
 		"JPEG Extended (Process 2 & 4)",
+		true,
 	)
-	JPEGLosslessNonHierarchical = newEncapsulatedSyntax(
+	JPEGLosslessNonHierarchical = newSupportedEncapsulatedSyntax(
 		"1.2.840.10008.1.2.4.57",
 		"JPEG Lossless, Non-Hierarchical (Process 14)",
+		true,
 	)
-	JPEGLosslessSV1 = newEncapsulatedSyntax(
+	JPEGLosslessSV1 = newSupportedEncapsulatedSyntax(
 		"1.2.840.10008.1.2.4.70",
 		"JPEG Lossless, Non-Hierarchical, First-Order Prediction",
+		true,
 	)
-	JPEGLSLossless = newEncapsulatedSyntax(
+	JPEGLSLossless = newJPEGLSSyntax(
 		"1.2.840.10008.1.2.4.80",
 		"JPEG-LS Lossless Image Compression",
 	)
-	JPEGLSNearLossless = newEncapsulatedSyntax(
+	JPEGLSNearLossless = newJPEGLSSyntax(
 		"1.2.840.10008.1.2.4.81",
 		"JPEG-LS Lossy (Near-Lossless) Image Compression",
 	)
-	JPEG2000LosslessOnly = newEncapsulatedSyntax(
+	JPEG2000LosslessOnly = newJPEG2000Syntax(
 		"1.2.840.10008.1.2.4.90",
 		"JPEG 2000 Image Compression (Lossless Only)",
 	)
-	JPEG2000 = newEncapsulatedSyntax(
+	JPEG2000 = newJPEG2000Syntax(
 		"1.2.840.10008.1.2.4.91",
 		"JPEG 2000 Image Compression",
 	)
-	JPEG2000Part2Lossless = newEncapsulatedSyntax(
+	JPEG2000Part2Lossless = newJPEG2000Syntax(
 		"1.2.840.10008.1.2.4.92",
 		"JPEG 2000 Part 2 Multi-component Image Compression (Lossless Only)",
 	)
-	JPEG2000Part2 = newEncapsulatedSyntax(
+	JPEG2000Part2 = newJPEG2000Syntax(
 		"1.2.840.10008.1.2.4.93",
 		"JPEG 2000 Part 2 Multi-component Image Compression",
 	)
-	RLELossless = newEncapsulatedSyntax(
+	RLELossless = newSupportedEncapsulatedSyntax(
 		"1.2.840.10008.1.2.5",
 		"RLE Lossless",
+		true,
 	)
 
-	JPIPReferenced = newEncapsulatedSyntax(
+	JPIPReferenced = newJPIPReferencedSyntax(
 		"1.2.840.10008.1.2.4.94",
 		"JPIP Referenced",
 	)
-	JPIPReferencedDeflate = newDeflatedSyntax(
+	JPIPReferencedDeflate = newJPIPReferencedDeflatedSyntax(
 		"1.2.840.10008.1.2.4.95",
 		"JPIP Referenced Deflate",
 	)
-	MPEG2MPML = newEncapsulatedSyntax(
+	MPEG2MPML = newVideoMediaSyntax(
 		"1.2.840.10008.1.2.4.100",
 		"MPEG2 Main Profile / Main Level",
 	)
-	MPEG2MPMLF = newEncapsulatedSyntax(
+	MPEG2MPMLF = newVideoMediaSyntax(
 		"1.2.840.10008.1.2.4.100.1",
 		"Fragmentable MPEG2 Main Profile / Main Level",
 	)
-	MPEG2MPHL = newEncapsulatedSyntax(
+	MPEG2MPHL = newVideoMediaSyntax(
 		"1.2.840.10008.1.2.4.101",
 		"MPEG2 Main Profile / High Level",
 	)
-	MPEG2MPHLF = newEncapsulatedSyntax(
+	MPEG2MPHLF = newVideoMediaSyntax(
 		"1.2.840.10008.1.2.4.101.1",
 		"Fragmentable MPEG2 Main Profile / High Level",
 	)
-	MPEG4HP41 = newEncapsulatedSyntax(
+	MPEG4HP41 = newVideoMediaSyntax(
 		"1.2.840.10008.1.2.4.102",
 		"MPEG-4 AVC/H.264 High Profile / Level 4.1",
 	)
-	MPEG4HP41F = newEncapsulatedSyntax(
+	MPEG4HP41F = newVideoMediaSyntax(
 		"1.2.840.10008.1.2.4.102.1",
 		"Fragmentable MPEG-4 AVC/H.264 High Profile / Level 4.1",
 	)
-	MPEG4HP41BD = newEncapsulatedSyntax(
+	MPEG4HP41BD = newVideoMediaSyntax(
 		"1.2.840.10008.1.2.4.103",
 		"MPEG-4 AVC/H.264 BD-compatible High Profile / Level 4.1",
 	)
-	MPEG4HP41BDF = newEncapsulatedSyntax(
+	MPEG4HP41BDF = newVideoMediaSyntax(
 		"1.2.840.10008.1.2.4.103.1",
 		"Fragmentable MPEG-4 AVC/H.264 BD-compatible High Profile / Level 4.1",
 	)
-	MPEG4HP422D = newEncapsulatedSyntax(
+	MPEG4HP422D = newVideoMediaSyntax(
 		"1.2.840.10008.1.2.4.104",
 		"MPEG-4 AVC/H.264 High Profile / Level 4.2 For 2D Video",
 	)
-	MPEG4HP422DF = newEncapsulatedSyntax(
+	MPEG4HP422DF = newVideoMediaSyntax(
 		"1.2.840.10008.1.2.4.104.1",
 		"Fragmentable MPEG-4 AVC/H.264 High Profile / Level 4.2 For 2D Video",
 	)
-	MPEG4HP423D = newEncapsulatedSyntax(
+	MPEG4HP423D = newVideoMediaSyntax(
 		"1.2.840.10008.1.2.4.105",
 		"MPEG-4 AVC/H.264 High Profile / Level 4.2 For 3D Video",
 	)
-	MPEG4HP423DF = newEncapsulatedSyntax(
+	MPEG4HP423DF = newVideoMediaSyntax(
 		"1.2.840.10008.1.2.4.105.1",
 		"Fragmentable MPEG-4 AVC/H.264 High Profile / Level 4.2 For 3D Video",
 	)
-	MPEG4HP42STEREO = newEncapsulatedSyntax(
+	MPEG4HP42STEREO = newVideoMediaSyntax(
 		"1.2.840.10008.1.2.4.106",
 		"MPEG-4 AVC/H.264 Stereo High Profile / Level 4.2",
 	)
-	MPEG4HP42STEREOF = newEncapsulatedSyntax(
+	MPEG4HP42STEREOF = newVideoMediaSyntax(
 		"1.2.840.10008.1.2.4.106.1",
 		"Fragmentable MPEG-4 AVC/H.264 Stereo High Profile / Level 4.2",
 	)
-	HEVCMP51 = newEncapsulatedSyntax(
+	HEVCMP51 = newVideoMediaSyntax(
 		"1.2.840.10008.1.2.4.107",
 		"HEVC/H.265 Main Profile / Level 5.1",
 	)
-	HEVCM10P51 = newEncapsulatedSyntax(
+	HEVCM10P51 = newVideoMediaSyntax(
 		"1.2.840.10008.1.2.4.108",
 		"HEVC/H.265 Main 10 Profile / Level 5.1",
 	)
-	JPEGXLLossless = newEncapsulatedSyntax(
+	JPEGXLLossless = newJPEGXLSyntax(
 		"1.2.840.10008.1.2.4.110",
 		"JPEG XL Lossless",
 	)
-	JPEGXLJPEGRecompression = newEncapsulatedSyntax(
+	JPEGXLJPEGRecompression = newJPEGXLSyntax(
 		"1.2.840.10008.1.2.4.111",
 		"JPEG XL JPEG Recompression",
 	)
-	JPEGXL = newEncapsulatedSyntax(
+	JPEGXL = newJPEGXLSyntax(
 		"1.2.840.10008.1.2.4.112",
 		"JPEG XL",
 	)
-	HTJ2KLossless = newEncapsulatedSyntax(
+	HTJ2KLossless = newJPEG2000Syntax(
 		"1.2.840.10008.1.2.4.201",
 		"High-Throughput JPEG 2000 Image Compression (Lossless Only)",
 	)
-	HTJ2KLosslessRPCL = newEncapsulatedSyntax(
+	HTJ2KLosslessRPCL = newJPEG2000Syntax(
 		"1.2.840.10008.1.2.4.202",
 		"High-Throughput JPEG 2000 with RPCL Options Image Compression (Lossless Only)",
 	)
-	HTJ2K = newEncapsulatedSyntax(
+	HTJ2K = newJPEG2000Syntax(
 		"1.2.840.10008.1.2.4.203",
 		"High-Throughput JPEG 2000 Image Compression",
 	)
-	JPIPHTJ2KReferenced = newEncapsulatedSyntax(
+	JPIPHTJ2KReferenced = newJPIPReferencedSyntax(
 		"1.2.840.10008.1.2.4.204",
 		"JPIP HTJ2K Referenced",
 	)
-	JPIPHTJ2KReferencedDeflate = newDeflatedSyntax(
+	JPIPHTJ2KReferencedDeflate = newJPIPReferencedDeflatedSyntax(
 		"1.2.840.10008.1.2.4.205",
 		"JPIP HTJ2K Referenced Deflate",
 	)
@@ -250,6 +262,18 @@ func newEncapsulatedSyntax(uid, name string) Syntax {
 	}
 }
 
+func newSupportedEncapsulatedSyntax(uid, name string, codecAvailable bool) Syntax {
+	return Syntax{
+		UID:            uid,
+		Name:           name,
+		ExplicitVR:     true,
+		ByteOrder:      binary.LittleEndian,
+		Supported:      true,
+		Encapsulated:   true,
+		CodecAvailable: codecAvailable,
+	}
+}
+
 func newFragmentOnlySyntax(uid, name string) Syntax {
 	return Syntax{
 		UID:            uid,
@@ -258,6 +282,140 @@ func newFragmentOnlySyntax(uid, name string) Syntax {
 		ByteOrder:      binary.LittleEndian,
 		Supported:      true,
 		Encapsulated:   true,
+		CodecAvailable: false,
+	}
+}
+
+func newVideoMediaSyntax(uid, name string) Syntax {
+	return Syntax{
+		UID:            uid,
+		Name:           name,
+		ExplicitVR:     true,
+		ByteOrder:      binary.LittleEndian,
+		Supported:      true,
+		Encapsulated:   true,
+		MediaPayload:   true,
+		CodecAvailable: false,
+	}
+}
+
+func newJPEGXLSyntax(uid, name string) Syntax {
+	return newOptionalStillImageCodecSyntax(uid, name)
+}
+
+func newJPEGLSSyntax(uid, name string) Syntax {
+	return newOptionalStillImageCodecSyntax(uid, name)
+}
+
+func newJPEG2000Syntax(uid, name string) Syntax {
+	return newOptionalStillImageCodecSyntax(uid, name)
+}
+
+func newOptionalStillImageCodecSyntax(uid, name string) Syntax {
+	return Syntax{
+		UID:            uid,
+		Name:           name,
+		ExplicitVR:     true,
+		ByteOrder:      binary.LittleEndian,
+		Supported:      true,
+		Encapsulated:   true,
+		CodecRequired:  true,
+		CodecAvailable: false,
+	}
+}
+
+func newJPIPReferencedSyntax(uid, name string) Syntax {
+	return Syntax{
+		UID:            uid,
+		Name:           name,
+		ExplicitVR:     true,
+		ByteOrder:      binary.LittleEndian,
+		Supported:      true,
+		CodecAvailable: false,
+	}
+}
+
+// IsVideoTransferSyntax reports whether uid is one of the MPEG, MPEG-4
+// AVC/H.264, or HEVC/H.265 transfer syntaxes that carry encapsulated video media
+// payloads rather than locally renderable still-image frames.
+func IsVideoTransferSyntax(uid string) bool {
+	switch NormalizeUID(uid) {
+	case MPEG2MPML.UID,
+		MPEG2MPMLF.UID,
+		MPEG2MPHL.UID,
+		MPEG2MPHLF.UID,
+		MPEG4HP41.UID,
+		MPEG4HP41F.UID,
+		MPEG4HP41BD.UID,
+		MPEG4HP41BDF.UID,
+		MPEG4HP422D.UID,
+		MPEG4HP422DF.UID,
+		MPEG4HP423D.UID,
+		MPEG4HP423DF.UID,
+		MPEG4HP42STEREO.UID,
+		MPEG4HP42STEREOF.UID,
+		HEVCMP51.UID,
+		HEVCM10P51.UID:
+		return true
+	default:
+		return false
+	}
+}
+
+// IsJPEGLSTransferSyntax reports whether uid is one of the DICOM JPEG-LS
+// still-image transfer syntaxes. These syntaxes are metadata/payload-readable
+// but require an optional decoder adapter for pixel frame rendering.
+func IsJPEGLSTransferSyntax(uid string) bool {
+	switch NormalizeUID(uid) {
+	case JPEGLSLossless.UID,
+		JPEGLSNearLossless.UID:
+		return true
+	default:
+		return false
+	}
+}
+
+// IsJPEG2000TransferSyntax reports whether uid is one of the DICOM JPEG 2000
+// or HTJ2K still-image transfer syntaxes. JPIP referenced syntaxes are excluded
+// because they need external pixel-stream retrieval rather than local frame
+// decode.
+func IsJPEG2000TransferSyntax(uid string) bool {
+	switch NormalizeUID(uid) {
+	case JPEG2000LosslessOnly.UID,
+		JPEG2000.UID,
+		JPEG2000Part2Lossless.UID,
+		JPEG2000Part2.UID,
+		HTJ2KLossless.UID,
+		HTJ2KLosslessRPCL.UID,
+		HTJ2K.UID:
+		return true
+	default:
+		return false
+	}
+}
+
+// IsJPEGXLTransferSyntax reports whether uid is one of the DICOM JPEG XL
+// still-image transfer syntaxes. These syntaxes are metadata/payload-readable
+// but require an optional decoder adapter for pixel frame rendering.
+func IsJPEGXLTransferSyntax(uid string) bool {
+	switch NormalizeUID(uid) {
+	case JPEGXLLossless.UID,
+		JPEGXLJPEGRecompression.UID,
+		JPEGXL.UID:
+		return true
+	default:
+		return false
+	}
+}
+
+func newJPIPReferencedDeflatedSyntax(uid, name string) Syntax {
+	return Syntax{
+		UID:            uid,
+		Name:           name,
+		ExplicitVR:     true,
+		ByteOrder:      binary.LittleEndian,
+		Supported:      true,
+		Deflated:       true,
 		CodecAvailable: false,
 	}
 }

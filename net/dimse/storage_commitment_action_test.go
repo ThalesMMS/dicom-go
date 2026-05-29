@@ -74,7 +74,7 @@ func TestNActionRequest_RequiresDatasetPresent(t *testing.T) {
 	assertParseNActionRequestError(t, obj, "N-ACTION request dataset type")
 }
 
-func TestNActionRequest_RejectsZeroMessageID(t *testing.T) {
+func TestNActionRequest_AcceptsZeroMessageID(t *testing.T) {
 	elems := []core.Element{
 		newUIElement(RequestedSOPClassUID, StorageCommitmentPushModelSOPClassUID),
 		newUSCommandElement(CommandField, NActionRQ),
@@ -84,7 +84,10 @@ func TestNActionRequest_RejectsZeroMessageID(t *testing.T) {
 		newUSCommandElement(CommandDataSetType, DataSetPresent),
 	}
 	obj := newCommandObject(elems)
-	assertParseNActionRequestError(t, obj, "MessageID must be non-zero")
+	parsed, err := ParseNActionRequest(obj)
+	if err != nil || parsed.MessageID != 0 {
+		t.Fatalf("ParseNActionRequest() = %+v, %v", parsed, err)
+	}
 }
 
 func TestNActionRequest_RequiresStorageCommitmentActionTypeID(t *testing.T) {
@@ -136,7 +139,7 @@ func TestNActionRequest_RequiresStorageCommitmentUIDs(t *testing.T) {
 	}
 }
 
-func TestNActionResponse_RejectsInvalidDatasetType(t *testing.T) {
+func TestNActionResponse_AcceptsAnyNonNullDatasetType(t *testing.T) {
 	rsp := NActionResponse{
 		AffectedSOPClassUID:       StorageCommitmentPushModelSOPClassUID,
 		AffectedSOPInstanceUID:    StorageCommitmentPushModelSOPInstanceUID,
@@ -152,10 +155,17 @@ func TestNActionResponse_RejectsInvalidDatasetType(t *testing.T) {
 	}
 	obj := newCommandObject(elems)
 	obj.Put(newUSCommandElement(CommandDataSetType, 0x9999))
-	assertParseNActionResponseError(t, obj, "dataset type")
+	obj.Put(newUSCommandElement(ActionTypeID, StorageCommitmentActionTypeID))
+	parsed, err := ParseNActionResponse(obj)
+	if err != nil {
+		t.Fatalf("ParseNActionResponse() error = %v", err)
+	}
+	if !parsed.HasActionReply {
+		t.Fatal("HasActionReply = false, want true for non-null CommandDataSetType")
+	}
 }
 
-func TestNActionResponse_RejectsZeroMessageIDBeingRespondedTo(t *testing.T) {
+func TestNActionResponse_AcceptsZeroMessageIDBeingRespondedTo(t *testing.T) {
 	elems := []core.Element{
 		newUIElement(AffectedSOPClassUID, StorageCommitmentPushModelSOPClassUID),
 		newUSCommandElement(CommandField, NActionRSP),
@@ -165,7 +175,10 @@ func TestNActionResponse_RejectsZeroMessageIDBeingRespondedTo(t *testing.T) {
 		newUSCommandElement(Status, StatusSuccess),
 	}
 	obj := newCommandObject(elems)
-	assertParseNActionResponseError(t, obj, "MessageIDBeingRespondedTo must be non-zero")
+	parsed, err := ParseNActionResponse(obj)
+	if err != nil || parsed.MessageIDBeingRespondedTo != 0 {
+		t.Fatalf("ParseNActionResponse() = %+v, %v", parsed, err)
+	}
 }
 
 func TestNActionResponse_UsesAffectedSOPUIDs(t *testing.T) {

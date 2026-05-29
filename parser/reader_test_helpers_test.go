@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"io"
+	"sync/atomic"
+	"testing"
+
 	"github.com/ThalesMMS/dicom-go/core"
 	"github.com/ThalesMMS/dicom-go/dictionary"
 	"github.com/ThalesMMS/dicom-go/internal/dicomtest"
 	"github.com/ThalesMMS/dicom-go/transfer"
-	"io"
-	"testing"
 )
 
 type countingDictionary struct {
@@ -19,7 +21,7 @@ type countingDictionary struct {
 
 type multiCountingDictionary struct {
 	entries    map[core.Tag]core.VR
-	byTagCalls int
+	byTagCalls atomic.Int64
 }
 
 type dictEntry struct {
@@ -50,7 +52,7 @@ func (d *multiCountingDictionary) ByTag(tag core.Tag) (dictionary.Entry, bool) {
 	if d == nil {
 		return dictionary.Entry{}, false
 	}
-	d.byTagCalls++
+	d.byTagCalls.Add(1)
 	vr, ok := d.entries[tag]
 	if !ok {
 		return dictionary.Entry{}, false

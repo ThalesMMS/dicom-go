@@ -11,17 +11,17 @@ import (
 // readerValueProvider replays a seekable source to stream raw value bytes for
 // elements that were not materialized in memory.
 //
-// It scans from the beginning of the data set each time. This keeps the design
-// simple and avoids retaining offsets in the core model.
+// The parser records value offsets for skipped/deferred values while reading.
+// CopyValueTo uses those offsets directly when available and falls back to a
+// tag scan for readers created before an offset was recorded.
 //
 // Limitations:
 //   - Only works when the original input passed to object.ReadFileWithOptions is
 //     an io.ReadSeeker (e.g., *os.File).
-//   - Only supports defined-length primitive values.
-//   - Undefined-length values (e.g., sequences, encapsulated Pixel Data) are not
-//     supported.
-//
-// Future improvements can cache element offsets or add a real value source type.
+//   - Supports defined-length primitive values and undefined-length encapsulated
+//     Pixel Data values. General SQ replay is a permanent, intentional
+//     non-goal (see docs/CONFORMANCE.md "Known Limitations" and #278);
+//     sequence item values are always materialized instead.
 //
 // NOTE: This is an internal helper; the public entrypoint is Object.CopyValueTo.
 

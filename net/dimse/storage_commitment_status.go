@@ -2,6 +2,13 @@ package dimse
 
 import "fmt"
 
+const (
+	// StatusStorageCommitmentProcessingFailure is the generic DIMSE processing
+	// failure status used when a Storage Commitment SCP cannot accept an
+	// N-ACTION request.
+	StatusStorageCommitmentProcessingFailure uint16 = 0x0110
+)
+
 // StorageCommitmentStatus represents the high-level class of a Storage
 // Commitment response status.
 //

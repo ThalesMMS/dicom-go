@@ -61,6 +61,18 @@ func (r FindResult) String() string {
 // automatically abort the association; the caller should decide whether to
 // Release/Abort.
 func Find(ctx context.Context, assoc *ul.Association, pcID byte, req CFindRequest, identifier *object.Object, identifierSyntax transfer.Syntax) (<-chan FindResult, <-chan error) {
+	if ctx == nil {
+		return findError(fmt.Errorf("dicom dimse: nil context"))
+	}
+	return FindWithOptions(OperationOptions{Context: ctx}, assoc, pcID, req, identifier, identifierSyntax)
+}
+
+// FindWithOptions is like Find but uses OperationOptions for operation
+// cancellation, overall timeout, per-response timeout, and association cleanup
+// policy after uncertain errors.
+func FindWithOptions(options OperationOptions, assoc *ul.Association, pcID byte, req CFindRequest, identifier *object.Object, identifierSyntax transfer.Syntax) (<-chan FindResult, <-chan error) {
+	options = operationOptionsWithDefaultPolicy(options, OperationErrorPolicyLeaveOpen)
+
 	out := make(chan FindResult)
 	errCh := make(chan error, 1)
 
@@ -68,12 +80,11 @@ func Find(ctx context.Context, assoc *ul.Association, pcID byte, req CFindReques
 		defer close(out)
 		defer close(errCh)
 
-		if ctx == nil {
-			errCh <- fmt.Errorf("dicom dimse: nil context")
-			return
-		}
+		ctx, cancel := operationContext(options)
+		defer cancel()
+
 		if err := ctx.Err(); err != nil {
-			errCh <- err
+			errCh <- newOperationError("C-FIND", err, false)
 			return
 		}
 
@@ -85,33 +96,43 @@ func Find(ctx context.Context, assoc *ul.Association, pcID byte, req CFindReques
 			errCh <- fmt.Errorf("dicom dimse: nil assoc")
 			return
 		}
+
+		releaseOperation, err := beginAssociationOperation(assoc)
+		if err != nil {
+			errCh <- newOperationError("C-FIND", err, false)
+			return
+		}
+		defer releaseOperation()
+
 		if err := SendCommandSet(assoc, pcID, req.CommandSet()); err != nil {
-			errCh <- err
+			errCh <- applyOperationErrorPolicy(assoc, options.ErrorPolicy, newOperationError("C-FIND", err, true))
 			return
 		}
 		if err := SendDataSet(assoc, pcID, identifier, identifierSyntax); err != nil {
-			errCh <- err
+			errCh <- applyOperationErrorPolicy(assoc, options.ErrorPolicy, newOperationError("C-FIND", err, true))
 			return
 		}
 
 		for {
 			select {
 			case <-ctx.Done():
-				errCh <- ctx.Err()
+				errCh <- applyOperationErrorPolicy(assoc, options.ErrorPolicy, newOperationError("C-FIND", ctx.Err(), true))
 				return
 			default:
 			}
 
-			rsp, id, err := receiveCFindResponseWithContext(ctx, assoc, pcID, identifierSyntax)
+			responseCtx, responseCancel := operationResponseContext(ctx, options.ResponseTimeout)
+			rsp, id, err := receiveCFindResponseWithContext(responseCtx, assoc, pcID, identifierSyntax)
+			responseCancel()
 			if err != nil {
-				errCh <- err
+				errCh <- applyOperationErrorPolicy(assoc, options.ErrorPolicy, newOperationError("C-FIND", err, true))
 				return
 			}
 
 			// Emit the response.
 			select {
 			case <-ctx.Done():
-				errCh <- ctx.Err()
+				errCh <- applyOperationErrorPolicy(assoc, options.ErrorPolicy, newOperationError("C-FIND", ctx.Err(), true))
 				return
 			case out <- FindResult{Response: rsp, Identifier: id}:
 			}
@@ -121,7 +142,8 @@ func Find(ctx context.Context, assoc *ul.Association, pcID byte, req CFindReques
 			// If the caller cancels the context after we've started receiving responses,
 			// abort the operation cleanly by returning ctx.Err(). The association is
 			// left to the caller to Release/Abort.
-			switch CategorizeCFindStatus(rsp.Status) {
+			category := CategorizeCFindStatus(rsp.Status)
+			switch category {
 			case CFindStatusPending:
 				continue
 			case CFindStatusSuccess:
@@ -129,11 +151,24 @@ func Find(ctx context.Context, assoc *ul.Association, pcID byte, req CFindReques
 			case CFindStatusFailure:
 				errCh <- CFindStatusError(rsp)
 				return
+			case CFindStatusInvalid:
+				errCh <- CFindStatusError(rsp)
+				return
 			default:
-				panic(fmt.Sprintf("dicom dimse: unexpected C-FIND status category for status 0x%04X", rsp.Status))
+				errCh <- fmt.Errorf("dicom dimse: unexpected C-FIND status category %s for status 0x%04X", category, rsp.Status)
+				return
 			}
 		}
 	}()
 
+	return out, errCh
+}
+
+func findError(err error) (<-chan FindResult, <-chan error) {
+	out := make(chan FindResult)
+	errCh := make(chan error, 1)
+	close(out)
+	errCh <- err
+	close(errCh)
 	return out, errCh
 }

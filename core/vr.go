@@ -84,7 +84,7 @@ func (vr VR) String() string {
 
 func (vr VR) UsesLongExplicitLength() bool {
 	switch vr {
-	case VROB, VROD, VROF, VROL, VROV, VROW, VRSQ, VRUC, VRUR, VRUT, VRUN:
+	case VROB, VROD, VROF, VROL, VROV, VROW, VRSQ, VRSV, VRUC, VRUR, VRUT, VRUN, VRUV:
 		return true
 	default:
 		return false

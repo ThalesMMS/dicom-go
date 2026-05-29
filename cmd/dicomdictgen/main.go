@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+
+	"github.com/ThalesMMS/dicom-go/internal/clidiag"
 )
 
 const (
@@ -26,30 +28,30 @@ func run(args []string, stdout, stderr io.Writer) int {
 		if errors.Is(err, errUsage) {
 			return 2
 		}
-		_, _ = fmt.Fprintln(stderr, err)
+		clidiag.Fprintln(stderr, "dicomdictgen", err)
 		return 1
 	}
 
 	entries, err := parseFile(opts.input)
 	if err != nil {
-		_, _ = fmt.Fprintln(stderr, err)
+		clidiag.Fprintln(stderr, "dicomdictgen", err)
 		return 1
 	}
 
 	generatedAt, err := dictionaryTimestamp(opts.input)
 	if err != nil {
-		_, _ = fmt.Fprintln(stderr, err)
+		clidiag.Fprintln(stderr, "dicomdictgen", err)
 		return 1
 	}
 
 	source, err := generateSource(opts.input, entries, generatedAt)
 	if err != nil {
-		_, _ = fmt.Fprintln(stderr, err)
+		clidiag.Fprintln(stderr, "dicomdictgen", err)
 		return 1
 	}
 
 	if err := writeGeneratedFile(opts.output, source); err != nil {
-		_, _ = fmt.Fprintln(stderr, err)
+		clidiag.Fprintln(stderr, "dicomdictgen", err)
 		return 1
 	}
 

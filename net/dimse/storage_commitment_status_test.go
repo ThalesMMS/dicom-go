@@ -2,6 +2,7 @@ package dimse
 
 import (
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -45,5 +46,29 @@ func TestCheckStorageCommitmentStatus_TypedError(t *testing.T) {
 
 	if err := CheckStorageCommitmentStatus("N-ACTION", 0x0000); err != nil {
 		t.Fatalf("expected nil, got %v", err)
+	}
+}
+
+func TestStorageCommitmentStatusStringAndError(t *testing.T) {
+	tests := map[StorageCommitmentStatus]string{
+		StorageCommitmentStatusSuccess: "success",
+		StorageCommitmentStatusFailure: "failure",
+		StorageCommitmentStatus(99):    "unknown",
+	}
+	for status, want := range tests {
+		if got := status.String(); got != want {
+			t.Fatalf("%v.String() = %q, want %q", int(status), got, want)
+		}
+	}
+
+	var nilErr *StorageCommitmentStatusError
+	if got := nilErr.Error(); got != "" {
+		t.Fatalf("nil StorageCommitmentStatusError.Error() = %q, want empty", got)
+	}
+	err := &StorageCommitmentStatusError{Op: "N-EVENT-REPORT", Status: 0x0110, Class: StorageCommitmentStatusFailure}
+	for _, want := range []string{"N-EVENT-REPORT", "0x0110", "failure"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("StorageCommitmentStatusError.Error() = %q, want substring %q", err.Error(), want)
+		}
 	}
 }

@@ -53,6 +53,14 @@ func TestReadDataSetBuildsSequenceWithTwoItems(t *testing.T) {
 	if len(seqValue.Items) != 2 {
 		t.Fatalf("sequence item count = %d, want 2", len(seqValue.Items))
 	}
+	firstItemOffset := int64(len(dicomtest.SequenceHeaderBytes(transfer.ExplicitVRLittleEndian, seqTag, 0xFFFFFFFF)))
+	secondItemOffset := firstItemOffset + 8 + int64(len(itemOne))
+	if !seqValue.Items[0].ItemOffsetSet || seqValue.Items[0].ItemOffset != firstItemOffset {
+		t.Fatalf("first item offset = %d set=%v, want %d/true", seqValue.Items[0].ItemOffset, seqValue.Items[0].ItemOffsetSet, firstItemOffset)
+	}
+	if !seqValue.Items[1].ItemOffsetSet || seqValue.Items[1].ItemOffset != secondItemOffset {
+		t.Fatalf("second item offset = %d set=%v, want %d/true", seqValue.Items[1].ItemOffset, seqValue.Items[1].ItemOffsetSet, secondItemOffset)
+	}
 	if len(seqValue.Items[0].Elements) != 2 {
 		t.Fatalf("first item element count = %d, want 2", len(seqValue.Items[0].Elements))
 	}
@@ -164,6 +172,9 @@ func TestNextReturnsSequenceAndItemControlTokensWithoutReadingBodies(t *testing.
 	}
 	if tok.Kind != TokenStartItem {
 		t.Fatalf("second token kind = %v, want %v", tok.Kind, TokenStartItem)
+	}
+	if tok.Offset != 12 {
+		t.Fatalf("item token offset = %d, want 12", tok.Offset)
 	}
 	if tok.Header.Tag != core.TagItem || tok.Header.Length != core.UndefinedLength {
 		t.Fatalf("unexpected item header: %+v", tok.Header)
@@ -817,7 +828,7 @@ func TestNextImplicitVRSequenceUsesDictionaryOnlyForDataElements(t *testing.T) {
 		TokenEndItem,
 		TokenEndSequence,
 	})
-	if dict.byTagCalls != 2 {
-		t.Fatalf("dictionary call count = %d, want 2 (SQ header + inner element only)", dict.byTagCalls)
+	if calls := dict.byTagCalls.Load(); calls != 2 {
+		t.Fatalf("dictionary call count = %d, want 2 (SQ header + inner element only)", calls)
 	}
 }

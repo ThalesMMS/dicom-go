@@ -22,6 +22,14 @@ func TestGenerateSourceContainsExpectedRegistryScaffolding(t *testing.T) {
 			Name:    "Patient Name",
 			VM:      "1",
 		},
+		{
+			Tag:              core.NewTag(0x0028, 0x0106),
+			VRExpr:           "core.VRUS",
+			ContextualVRExpr: "dictionary.ContextualVRXS",
+			Keyword:          "SmallestImagePixelValue",
+			Name:             "Smallest Image Pixel Value",
+			VM:               "1",
+		},
 	}, time.Date(2026, 4, 22, 12, 0, 0, 0, time.UTC))
 	if err != nil {
 		t.Fatal(err)
@@ -36,6 +44,8 @@ func TestGenerateSourceContainsExpectedRegistryScaffolding(t *testing.T) {
 		"package std",
 		"var Dictionary dictionary.DataDictionary = table{",
 		"func init() {",
+		"func (t table) VRSpecByTag(tag core.Tag) (dictionary.VRSpec, bool)",
+		"dictionary.NewContextualVRSpec(dictionary.ContextualVRXS)",
 		"{Tag: core.NewTag(0x0010, 0x0010), VR: core.VRPN, Keyword: \"PatientName\", Name: \"Patient Name\", VM: \"1\"}",
 	} {
 		if !strings.Contains(text, want) {

@@ -1,13 +1,14 @@
-// Package rle provides an optional pure Go decoder for DICOM RLE Lossless
-// pixel data, transfer syntax UID 1.2.840.10008.1.2.5.
+// Package rle provides an optional pure Go codec for DICOM RLE Lossless pixel
+// data, transfer syntax UID 1.2.840.10008.1.2.5.
 //
-// The codec supports 8-bit and 16-bit frames with 1 to 3 samples per pixel.
-// Import this package only when RLE support is required, then register the
-// codec explicitly:
+// The decoder and frame encoder support 8-bit and 16-bit monochrome, palette,
+// and RGB frames. Import this package only when RLE support is required, then
+// register the required direction explicitly:
 //
 //	pixeldata.RegisterCodec(rle.UID, rle.New())
+//	rle.RegisterEncoder(encoderRegistry)
 //
-// Decoding follows DICOM PS3.5 Annex G: each encapsulated frame contains a
-// 64-byte RLE header, PackBits-compressed byte-plane segments, and segment
-// interleaving into native little-endian pixel bytes.
+// Coding follows DICOM PS3.5 Annex G: each encapsulated frame contains a
+// 64-byte RLE header and PackBits-compressed byte-plane segments. NewEncoder
+// returns one complete encoded frame for use as one encapsulated fragment.
 package rle

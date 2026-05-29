@@ -31,7 +31,7 @@ var outputTemplate = template.Must(template.New("std").Parse(`// Code generated 
 // Generated at: {{.GeneratedAt}}
 // Implementation notes:
 // - repeating tag ranges are expanded to concrete tags because dicom-go currently exposes exact-tag lookup only
-// - context-dependent VRs are relaxed as xs->US, ox/lt/px->OW, up->UL
+// - context-dependent VRs preserve their complete allowed VR set while Entry.VR keeps its compatible fallback
 // - Entry.Name is derived from the DICOM keyword because dicom.dic does not provide the long display name
 
 package std
@@ -44,13 +44,15 @@ import (
 )
 
 var Dictionary dictionary.DataDictionary = table{
-	byTag: map[core.Tag]dictionary.Entry{},
-	byKey: map[string]dictionary.Entry{},
+	byTag:   map[core.Tag]dictionary.Entry{},
+	byKey:   map[string]dictionary.Entry{},
+	vrSpecs: map[core.Tag]dictionary.VRSpec{},
 }
 
 type table struct {
-	byTag map[core.Tag]dictionary.Entry
-	byKey map[string]dictionary.Entry
+	byTag   map[core.Tag]dictionary.Entry
+	byKey   map[string]dictionary.Entry
+	vrSpecs map[core.Tag]dictionary.VRSpec
 }
 
 func (t table) ByTag(tag core.Tag) (dictionary.Entry, bool) {
@@ -63,6 +65,17 @@ func (t table) ByKeyword(keyword string) (dictionary.Entry, bool) {
 	return e, ok
 }
 
+func (t table) VRSpecByTag(tag core.Tag) (dictionary.VRSpec, bool) {
+	if spec, ok := t.vrSpecs[tag]; ok {
+		return spec, true
+	}
+	e, ok := t.byTag[tag]
+	if !ok || e.VR == "" {
+		return dictionary.VRSpec{}, false
+	}
+	return dictionary.NewVRSpec(e.VR), true
+}
+
 func init() {
 	t := Dictionary.(table)
 	for _, e := range entries {
@@ -72,6 +85,14 @@ func init() {
 			t.byKey[key] = e
 		}
 	}
+	for tag, spec := range contextualVRSpecs {
+		t.vrSpecs[tag] = spec
+	}
+}
+
+var contextualVRSpecs = map[core.Tag]dictionary.VRSpec{
+{{- range .Entries }}{{if .ContextualVRExpr}}
+	core.NewTag({{printf "0x%04X" .Tag.Group}}, {{printf "0x%04X" .Tag.Element}}): dictionary.NewContextualVRSpec({{.ContextualVRExpr}}),{{end}}{{end}}
 }
 
 var entries = []dictionary.Entry{

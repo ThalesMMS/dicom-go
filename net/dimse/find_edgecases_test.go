@@ -121,7 +121,9 @@ func TestFind_ZeroMatches_FinalSuccessOnly(t *testing.T) {
 	_ = <-serverDone
 }
 
-func TestReceiveCFindResponse_InvalidDataSetType(t *testing.T) {
+func TestFind_GeneralFailureStatusReturnsError(t *testing.T) {
+	const generalFailureStatus uint16 = 0x0122
+
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
@@ -151,13 +153,12 @@ func TestReceiveCFindResponse_InvalidDataSetType(t *testing.T) {
 			return
 		}
 
-		// Drain request cmd + identifier.
 		rqCmdObj, err := ReceiveCommandSet(assoc, pc.ID)
 		if err != nil {
 			serverDone <- err
 			return
 		}
-		_, err = ParseCFindRequest(rqCmdObj)
+		rq, err := ParseCFindRequest(rqCmdObj)
 		if err != nil {
 			serverDone <- err
 			return
@@ -167,13 +168,11 @@ func TestReceiveCFindResponse_InvalidDataSetType(t *testing.T) {
 			return
 		}
 
-		rsp := CFindResponse{
+		serverDone <- SendCFindResponse(assoc, pc.ID, CFindResponse{
 			AffectedSOPClassUID:       StudyRootFindSOPClassUID,
-			MessageIDBeingRespondedTo: 1,
-			Status:                    StatusSuccess,
-			CommandDataSetType:        0x9999,
-		}
-		serverDone <- SendCommandSet(assoc, pc.ID, rsp.CommandSet())
+			MessageIDBeingRespondedTo: rq.MessageID,
+			Status:                    generalFailureStatus,
+		}, nil, transfer.ImplicitVRLittleEndian)
 	}()
 
 	assoc, err := ul.DialContext(ctx, listener.Addr().String(), ul.DialOptions{
@@ -192,19 +191,145 @@ func TestReceiveCFindResponse_InvalidDataSetType(t *testing.T) {
 	}
 
 	identifier := object.FromElements([]core.Element{dicomtest.NewStringElement(core.NewTag(0x0008, 0x0052), core.VRCS, "STUDY")}, std.Dictionary)
-
 	results, errs := Find(ctx, assoc, pc.ID, CFindRequest{
 		AffectedSOPClassUID: StudyRootFindSOPClassUID,
 		MessageID:           1,
 	}, identifier, transfer.ImplicitVRLittleEndian)
 
-	for range results {
+	var got []FindResult
+	for r := range results {
+		got = append(got, r)
 	}
-	if err := <-errs; err == nil || !strings.Contains(err.Error(), "C-FIND response dataset type") {
-		t.Fatalf("expected dataset type error, got %v", err)
+	err = <-errs
+	if err == nil || errors.Is(err, ErrCFindInvalidStatus) {
+		t.Fatalf("Find() error = %v, want recognized general failure", err)
 	}
-	// Server may close the connection intentionally.
-	_ = <-serverDone
+	if len(got) != 1 {
+		t.Fatalf("results = %d, want final response", len(got))
+	}
+	if got[0].Response == nil || got[0].Status() != generalFailureStatus {
+		t.Fatalf("final response = %#v, want status 0x%04X", got[0].Response, generalFailureStatus)
+	}
+	if err := <-serverDone; err != nil {
+		t.Fatalf("server error = %v", err)
+	}
+}
+
+func TestFind_AllowsNonNoDataSetTypeAsIdentifierPresent(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	listener, err := ul.Listen(ul.ListenOptions{Address: "127.0.0.1:0", Context: ctx})
+	if err != nil {
+		t.Fatalf("Listen() error = %v", err)
+	}
+	defer closeOrFail(t, "listener", listener)
+
+	serverDone := make(chan error, 1)
+	go func() {
+		assoc, err := listener.AcceptAssociation(ul.AcceptOptions{
+			AETitle:                   "FINDSCP",
+			Context:                   ctx,
+			SupportedAbstractSyntaxes: []string{StudyRootFindSOPClassUID},
+			SupportedTransferSyntaxes: []string{ul.ImplicitVRLittleEndian},
+		})
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		defer closeOrFail(t, "server association", assoc)
+
+		pc, err := AcceptedContextForSOPClass(assoc, StudyRootFindSOPClassUID)
+		if err != nil {
+			serverDone <- err
+			return
+		}
+
+		rqCmdObj, err := ReceiveCommandSet(assoc, pc.ID)
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		if _, err := ParseCFindRequest(rqCmdObj); err != nil {
+			serverDone <- err
+			return
+		}
+		if _, err := receiveIdentifierObject(assoc, pc.ID, pc.TransferSyntaxUID); err != nil {
+			serverDone <- err
+			return
+		}
+
+		pendingCmd := CFindResponse{
+			AffectedSOPClassUID:       StudyRootFindSOPClassUID,
+			MessageIDBeingRespondedTo: 1,
+			Status:                    StatusPending,
+			CommandDataSetType:        0x0001,
+		}
+		if err := SendCommandSet(assoc, pc.ID, pendingCmd.CommandSet()); err != nil {
+			serverDone <- err
+			return
+		}
+		pendingID := object.FromElements([]core.Element{
+			dicomtest.NewStringElement(core.NewTag(0x0010, 0x0020), core.VRLO, "RADIANT-PATIENT"),
+		}, std.Dictionary)
+		if err := sendIdentifierObject(assoc, pc.ID, pendingID, pc.TransferSyntaxUID); err != nil {
+			serverDone <- err
+			return
+		}
+
+		finalCmd := CFindResponse{
+			AffectedSOPClassUID:       StudyRootFindSOPClassUID,
+			MessageIDBeingRespondedTo: 1,
+			Status:                    StatusSuccess,
+			CommandDataSetType:        NoDataSet,
+		}
+		serverDone <- SendCommandSet(assoc, pc.ID, finalCmd.CommandSet())
+	}()
+
+	assoc, err := ul.DialContext(ctx, listener.Addr().String(), ul.DialOptions{
+		CallingAETitle: "FINDSCU",
+		CalledAETitle:  "FINDSCP",
+		Contexts:       []ul.PresentationContext{StudyRootFindPresentationContext()},
+	})
+	if err != nil {
+		t.Fatalf("DialContext() error = %v", err)
+	}
+	defer closeOrFail(t, "client association", assoc)
+
+	pc, err := AcceptedContextForSOPClass(assoc, StudyRootFindSOPClassUID)
+	if err != nil {
+		t.Fatalf("AcceptedContextForSOPClass() error = %v", err)
+	}
+
+	identifier := object.FromElements([]core.Element{dicomtest.NewStringElement(core.NewTag(0x0008, 0x0052), core.VRCS, "STUDY")}, std.Dictionary)
+	results, errs := Find(ctx, assoc, pc.ID, CFindRequest{
+		AffectedSOPClassUID: StudyRootFindSOPClassUID,
+		MessageID:           1,
+	}, identifier, transfer.ImplicitVRLittleEndian)
+
+	var got []FindResult
+	for r := range results {
+		got = append(got, r)
+	}
+	if err := <-errs; err != nil {
+		t.Fatalf("Find() error = %v", err)
+	}
+	if err := <-serverDone; err != nil {
+		t.Fatalf("server error = %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("results = %d, want pending match and final response", len(got))
+	}
+	if got[0].Identifier == nil {
+		t.Fatalf("pending response Identifier is nil")
+	}
+	patientID, ok := got[0].Identifier.GetString(core.NewTag(0x0010, 0x0020))
+	if !ok || patientID != "RADIANT-PATIENT" {
+		t.Fatalf("PatientID = %q ok=%v", patientID, ok)
+	}
+	if got[1].Identifier != nil || got[1].Response == nil || got[1].Response.Status != StatusSuccess {
+		t.Fatalf("final response = %#v identifier=%#v, want success with nil identifier", got[1].Response, got[1].Identifier)
+	}
 }
 
 func TestSendCFindRequest_NoAcceptedPresentationContext(t *testing.T) {

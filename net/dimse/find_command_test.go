@@ -37,6 +37,22 @@ func TestCFindRequestCommandSet_RoundTrip(t *testing.T) {
 	}
 }
 
+func TestCFindRequestCommandSetPatientRootRoundTrip(t *testing.T) {
+	req := CFindRequest{
+		AffectedSOPClassUID: PatientRootFindSOPClassUID,
+		MessageID:           8,
+		Priority:            PriorityMedium,
+	}
+
+	parsed, err := ParseCFindRequest(object.FromElements(req.CommandSet(), nil))
+	if err != nil {
+		t.Fatalf("ParseCFindRequest() error = %v", err)
+	}
+	if parsed.AffectedSOPClassUID != PatientRootFindSOPClassUID {
+		t.Fatalf("AffectedSOPClassUID = %q, want %q", parsed.AffectedSOPClassUID, PatientRootFindSOPClassUID)
+	}
+}
+
 func TestCFindRequestCommandSet_DefaultPriority(t *testing.T) {
 	req := CFindRequest{
 		AffectedSOPClassUID: StudyRootFindSOPClassUID,
@@ -65,6 +81,42 @@ func TestParseCFindRequest_DataSetTypeMustBePresent(t *testing.T) {
 	obj := object.FromElements(cs, nil)
 	if _, err := ParseCFindRequest(obj); err == nil {
 		t.Fatalf("expected error")
+	}
+}
+
+func TestParseCFindRequestAcceptsLegacyDataSetPresentValue(t *testing.T) {
+	req := CFindRequest{AffectedSOPClassUID: StudyRootFindSOPClassUID, MessageID: 1}
+	elements := req.CommandSet()
+	for i := range elements {
+		if elements[i].Header.Tag == CommandDataSetType {
+			elements[i].Value = core.RawValue{0x02, 0x01}
+		}
+	}
+	if _, err := ParseCFindRequest(object.FromElements(elements, nil)); err != nil {
+		t.Fatalf("ParseCFindRequest() error = %v", err)
+	}
+}
+
+func TestParseCFindRequestAcceptsZeroMessageID(t *testing.T) {
+	request := CFindRequest{AffectedSOPClassUID: StudyRootFindSOPClassUID, MessageID: 0}
+	parsed, err := ParseCFindRequest(object.FromElements(request.CommandSet(), nil))
+	if err != nil {
+		t.Fatalf("ParseCFindRequest() error = %v", err)
+	}
+	if parsed.MessageID != 0 {
+		t.Fatalf("MessageID = %d, want 0", parsed.MessageID)
+	}
+}
+
+func TestParseCFindRequestRejectsInvalidPriority(t *testing.T) {
+	elements := CFindRequest{AffectedSOPClassUID: StudyRootFindSOPClassUID, MessageID: 1}.CommandSet()
+	for i := range elements {
+		if elements[i].Header.Tag == Priority {
+			elements[i].Value = core.RawValue{0x03, 0x00}
+		}
+	}
+	if _, err := ParseCFindRequest(object.FromElements(elements, nil)); err == nil {
+		t.Fatal("ParseCFindRequest() error = nil")
 	}
 }
 
@@ -116,6 +168,80 @@ func TestCFindResponseCommandSet_RoundTrip_WithAndWithoutDatasetAndErrorComment(
 				t.Fatalf("ErrorComment=%q want %q", parsed.ErrorComment, tc.rsp.ErrorComment)
 			}
 		})
+	}
+}
+
+func TestCFindResponseCommandSet_RoundTrip_WithOptionalFailureFields(t *testing.T) {
+	offending := core.NewTag(0x0010, 0x0020)
+	rsp := CFindResponse{
+		AffectedSOPClassUID:           StudyRootFindSOPClassUID,
+		MessageIDBeingRespondedTo:     9,
+		Status:                        0xA900,
+		CommandDataSetType:            NoDataSet,
+		ErrorComment:                  "identifier does not match SOP class",
+		OffendingElementOrNil:         &offending,
+		FailedSOPInstanceUIDListOrNil: []string{"1.2.3", "1.2.4"},
+	}
+
+	obj, err := DecodeCommandSet(mustEncodeCommandSet(t, rsp.CommandSet()))
+	if err != nil {
+		t.Fatalf("DecodeCommandSet: %v", err)
+	}
+	parsed, err := ParseCFindResponse(obj)
+	if err != nil {
+		t.Fatalf("ParseCFindResponse: %v", err)
+	}
+	if parsed.OffendingElementOrNil == nil {
+		t.Fatal("OffendingElementOrNil = nil, want tag")
+	}
+	if *parsed.OffendingElementOrNil != offending {
+		t.Fatalf("OffendingElementOrNil = %s, want %s", *parsed.OffendingElementOrNil, offending)
+	}
+	if got := parsed.FailedSOPInstanceUIDListOrNil; len(got) != 2 || got[0] != "1.2.3" || got[1] != "1.2.4" {
+		t.Fatalf("FailedSOPInstanceUIDListOrNil = %v, want [1.2.3 1.2.4]", got)
+	}
+}
+
+func TestParseCFindResponse_OptionalFailureFieldsAbsent(t *testing.T) {
+	rsp := CFindResponse{
+		AffectedSOPClassUID:       StudyRootFindSOPClassUID,
+		MessageIDBeingRespondedTo: 9,
+		Status:                    StatusSuccess,
+		CommandDataSetType:        NoDataSet,
+	}
+
+	parsed, err := ParseCFindResponse(object.FromElements(rsp.CommandSet(), nil))
+	if err != nil {
+		t.Fatalf("ParseCFindResponse: %v", err)
+	}
+	if parsed.OffendingElementOrNil != nil {
+		t.Fatalf("OffendingElementOrNil = %s, want nil", *parsed.OffendingElementOrNil)
+	}
+	if len(parsed.FailedSOPInstanceUIDListOrNil) != 0 {
+		t.Fatalf("FailedSOPInstanceUIDListOrNil = %v, want empty", parsed.FailedSOPInstanceUIDListOrNil)
+	}
+}
+
+func TestParseCFindResponseAllowsMissingAffectedSOPClassUID(t *testing.T) {
+	rsp := CFindResponse{
+		AffectedSOPClassUID:       StudyRootFindSOPClassUID,
+		MessageIDBeingRespondedTo: 9,
+		Status:                    StatusSuccess,
+		CommandDataSetType:        NoDataSet,
+	}
+	elements := rsp.CommandSet()
+	for i := range elements {
+		if elements[i].Header.Tag == AffectedSOPClassUID {
+			elements = append(elements[:i], elements[i+1:]...)
+			break
+		}
+	}
+	parsed, err := ParseCFindResponse(object.FromElements(elements, nil))
+	if err != nil {
+		t.Fatalf("ParseCFindResponse() error = %v", err)
+	}
+	if parsed.AffectedSOPClassUID != "" {
+		t.Fatalf("AffectedSOPClassUID = %q, want empty", parsed.AffectedSOPClassUID)
 	}
 }
 

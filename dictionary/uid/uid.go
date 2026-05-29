@@ -3,6 +3,8 @@ package uid
 import (
 	"fmt"
 	"strings"
+
+	"github.com/ThalesMMS/dicom-go/core"
 )
 
 // Type identifies the standard DICOM UID category from PS3.6 table A-1.
@@ -65,11 +67,8 @@ type Registry interface {
 }
 
 // NormalizeUID trims trailing spaces and NUL bytes from a DICOM UID.
-//
-// This intentionally duplicates the transfer package behavior so UID lookups do
-// not depend on transfer-specific code.
 func NormalizeUID(uid string) string {
-	return strings.TrimRight(uid, " \x00")
+	return core.NormalizeUID(uid)
 }
 
 // ParseType converts the standard PS3.6 type label into a Type.

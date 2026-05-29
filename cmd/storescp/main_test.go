@@ -7,6 +7,7 @@ import (
 	"flag"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -253,14 +254,14 @@ func TestSupportedTransferSyntaxUIDsIncludesNativeSyntaxes(t *testing.T) {
 
 func TestStorageSOPClassUIDsIncludesSecondaryCapture(t *testing.T) {
 	found := false
-	for _, uid := range storageSOPClassUIDs() {
+	for _, uid := range dimse.DefaultStorageSOPClassUIDs() {
 		if uid == "1.2.840.10008.5.1.4.1.1.7" {
 			found = true
 			break
 		}
 	}
 	if !found {
-		t.Fatal("storageSOPClassUIDs() missing Secondary Capture Image Storage")
+		t.Fatal("dimse.DefaultStorageSOPClassUIDs() missing Secondary Capture Image Storage")
 	}
 }
 
@@ -321,5 +322,76 @@ func TestHandleAssociationHandlesCEcho(t *testing.T) {
 	}
 	if err := <-serverDone; err != nil {
 		t.Fatalf("server error = %v", err)
+	}
+}
+
+func TestHandleAssociationAbortsUnsupportedDIMSECommand(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	listener, err := ul.Listen(ul.ListenOptions{Address: "127.0.0.1:0", Context: ctx})
+	if err != nil {
+		t.Fatalf("Listen() error = %v", err)
+	}
+	defer func() { _ = listener.Close() }()
+
+	outDir := t.TempDir()
+	stdout := &bytes.Buffer{}
+	serverDone := make(chan error, 1)
+	go func() {
+		assoc, err := listener.AcceptAssociation(ul.AcceptOptions{
+			AETitle:                   "STORESCP",
+			Context:                   ctx,
+			SupportedAbstractSyntaxes: acceptedAbstractSyntaxes(),
+			SupportedTransferSyntaxes: supportedTransferSyntaxUIDs(),
+		})
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		serverDone <- handleAssociation(assoc, outDir, stdout)
+	}()
+
+	assoc, err := ul.DialContext(ctx, listener.Addr().String(), ul.DialOptions{
+		CalledAETitle:  "STORESCP",
+		CallingAETitle: "FINDSCU",
+		Contexts: []ul.PresentationContext{{
+			AbstractSyntaxUID:  dimse.VerificationSOPClassUID,
+			TransferSyntaxUIDs: []string{transfer.ImplicitVRLittleEndian.UID},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("DialContext() error = %v", err)
+	}
+	pc, ok := dimse.AcceptedVerificationContext(assoc)
+	if !ok {
+		t.Fatal("AcceptedVerificationContext() = false")
+	}
+	if err := dimse.SendCommandSet(assoc, pc.ID, dimse.CFindRequest{
+		AffectedSOPClassUID: dimse.StudyRootFindSOPClassUID,
+		MessageID:           21,
+	}.CommandSet()); err != nil {
+		t.Fatalf("SendCommandSet(C-FIND-RQ) error = %v", err)
+	}
+	_, err = assoc.ReadPDU()
+	if !errors.Is(err, ul.ErrAssociationAborted) {
+		t.Fatalf("ReadPDU() error = %v, want ErrAssociationAborted", err)
+	}
+	var abortErr *ul.AbortError
+	if !errors.As(err, &abortErr) {
+		t.Fatalf("ReadPDU() error = %v, want *ul.AbortError", err)
+	}
+	if abortErr.Source != ul.AbortSourceServiceUser || abortErr.Reason != ul.AbortReasonNotSpecified {
+		t.Fatalf("abort = source %d reason %d, want %d/%d", abortErr.Source, abortErr.Reason, ul.AbortSourceServiceUser, ul.AbortReasonNotSpecified)
+	}
+	err = <-serverDone
+	if !errors.Is(err, errUnsupportedDIMSECommand) {
+		t.Fatalf("server error = %v, want errUnsupportedDIMSECommand", err)
+	}
+	if !strings.Contains(err.Error(), "C-FIND-RQ") {
+		t.Fatalf("server error = %q, want command name", err)
+	}
+	if !strings.Contains(stdout.String(), "storescp supports only C-ECHO-RQ and C-STORE-RQ") {
+		t.Fatalf("stdout = %q, want supported-command log", stdout.String())
 	}
 }

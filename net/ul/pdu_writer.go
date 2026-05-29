@@ -111,6 +111,9 @@ func writeAssociationRQ(buf *bytes.Buffer, rq *AssociationRQ) error {
 	if len(rq.PresentationContexts) == 0 {
 		return fmt.Errorf("%w: A-ASSOCIATE-RQ requires at least one presentation context", ErrInvalidPDU)
 	}
+	if err := validatePresentationContextIDsProposed(rq.PresentationContexts); err != nil {
+		return err
+	}
 	if rq.UserInfo == nil {
 		return fmt.Errorf("%w: A-ASSOCIATE-RQ requires a User Information item", ErrInvalidPDU)
 	}
@@ -135,6 +138,9 @@ func writeAssociationAC(buf *bytes.Buffer, ac *AssociationAC) error {
 	if len(ac.PresentationContexts) == 0 {
 		return fmt.Errorf("%w: A-ASSOCIATE-AC requires at least one presentation context", ErrInvalidPDU)
 	}
+	if err := validatePresentationContextIDsResult(ac.PresentationContexts); err != nil {
+		return err
+	}
 	if ac.UserInfo == nil {
 		return fmt.Errorf("%w: A-ASSOCIATE-AC requires a User Information item", ErrInvalidPDU)
 	}
@@ -150,6 +156,34 @@ func writeAssociationAC(buf *bytes.Buffer, ac *AssociationAC) error {
 		}
 	}
 	return writeUserInformation(buf, ac.UserInfo)
+}
+
+func validatePresentationContextIDsProposed(contexts []PresentationContextProposed) error {
+	if len(contexts) > MaxPresentationContexts {
+		return fmt.Errorf("%w: presentation context count %d exceeds %d", ErrInvalidPCID, len(contexts), MaxPresentationContexts)
+	}
+	seen := make(map[byte]bool, len(contexts))
+	for _, context := range contexts {
+		if !validPresentationContextID(context.ID) || seen[context.ID] {
+			return fmt.Errorf("%w: duplicate or invalid presentation context ID %d", ErrInvalidPCID, context.ID)
+		}
+		seen[context.ID] = true
+	}
+	return nil
+}
+
+func validatePresentationContextIDsResult(contexts []PresentationContextResult) error {
+	if len(contexts) > MaxPresentationContexts {
+		return fmt.Errorf("%w: presentation context count %d exceeds %d", ErrInvalidPCID, len(contexts), MaxPresentationContexts)
+	}
+	seen := make(map[byte]bool, len(contexts))
+	for _, context := range contexts {
+		if !validPresentationContextID(context.ID) || seen[context.ID] {
+			return fmt.Errorf("%w: duplicate or invalid presentation context ID %d", ErrInvalidPCID, context.ID)
+		}
+		seen[context.ID] = true
+	}
+	return nil
 }
 
 func writeAssociationFixed(buf *bytes.Buffer, protocolVersion uint16, calledAETitle, callingAETitle string) error {
@@ -245,7 +279,14 @@ func writePresentationContextResult(buf *bytes.Buffer, pc *PresentationContextRe
 
 func writeUserInformation(buf *bytes.Buffer, items []UserVariableItem) error {
 	var item bytes.Buffer
+	asyncSeen := false
 	for _, userItem := range items {
+		if _, ok := asAsynchronousOperationsWindow(userItem); ok {
+			if asyncSeen {
+				return fmt.Errorf("%w: duplicate asynchronous operations window", ErrInvalidUserItem)
+			}
+			asyncSeen = true
+		}
 		if err := writeUserVariableItem(&item, userItem); err != nil {
 			return err
 		}
@@ -270,14 +311,26 @@ func writeUserVariableItem(buf *bytes.Buffer, item UserVariableItem) error {
 		return writeImplementationVersionNameItem(buf, &it)
 	case *ImplementationVersionNameItem:
 		return writeImplementationVersionNameItem(buf, it)
+	case AsynchronousOperationsWindow:
+		return writeAsynchronousOperationsWindow(buf, &it)
+	case *AsynchronousOperationsWindow:
+		return writeAsynchronousOperationsWindow(buf, it)
 	case SopClassExtendedNegotiationItem:
 		return writeSopClassExtendedNegotiationItem(buf, &it)
 	case *SopClassExtendedNegotiationItem:
 		return writeSopClassExtendedNegotiationItem(buf, it)
+	case RoleSelectionItem:
+		return writeRoleSelectionItem(buf, &it)
+	case *RoleSelectionItem:
+		return writeRoleSelectionItem(buf, it)
 	case UserIdentityItem:
 		return writeUserIdentityItem(buf, &it)
 	case *UserIdentityItem:
 		return writeUserIdentityItem(buf, it)
+	case UserIdentityResponseItem:
+		return writeUserIdentityResponseItem(buf, &it)
+	case *UserIdentityResponseItem:
+		return writeUserIdentityResponseItem(buf, it)
 	case UnknownUserItem:
 		return writeItem(buf, it.Type, it.Data)
 	case *UnknownUserItem:
@@ -288,6 +341,21 @@ func writeUserVariableItem(buf *bytes.Buffer, item UserVariableItem) error {
 	default:
 		return fmt.Errorf("%w: %T", ErrInvalidUserItem, item)
 	}
+}
+
+func writeAsynchronousOperationsWindow(buf *bytes.Buffer, item *AsynchronousOperationsWindow) error {
+	if item == nil {
+		return fmt.Errorf("%w: nil *AsynchronousOperationsWindow", ErrInvalidUserItem)
+	}
+	var data bytes.Buffer
+	encoder := dicomenc.NewBasicEncoder(binary.BigEndian)
+	if err := encoder.WriteU16(&data, item.MaximumInvoked); err != nil {
+		return err
+	}
+	if err := encoder.WriteU16(&data, item.MaximumPerformed); err != nil {
+		return err
+	}
+	return writeItem(buf, SubItemAsynchronousOperations, data.Bytes())
 }
 
 func writeMaxLengthItem(buf *bytes.Buffer, item *MaxLengthItem) error {
@@ -328,6 +396,35 @@ func writeSopClassExtendedNegotiationItem(buf *bytes.Buffer, item *SopClassExten
 	return writeItem(buf, SubItemSopClassExtendedNegotiation, data.Bytes())
 }
 
+func writeRoleSelectionItem(buf *bytes.Buffer, item *RoleSelectionItem) error {
+	if item == nil {
+		return fmt.Errorf("%w: nil *RoleSelectionItem", ErrInvalidUserItem)
+	}
+	if item.SopClassUID == "" {
+		return fmt.Errorf("%w: SOP class UID", ErrMissingPDUField)
+	}
+	if len(item.SopClassUID) > math.MaxUint16 {
+		return fmt.Errorf("%w: SOP class UID length %d exceeds uint16", ErrLengthOverflow, len(item.SopClassUID))
+	}
+
+	var data bytes.Buffer
+	if err := dicomenc.NewBasicEncoder(binary.BigEndian).WriteU16(&data, uint16(len(item.SopClassUID))); err != nil {
+		return err
+	}
+	data.WriteString(item.SopClassUID)
+	if item.SCURole {
+		data.WriteByte(1)
+	} else {
+		data.WriteByte(0)
+	}
+	if item.SCPRole {
+		data.WriteByte(1)
+	} else {
+		data.WriteByte(0)
+	}
+	return writeItem(buf, SubItemRoleSelection, data.Bytes())
+}
+
 func writeUserIdentityItem(buf *bytes.Buffer, item *UserIdentityItem) error {
 	if item == nil {
 		return fmt.Errorf("%w: nil *UserIdentityItem", ErrInvalidUserItem)
@@ -347,6 +444,18 @@ func writeUserIdentityItem(buf *bytes.Buffer, item *UserIdentityItem) error {
 		return err
 	}
 	return writeItem(buf, SubItemUserIdentity, data.Bytes())
+}
+
+func writeUserIdentityResponseItem(buf *bytes.Buffer, item *UserIdentityResponseItem) error {
+	if item == nil {
+		return fmt.Errorf("%w: nil *UserIdentityResponseItem", ErrInvalidUserItem)
+	}
+
+	var data bytes.Buffer
+	if err := writeU16LengthBytes(&data, item.ServerResponse); err != nil {
+		return err
+	}
+	return writeItem(buf, SubItemUserIdentityResponse, data.Bytes())
 }
 
 func writePDataTF(buf *bytes.Buffer, pdata *PDataTF) error {

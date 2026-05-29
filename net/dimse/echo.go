@@ -5,8 +5,10 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"time"
 
 	"github.com/ThalesMMS/dicom-go/core"
+	"github.com/ThalesMMS/dicom-go/net/telemetry"
 	"github.com/ThalesMMS/dicom-go/net/ul"
 	"github.com/ThalesMMS/dicom-go/object"
 )
@@ -24,28 +26,60 @@ func AcceptedVerificationContext(assoc *ul.Association) (ul.AcceptedContext, boo
 }
 
 func SendCommandSet(assoc *ul.Association, pcID byte, elements []core.Element) error {
+	return SendCommandSetWithContext(nil, assoc, pcID, elements)
+}
+
+// SendCommandSetWithContext encodes and sends one command set while making all
+// fragmented P-DATA writes observe ctx.
+func SendCommandSetWithContext(ctx context.Context, assoc *ul.Association, pcID byte, elements []core.Element) error {
+	started := time.Now()
+	ctx = commandWriteContext(ctx)
 	data, err := EncodeCommandSet(elements)
 	if err != nil {
 		return err
 	}
-	writer := NewPDataWriter(assoc, pcID, true, peerMaxPDUWithHeader(assoc))
+	writer := NewPDataWriterWithContext(ctx, assoc, pcID, true, peerMaxPDUWithHeader(assoc))
 	if _, err := writer.Write(data); err != nil {
 		return err
 	}
-	return writer.Finish()
+	if err := writer.Finish(); err != nil {
+		return err
+	}
+	observeCommand(assoc, telemetry.Outbound, pcID, object.FromElements(elements, nil), time.Since(started))
+	return nil
 }
 
 func ReceiveCommandSet(assoc *ul.Association, pcID byte) (*object.Object, error) {
 	return receiveCommandSetWithContext(nil, assoc, pcID)
 }
 
+// ReceiveCommandSetAny reads the next command set from whichever presentation
+// context the peer uses and returns that context ID with the decoded command.
+// It is useful for DIMSE operations that can receive interleaved commands on
+// multiple presentation contexts, such as C-GET C-STORE-RSP and C-CANCEL-RQ.
+func ReceiveCommandSetAny(assoc *ul.Association) (byte, *object.Object, error) {
+	return ReceiveCommandSetAnyWithContext(nil, assoc)
+}
+
+// ReceiveCommandSetAnyWithContext is ReceiveCommandSetAny with a caller-supplied
+// receive context, useful for bounded polling of optional interleaved commands.
+func ReceiveCommandSetAnyWithContext(ctx context.Context, assoc *ul.Association) (byte, *object.Object, error) {
+	ctx = commandReadContext(ctx)
+	return receiveCommandSetAnyWithContext(ctx, assoc)
+}
+
 func receiveCommandSetWithContext(ctx context.Context, assoc *ul.Association, pcID byte) (*object.Object, error) {
+	ctx = commandReadContext(ctx)
 	reader := newTypedPDataReaderWithContext(ctx, assoc, pcID, true)
 	var data bytes.Buffer
 	if _, err := io.Copy(&data, reader); err != nil {
 		return nil, err
 	}
-	return DecodeCommandSet(data.Bytes())
+	command, err := DecodeCommandSet(data.Bytes())
+	if err == nil {
+		observeCommand(assoc, telemetry.Inbound, pcID, command, 0)
+	}
+	return command, err
 }
 
 type CEchoRequest struct {
@@ -104,24 +138,10 @@ func ParseCEchoResponse(obj *object.Object) (*CEchoResponse, error) {
 
 func SendCEcho(assoc *ul.Association, pcID byte, messageID uint16) (*CEchoResponse, error) {
 	req := CEchoRequest{MessageID: messageID}
-	data, err := EncodeCommandSet(req.CommandSet())
-	if err != nil {
+	if err := SendCommandSet(assoc, pcID, req.CommandSet()); err != nil {
 		return nil, err
 	}
-	writer := NewPDataWriter(assoc, pcID, true, peerMaxPDUWithHeader(assoc))
-	if _, err := writer.Write(data); err != nil {
-		return nil, err
-	}
-	if err := writer.Finish(); err != nil {
-		return nil, err
-	}
-
-	reader := newTypedPDataReader(assoc, pcID, true)
-	var responseData bytes.Buffer
-	if _, err := io.Copy(&responseData, reader); err != nil {
-		return nil, err
-	}
-	obj, err := DecodeCommandSet(responseData.Bytes())
+	obj, err := ReceiveCommandSet(assoc, pcID)
 	if err != nil {
 		return nil, err
 	}
@@ -181,16 +201,12 @@ func ReceiveCEcho(assoc *ul.Association, pcID byte) (uint16, error) {
 }
 
 func SendCEchoResponse(assoc *ul.Association, pcID byte, messageID uint16, status uint16) error {
+	return SendCEchoResponseWithContext(nil, assoc, pcID, messageID, status)
+}
+
+func SendCEchoResponseWithContext(ctx context.Context, assoc *ul.Association, pcID byte, messageID uint16, status uint16) error {
 	resp := CEchoResponse{MessageIDBeingRespondedTo: messageID, Status: status}
-	data, err := EncodeCommandSet(resp.CommandSet())
-	if err != nil {
-		return err
-	}
-	writer := NewPDataWriter(assoc, pcID, true, peerMaxPDUWithHeader(assoc))
-	if _, err := writer.Write(data); err != nil {
-		return err
-	}
-	return writer.Finish()
+	return SendCommandSetWithContext(ctx, assoc, pcID, resp.CommandSet())
 }
 
 func HandleCEcho(assoc *ul.Association) error {
@@ -206,11 +222,9 @@ func HandleCEcho(assoc *ul.Association) error {
 }
 
 func peerMaxPDUWithHeader(assoc *ul.Association) int {
-	if assoc == nil || assoc.PeerMaxPDU == 0 {
-		return int(ul.DefaultMaxPDU + ul.PDUHeaderSize)
+	maxPDU := ul.DefaultMaxPDU
+	if assoc != nil && assoc.PeerMaxPDU > 0 && assoc.PeerMaxPDU < maxPDU {
+		maxPDU = assoc.PeerMaxPDU
 	}
-	if assoc.PeerMaxPDU > ^uint32(0)-ul.PDUHeaderSize {
-		return int(^uint32(0))
-	}
-	return int(assoc.PeerMaxPDU + ul.PDUHeaderSize)
+	return int(maxPDU + ul.PDUHeaderSize)
 }

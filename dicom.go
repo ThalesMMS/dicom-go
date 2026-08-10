@@ -1,6 +1,7 @@
 package dicom
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -9,6 +10,7 @@ import (
 	dicomenc "github.com/ThalesMMS/dicom-go/encoding"
 	"github.com/ThalesMMS/dicom-go/object"
 	"github.com/ThalesMMS/dicom-go/transfer"
+	"github.com/ThalesMMS/dicom-go/validation"
 )
 
 type File = object.File
@@ -16,10 +18,52 @@ type Object = object.Object
 type Dataset = core.DataSet
 type Element = core.Element
 type ReadFileOptions = object.ReadFileOptions
+type WriteFileOptions = object.WriteFileOptions
+type TransferSyntaxRecoveryOptions = object.TransferSyntaxRecoveryOptions
+type TransferSyntaxResolution = object.TransferSyntaxResolution
+type TransferSyntaxResolutionSource = object.TransferSyntaxResolutionSource
 type Frame = object.Frame
 type FrameMetadata = object.FrameMetadata
 type FrameSink = object.FrameSink
+type ValidationOptions = validation.Options
+type ValidationReport = validation.Report
+type ValidationResult = validation.Result
+type ValidationMode = validation.Mode
+type ValidationFinding = validation.Finding
+type ValidationHookPoint = validation.HookPoint
+type ValidationHookEvent = validation.HookEvent
+type ValidationHookDecision = validation.HookDecision
+type ValidationHookRegistration = validation.HookRegistration
+type ValidationHookChain = validation.HookChain
+type DataSetRuleRegistration = validation.DataSetRuleRegistration
+type WriteValidationResult = object.WriteValidationResult
+type WriteValidationError = object.WriteValidationError
 type ParseOption func(*ReadFileOptions)
+
+const (
+	ValidationModePreserve = validation.ModePreserve
+	ValidationModeWarn     = validation.ModeWarn
+	ValidationModeStrict   = validation.ModeStrict
+
+	TransferSyntaxSourceDeclared                = object.TransferSyntaxSourceDeclared
+	TransferSyntaxSourceDeclaredMissingPreamble = object.TransferSyntaxSourceDeclaredMissingPreamble
+	TransferSyntaxSourceInferredRawDataSet      = object.TransferSyntaxSourceInferredRawDataSet
+	TransferSyntaxSourceInferredMissingPreamble = object.TransferSyntaxSourceInferredMissingPreamble
+	TransferSyntaxSourceInferredMissingFileMeta = object.TransferSyntaxSourceInferredMissingFileMeta
+	TransferSyntaxSourceInferredMissingUID      = object.TransferSyntaxSourceInferredMissingUID
+	TransferSyntaxSourceInferredUnknownUID      = object.TransferSyntaxSourceInferredUnknownUID
+	TransferSyntaxSourceRecoveredMismatch       = object.TransferSyntaxSourceRecoveredMismatch
+)
+
+var ErrValidationFailed = validation.ErrValidationFailed
+
+func NewValidationHookChain(registrations ...ValidationHookRegistration) (*ValidationHookChain, error) {
+	return validation.NewHookChain(registrations...)
+}
+
+func ValidateDataSet(ctx context.Context, dataset Dataset, opts ValidationOptions) (ValidationResult, error) {
+	return validation.ValidateDataSet(ctx, dataset, opts)
+}
 
 var ErrFrameChannelUnsupported = errors.New("dicom: unsupported compatibility Parse frame channel")
 
@@ -74,8 +118,16 @@ func OpenFileWithOptions(path string, opts ReadFileOptions) (*File, error) {
 	return object.OpenFileWithOptions(path, opts)
 }
 
+func OpenFileWithTransferSyntaxRecovery(path string, opts ReadFileOptions, recovery TransferSyntaxRecoveryOptions) (*File, TransferSyntaxResolution, error) {
+	return object.OpenFileWithTransferSyntaxRecovery(path, opts, recovery)
+}
+
 func ReadFileWithOptions(r io.Reader, opts ReadFileOptions) (*File, error) {
 	return object.ReadFileWithOptions(r, opts)
+}
+
+func ReadFileWithTransferSyntaxRecovery(r io.Reader, opts ReadFileOptions, recovery TransferSyntaxRecoveryOptions) (*File, TransferSyntaxResolution, error) {
+	return object.ReadFileWithTransferSyntaxRecovery(r, opts, recovery)
 }
 
 // Parse reads a Part 10 stream through the compatibility facade. frameChan may
@@ -136,12 +188,44 @@ func ReadDataSetWithOptions(r io.Reader, syntax transfer.Syntax, opts ReadFileOp
 	return object.ReadDataSetWithOptions(r, syntax, opts)
 }
 
+func ReadDataSetWithTransferSyntaxRecovery(r io.Reader, opts ReadFileOptions, recovery TransferSyntaxRecoveryOptions) (*Object, TransferSyntaxResolution, error) {
+	return object.ReadDataSetWithTransferSyntaxRecovery(r, opts, recovery)
+}
+
 func OpenDataSet(path string, syntax transfer.Syntax) (*Object, error) {
 	return object.OpenDataSet(path, syntax)
 }
 
 func OpenDataSetWithOptions(path string, syntax transfer.Syntax, opts ReadFileOptions) (*Object, error) {
 	return object.OpenDataSetWithOptions(path, syntax, opts)
+}
+
+func OpenDataSetWithTransferSyntaxRecovery(path string, opts ReadFileOptions, recovery TransferSyntaxRecoveryOptions) (*Object, TransferSyntaxResolution, error) {
+	return object.OpenDataSetWithTransferSyntaxRecovery(path, opts, recovery)
+}
+
+func ReadDataSetWithValidation(ctx context.Context, r io.Reader, syntax transfer.Syntax, readOpts ReadFileOptions, validationOpts ValidationOptions) (*Object, ValidationReport, error) {
+	return object.ReadDataSetWithValidation(ctx, r, syntax, readOpts, validationOpts)
+}
+
+func OpenDataSetWithValidation(ctx context.Context, path string, syntax transfer.Syntax, readOpts ReadFileOptions, validationOpts ValidationOptions) (*Object, ValidationReport, error) {
+	return object.OpenDataSetWithValidation(ctx, path, syntax, readOpts, validationOpts)
+}
+
+func WriteFile(w io.Writer, file *File) error {
+	return object.WriteFile(w, file)
+}
+
+func WriteFileWithOptions(w io.Writer, file *File, opts WriteFileOptions) error {
+	return object.WriteFileWithOptions(w, file, opts)
+}
+
+func WriteDataSet(w io.Writer, obj *Object, syntax transfer.Syntax) error {
+	return object.WriteDataSet(w, obj, syntax)
+}
+
+func WriteDataSetWithValidation(ctx context.Context, w io.Writer, obj *Object, syntax transfer.Syntax, opts ValidationOptions) (WriteValidationResult, error) {
+	return object.WriteDataSetWithValidation(ctx, w, obj, syntax, opts)
 }
 
 func parseReadFileOptions(opts []ParseOption) ReadFileOptions {

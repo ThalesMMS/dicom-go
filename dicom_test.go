@@ -2,6 +2,7 @@ package dicom
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -31,6 +32,26 @@ func TestReadFileWithOptionsDelegatesToObjectLayer(t *testing.T) {
 	}
 	if !errors.Is(err, parser.ErrMaxElementBytesExceeded) {
 		t.Fatalf("expected ErrMaxElementBytesExceeded, got %v", err)
+	}
+}
+
+func TestValidationFacadeReadsAndWritesRawDataSet(t *testing.T) {
+	tag := core.NewTag(0x0010, 0x0020)
+	var encoded bytes.Buffer
+	if err := parser.NewWriter(&encoded, transfer.ExplicitVRLittleEndian).WriteElement(core.NewRawElement(tag, core.VRLO, []byte("IDENTIFIER"))); err != nil {
+		t.Fatal(err)
+	}
+	obj, report, err := ReadDataSetWithValidation(context.Background(), bytes.NewReader(encoded.Bytes()), transfer.ExplicitVRLittleEndian, ReadFileOptions{}, ValidationOptions{Mode: ValidationModePreserve})
+	if err != nil || len(report.Findings) != 0 {
+		t.Fatalf("ReadDataSetWithValidation report=%#v err=%v", report, err)
+	}
+	var output bytes.Buffer
+	writeResult, err := WriteDataSetWithValidation(context.Background(), &output, obj, transfer.ExplicitVRLittleEndian, ValidationOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !writeResult.Complete || !bytes.Equal(output.Bytes(), encoded.Bytes()) {
+		t.Fatalf("write result=%#v\nwant=% x\ngot=% x", writeResult, encoded.Bytes(), output.Bytes())
 	}
 }
 

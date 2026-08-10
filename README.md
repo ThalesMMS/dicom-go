@@ -7,7 +7,7 @@ types and explicit registries. The `v0.1.0` release provides a practical subset
 for reading and writing Part 10 files, converting datasets to/from DICOM JSON,
 extracting pixel data, running reusable DIMSE network workflows, defining the
 DICOMweb client/protocol boundary, and using headless clinical-viewer primitives
-such as rendering, ROI, DICOMDIR reference resolution and small
+such as rendering, ROI, DICOM file-set reading/authoring and
 de-identification helpers.
 
 This project does not claim full DICOM conformance. See
@@ -191,6 +191,15 @@ err := file.Dataset.ValidateSOPClass(object.ValidationOptions{
 The library provides hooks and small helpers only; it does not ship a complete
 SOP Class conformance rule set.
 
+### Uniform Validation and Lifecycle Hooks
+
+The `validation` package adds explicitly opt-in VR/VM, dictionary, dataset and
+File Meta validation plus parser/writer lifecycle hooks. Existing read/write
+APIs remain unchanged and do not enable these checks automatically. Reports are
+bounded and omit element values; hook callbacks are trusted in-process code.
+See [`docs/VALIDATION.md`](./docs/VALIDATION.md) for modes, hook actions,
+streaming behavior and performance gates.
+
 ### Pixel Data
 
 Native uncompressed frame extraction:
@@ -306,8 +315,9 @@ Examples: [`examples/pixeldata`](./examples/pixeldata) and
 
 Small reusable utilities are exposed as public packages:
 
-- `dicomdir` extracts and resolves referenced file paths from DICOMDIR media
-  indexes.
+- `dicomdir` extracts existing DICOMDIR references and builds, validates,
+  queries, and transactionally writes bounded DICOM file-sets. See
+  [`docs/DICOM_FILE_SETS.md`](./docs/DICOM_FILE_SETS.md).
 - `deid` applies a small in-place anonymization subset for common patient tags,
   recursive sequence items, policy-driven private tags, hierarchy UID remapping
   and burned-in pixel risk reporting.
@@ -387,7 +397,14 @@ Inspect files:
 go run ./cmd/dcmdump image.dcm
 go run ./cmd/dcmdump -show-offsets image.dcm
 go run ./cmd/dcmdump -json image.dcm
+go run ./cmd/dcmdump -recover-transfer-syntax legacy-or-raw.dcm
 ```
+
+Transfer Syntax recovery is disabled by default. The recovery flag and the
+dedicated library APIs use bounded inference, report confidence and candidate
+diagnostics, and never enable recovery in network ingestion paths. See
+[`docs/TRANSFER_SYNTAX_RECOVERY.md`](docs/TRANSFER_SYNTAX_RECOVERY.md) for the
+policy and resource-bound contracts.
 
 Verification:
 
@@ -404,7 +421,7 @@ Storage:
 
 ```sh
 go run ./cmd/storescp -- -address 127.0.0.1:11112 -output ./received
-go run ./cmd/storescu -- 127.0.0.1:11112 image.dcm
+go run ./cmd/storescu -- 127.0.0.1:11112 image.dcm another.dcm directory/
 ```
 
 `storescp` serves C-STORE and C-ECHO verification only. Other DIMSE commands
@@ -537,9 +554,16 @@ provided via `cmd/findscu` and `cmd/dicom-go-retrieve`.
 - Optional JPEG Baseline and RLE Lossless pixel codecs.
 - DICOM UL association negotiation over plain TCP, with optional TLS configured
   by callers.
+- Framework-neutral safe network telemetry, opaque association IDs, bounded raw
+  P-DATA capture, progress-based phase timeouts, and a pre-negotiation bounded
+  association server. See
+  [network observability and operational controls](./docs/NETWORK_OBSERVABILITY.md).
 - Minimal DIMSE C-ECHO, C-STORE, Study Root C-FIND (SCU/SCP),
   Study Root C-MOVE (SCU/SCP workflow helpers) and Study/Patient Root
   Query/Retrieve model helper primitives.
+- Generic typed DIMSE-N command models, SCU methods and SCP handlers for
+  N-EVENT-REPORT, N-GET, N-SET, N-ACTION, N-CREATE and N-DELETE. The existing
+  Storage Commitment API remains available as a service-specific adapter.
 - DICOMweb is a library responsibility: reusable QIDO-RS, WADO-RS and STOW-RS
   request/response helpers belong here rather than in application backends. The
   `net/dicomweb` package boundary/scaffold exists, while full Twin migration is
@@ -569,7 +593,9 @@ Not implemented / out of scope in `v0.1.0`:
   for complete JPEG 2000/HTJ2K responses when the corresponding optional codec
   is registered.
 - Security/auditing profiles.
-- Many DIMSE services.
+- Service-class workflows built on DIMSE-N, including MPPS, UPS and Print
+  Management. The generic protocol layer is present, but applications still
+  own the service-specific datasets, state machines and negotiation policy.
 - A complete reusable DICOMweb client/helper surface. Applications may still have
   temporary adapters, but protocol semantics should move here instead of becoming
   permanent application-owned networking code.
@@ -590,15 +616,29 @@ Networking cautions:
   in-memory transaction tracker, event/action dataset helpers and a minimal
   single-request SCP API. It is not a production service with persistence,
   retries or audit integration.
+- Generic N-service operations use `dimse.NormalizedClient` and
+  `dimse.NormalizedSCPOptions`. They preserve optional command status fields,
+  enforce one outstanding operation per association and require an explicit
+  presentation-context policy when a Meta SOP Class abstract syntax differs
+  from the command SOP Class UID.
 - DICOMweb helpers should cover reusable QIDO-RS, WADO-RS and STOW-RS protocol
   behavior. Application code owns node stores, URL/profile configuration,
   credential retrieval, retry policy, job progress, archive integration,
   receiver policy, operation history, UI summaries and auto-query.
-- Current DIMSE helpers assume **one outstanding operation per association**.
-  They do not negotiate asynchronous operation windows, multiplex independent
-  operations or retry DIMSE commands automatically. Bounded SCP worker queues
-  are available through `dimse.ServiceQueue` and the `echoscp` queue flags;
-  larger service workflows still need to wire those controls explicitly.
+- Legacy DIMSE helpers assume **one outstanding operation per association**.
+  `ul` can negotiate Asynchronous Operations Window and the explicit
+  `dimse.AsyncSession` API multiplexes C-ECHO, C-STORE, C-FIND, C-MOVE, C-GET
+  and N-DIMSE under one sole receive owner. It remains opt-in; ordinary helpers
+  stay synchronous, and commands are not retried automatically. See
+  [`docs/ASYNCHRONOUS_OPERATIONS.md`](docs/ASYNCHRONOUS_OPERATIONS.md).
+- `ul.AssociationServer` bounds silent negotiations plus active handlers before
+  goroutines are created. `dimse.SCPControls` supplies command/dataset progress,
+  operation and cancel-grace policy without turning a slow active transfer into
+  an absolute deadline.
+- High-level `net/telemetry` events omit endpoints, payloads, identifiers and
+  credentials by default. Raw P-DATA capture is a separate explicit PHI-bearing
+  sink with mandatory byte budgets; A-ASSOCIATE/User Identity bytes are never
+  captured.
 - TLS transport is opt-in at the UL library boundary through
   `ul.DialOptions.TLSConfig` and `ul.AcceptOptions.TLSConfig`. Plain TCP remains
   the default and the CLIs do not expose TLS flags yet.
@@ -633,7 +673,7 @@ untrusted files, large studies, or production network peers.
 | `pixeldata/rle` | Optional pure Go RLE Lossless decoder. |
 | `net/ul` | DICOM Upper Layer PDU codec and association negotiation. |
 | `net/audit` | Optional structured audit event model for network service wrappers. |
-| `net/dimse` | Minimal C-ECHO, C-STORE, C-FIND, C-MOVE and Storage Commitment command/data helpers. |
+| `net/dimse` | C-ECHO, C-STORE, Query/Retrieve helpers, all six generic normalized DIMSE services, and Storage Commitment adapters. |
 | `net/dicomweb` | Package boundary/scaffold for reusable QIDO-RS, WADO-RS and STOW-RS helpers; full Twin migration remains tracked by #126-#130. |
 | `cmd/*` | Runnable command line tools. |
 | `examples/*` | Runnable examples by feature area. |

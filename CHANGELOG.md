@@ -9,6 +9,22 @@ and this project uses Go module semantic version tags.
 
 ### Added
 
+- `dicomdir`: bounded IMAGE file-set scan, validation, query/statistics,
+  deterministic two-pass DICOMDIR authoring, strict portable File IDs,
+  source revalidation, and atomic root publication with pydicom interop.
+- `net/telemetry` and `net/ul`: opaque stable association IDs, safe structured
+  UL/DIMSE lifecycle and command events, explicit endpoint HMAC policy, bounded
+  opt-in raw P-DATA capture, atomic metrics, progress-based timeouts and a
+  pre-negotiation bounded association server with graceful deadline shutdown.
+- `net/dimse`: phase-specific `SCPControls`, panic/cancel-safe service queues,
+  cancel grace for cooperative handlers, and correlated operation durations and
+  status categories for C- and N-services.
+- `net/dimse`: generic typed N-EVENT-REPORT, N-GET, N-SET, N-ACTION,
+  N-CREATE and N-DELETE request/response models, context-aware SCU operations,
+  shared-dispatch SCP handlers, preserved status-detail fields and opt-in
+  bidirectional MPPS interoperability tests against pynetdicom.
+- `examples/ndimse`: a synthetic in-memory N-GET exchange demonstrating the
+  generic normalized SCU and SCP APIs.
 - `video`: bounded, context-aware inspection and streaming extraction for DICOM
   MPEG, H.264, and HEVC transfer syntaxes, including fragment/container
   validation and deterministic frame timing metadata for application-owned
@@ -54,6 +70,9 @@ and this project uses Go module semantic version tags.
 
 ### Changed
 
+- `net/dicomweb`: `Client.InstanceMetadata` now returns the raw DICOM JSON
+  metadata datasets for one instance; callers that need an `InstanceRef` must
+  obtain it from the returned dataset rather than receiving a projected value.
 - `net/dicomweb`: `TokenManager.Logout` is terminal. Subsequent `Token` calls
   return `ErrBearerTokenUnavailable` and cannot reacquire credentials; callers
   must construct a new manager to authenticate again.

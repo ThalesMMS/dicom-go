@@ -181,11 +181,11 @@ func (Empty) ByKeyword(string) (Entry, bool) { return Entry{}, false }
 // Unknown tags, private tags without dictionary coverage, missing dictionaries,
 // and entries without an exact VR all fall back to UN. In practice this means
 // implicit-VR parsing preserves defined-length values as opaque raw bytes
-// instead of guessing a VR heuristically. Private dictionary support is
-// intentionally out of scope for the standard dictionary package, so odd-group
-// private tags typically reach this fallback unless callers inject a custom
-// DataDictionary. Use Chain to layer private dictionaries before the standard
-// dictionary without losing standard fallback coverage.
+// instead of guessing a VR heuristically. This tag-only function cannot resolve
+// dynamically reserved private blocks. Readers with a PrivateDataDictionary use
+// LookupScopedEntry and a separate reservation scope for each dataset/item.
+// Use Chain to compose PrivateCatalog with the standard dictionary and ordinary
+// absolute-tag overlays in the desired precedence.
 func LookupVR(dict DataDictionary, tag core.Tag) core.VR {
 	if dict == nil {
 		return core.VRUN

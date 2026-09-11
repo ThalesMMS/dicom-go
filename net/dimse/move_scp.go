@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 
 	"github.com/ThalesMMS/dicom-go/core"
 	"github.com/ThalesMMS/dicom-go/net/ul"
@@ -12,7 +13,10 @@ import (
 	"github.com/ThalesMMS/dicom-go/transfer"
 )
 
-var ErrCMoveCanceled = errors.New("dicom dimse: C-MOVE canceled")
+var (
+	ErrCMoveCanceled      = errors.New("dicom dimse: C-MOVE canceled")
+	ErrCMoveBatchContract = errors.New("dicom dimse: invalid C-MOVE batch contract")
+)
 
 const maxCMoveSubOperations = 1<<16 - 1
 
@@ -39,10 +43,35 @@ type CMoveSubOperationResult struct {
 	Err    error
 }
 
+// CMoveSubOperationDescriptor identifies one storage sub-operation without
+// prescribing how it is sent. Descriptors are yielded in declaration order.
+type CMoveSubOperationDescriptor struct {
+	AffectedSOPClassUID    string
+	AffectedSOPInstanceUID string
+}
+
+// CMoveBatch describes storage sub-operations that a handler executes as one
+// batch, for example through a reusable C-STORE association. Run must call
+// yield synchronously exactly once for each descriptor, in declaration order,
+// and stop when yield returns an error. The SCP copies SubOperations before
+// Run starts. The context is canceled on C-CANCEL.
+type CMoveBatch struct {
+	SubOperations []CMoveSubOperationDescriptor
+	Run           func(context.Context, func(CMoveSubOperationResult) error) error
+}
+
 // CMoveHandler resolves matching instances for a C-MOVE request and returns
 // storage sub-operations that deliver them to the requested Move Destination.
 type CMoveHandler interface {
 	Move(context.Context, CMoveRequestContext) ([]CMoveSubOperation, error)
+}
+
+// CMoveBatchHandler optionally lets a C-MOVE handler execute all storage
+// sub-operations through one batch-owned session. Existing CMoveHandler
+// implementations continue to use Move unchanged.
+type CMoveBatchHandler interface {
+	CMoveHandler
+	PrepareCMoveBatch(context.Context, CMoveRequestContext) (CMoveBatch, error)
 }
 
 // CMoveHandlerFunc adapts a function to CMoveHandler.
@@ -183,14 +212,23 @@ func serveCMoveCommand(ctx context.Context, assoc *ul.Association, pcID byte, co
 	monitor := startSCPCancelMonitor(ctx, assoc, pcID, req.MessageID, ErrCMoveCanceled, false)
 	defer monitor.Stop()
 	operationCtx := monitor.Context()
+	requestContext := CMoveRequestContext{
+		Request:               *req,
+		Identifier:            identifier,
+		QueryRetrieveLevel:    level,
+		PresentationContextID: pcID,
+		IdentifierSyntax:      syntax,
+	}
 	counts, err := runSCPHandler(operationCtx, assoc, scpControlsFromContext(ctx).CancelGrace, func(handlerCtx context.Context) (cMoveSubOperationCounts, error) {
-		ops, handlerErr := handler.Move(handlerCtx, CMoveRequestContext{
-			Request:               *req,
-			Identifier:            identifier,
-			QueryRetrieveLevel:    level,
-			PresentationContextID: pcID,
-			IdentifierSyntax:      syntax,
-		})
+		if batchHandler, ok := handler.(CMoveBatchHandler); ok {
+			batch, handlerErr := batchHandler.PrepareCMoveBatch(handlerCtx, requestContext)
+			if handlerErr != nil {
+				return cMoveSubOperationCounts{}, handlerErr
+			}
+			return runCMoveBatch(handlerCtx, ctx, assoc, pcID, *req, model.SOPClassUID, monitor, batch)
+		}
+
+		ops, handlerErr := handler.Move(handlerCtx, requestContext)
 		if handlerErr != nil {
 			return cMoveSubOperationCounts{}, handlerErr
 		}
@@ -232,6 +270,73 @@ func serveCMoveCommand(ctx context.Context, assoc *ul.Association, pcID byte, co
 		status = StatusCMoveSubOperationsCompleteOneOrMoreFailures
 	}
 	return sendCMoveResponse(ctx, assoc, pcID, *req, model.SOPClassUID, status, "", counts)
+}
+
+func runCMoveBatch(handlerCtx, responseCtx context.Context, assoc *ul.Association, pcID byte, req CMoveRequest, sopClassUID string, monitor *scpCancelMonitor, batch CMoveBatch) (cMoveSubOperationCounts, error) {
+	descriptors := append([]CMoveSubOperationDescriptor(nil), batch.SubOperations...)
+	if err := validateCMoveBatch(descriptors, batch.Run); err != nil {
+		return cMoveSubOperationCounts{}, err
+	}
+
+	counts := cMoveSubOperationCounts{remaining: uint16(len(descriptors))}
+	var mu sync.Mutex
+	yielded := 0
+	closed := false
+	var yieldErr error
+	yield := func(result CMoveSubOperationResult) error {
+		mu.Lock()
+		defer mu.Unlock()
+		if yieldErr != nil {
+			return yieldErr
+		}
+		if closed {
+			yieldErr = fmt.Errorf("%w: yield called after Run returned", ErrCMoveBatchContract)
+			return yieldErr
+		}
+		if operationErr := monitor.OperationError(); operationErr != nil {
+			yieldErr = operationErr
+			return yieldErr
+		}
+		if yielded >= len(descriptors) {
+			yieldErr = fmt.Errorf("%w: yielded more than %d sub-operations", ErrCMoveBatchContract, len(descriptors))
+			return yieldErr
+		}
+		if errors.Is(result.Err, ErrCMoveCanceled) || errors.Is(result.Err, context.Canceled) {
+			yieldErr = result.Err
+			return yieldErr
+		}
+
+		counts.remaining--
+		countCMoveSubOperationResult(&counts, result)
+		yielded++
+		if operationErr := monitor.OperationError(); operationErr != nil {
+			yieldErr = operationErr
+			return yieldErr
+		}
+		if yielded < len(descriptors) {
+			if err := sendCMoveResponse(responseCtx, assoc, pcID, req, sopClassUID, StatusPending, "", counts); err != nil {
+				yieldErr = err
+				return yieldErr
+			}
+		}
+		return nil
+	}
+
+	runErr := batch.Run(handlerCtx, yield)
+	mu.Lock()
+	closed = true
+	resultCounts := counts
+	resultYielded := yielded
+	resultYieldErr := yieldErr
+	mu.Unlock()
+
+	operationErr := monitor.OperationError()
+	err := errors.Join(runErr, resultYieldErr, operationErr)
+	interrupted := errors.Is(err, ErrCMoveCanceled) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+	if !interrupted && resultYieldErr == nil && resultYielded != len(descriptors) {
+		err = errors.Join(err, fmt.Errorf("%w: Run yielded %d of %d sub-operations", ErrCMoveBatchContract, resultYielded, len(descriptors)))
+	}
+	return resultCounts, err
 }
 
 func sendCMoveOperationError(ctx context.Context, assoc *ul.Association, pcID byte, req CMoveRequest, sopClassUID string, counts cMoveSubOperationCounts, err error) error {
@@ -313,6 +418,24 @@ func validateCMoveSubOperations(ops []CMoveSubOperation) error {
 		}
 		if op.Store == nil {
 			return fmt.Errorf("dicom dimse: C-MOVE sub-operation %d missing Store callback", i)
+		}
+	}
+	return nil
+}
+
+func validateCMoveBatch(descriptors []CMoveSubOperationDescriptor, run func(context.Context, func(CMoveSubOperationResult) error) error) error {
+	if len(descriptors) > maxCMoveSubOperations {
+		return fmt.Errorf("%w: too many sub-operations: %d exceeds %d", ErrCMoveBatchContract, len(descriptors), maxCMoveSubOperations)
+	}
+	if run == nil {
+		return fmt.Errorf("%w: missing Run callback", ErrCMoveBatchContract)
+	}
+	for i, descriptor := range descriptors {
+		if !core.IsValidUID(descriptor.AffectedSOPClassUID) {
+			return fmt.Errorf("%w: sub-operation %d has invalid Affected SOP Class UID", ErrCMoveBatchContract, i)
+		}
+		if !core.IsValidUID(descriptor.AffectedSOPInstanceUID) {
+			return fmt.Errorf("%w: sub-operation %d has invalid Affected SOP Instance UID", ErrCMoveBatchContract, i)
 		}
 	}
 	return nil

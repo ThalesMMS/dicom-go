@@ -28,7 +28,13 @@ type CGetRequestContext struct {
 type CGetSubOperation struct {
 	AffectedSOPClassUID    string
 	AffectedSOPInstanceUID string
-	LoadDataSet            func(context.Context) (*object.Object, error)
+	// TransferSyntaxUIDs optionally constrains presentation context selection
+	// for this C-STORE sub-operation. Empty preserves the StoreClient default.
+	TransferSyntaxUIDs []string
+	// MessageID optionally overrides the generated per-sub-operation Message ID.
+	// Zero preserves the generated default.
+	MessageID   uint16
+	LoadDataSet func(context.Context) (*object.Object, error)
 }
 
 // CGetSubOperationResult reports the final status of one same-association
@@ -55,9 +61,10 @@ func (f CGetHandlerFunc) Get(ctx context.Context, req CGetRequestContext) ([]CGe
 
 // CGetSCPError lets handlers choose a final C-GET status and Error Comment.
 type CGetSCPError struct {
-	Status       uint16
-	ErrorComment string
-	Err          error
+	Status              uint16
+	ErrorComment        string
+	FailedSuboperations uint16
+	Err                 error
 }
 
 func NewCGetSCPError(status uint16, comment string, err error) *CGetSCPError {
@@ -94,6 +101,11 @@ func ServeStudyRootCGet(ctx context.Context, assoc *ul.Association, pcID byte, h
 	if handler == nil {
 		return fmt.Errorf("dicom dimse: nil C-GET handler")
 	}
+	releaseOperation, err := beginAssociationOperation(assoc)
+	if err != nil {
+		return err
+	}
+	defer releaseOperation()
 	command, err := ReceiveCommandSet(assoc, pcID)
 	if err != nil {
 		return err
@@ -108,6 +120,11 @@ func ServePatientRootCGet(ctx context.Context, assoc *ul.Association, pcID byte,
 	if handler == nil {
 		return fmt.Errorf("dicom dimse: nil C-GET handler")
 	}
+	releaseOperation, err := beginAssociationOperation(assoc)
+	if err != nil {
+		return err
+	}
+	defer releaseOperation()
 	command, err := ReceiveCommandSet(assoc, pcID)
 	if err != nil {
 		return err
@@ -170,6 +187,7 @@ func serveCGetCommand(ctx context.Context, assoc *ul.Association, pcID byte, com
 	monitor := startSCPCancelMonitor(ctx, assoc, pcID, req.MessageID, ErrCGetCanceled, true)
 	defer monitor.Stop()
 	operationCtx := monitor.Context()
+	finalComment := ""
 	counts, err := runSCPHandler(operationCtx, assoc, scpControlsFromContext(ctx).CancelGrace, func(handlerCtx context.Context) (cMoveSubOperationCounts, error) {
 		ops, handlerErr := handler.Get(handlerCtx, CGetRequestContext{
 			Request:               *req,
@@ -179,7 +197,12 @@ func serveCGetCommand(ctx context.Context, assoc *ul.Association, pcID byte, com
 			IdentifierSyntax:      syntax,
 		})
 		if handlerErr != nil {
-			return cMoveSubOperationCounts{}, handlerErr
+			counts := cMoveSubOperationCounts{}
+			var statusErr *CGetSCPError
+			if errors.As(handlerErr, &statusErr) && statusErr != nil {
+				counts.failed = statusErr.FailedSuboperations
+			}
+			return counts, handlerErr
 		}
 		if validationErr := validateCGetSubOperations(assoc, ops); validationErr != nil {
 			return cMoveSubOperationCounts{}, validationErr
@@ -197,6 +220,9 @@ func serveCGetCommand(ctx context.Context, assoc *ul.Association, pcID byte, com
 			result := runCGetSubOperation(handlerCtx, ctx, client, monitor, op, uint16(i+1), req.Priority)
 			if errors.Is(result.Err, ErrCGetCanceled) || errors.Is(result.Err, context.Canceled) {
 				return counts, result.Err
+			}
+			if result.Err != nil {
+				finalComment = result.Err.Error()
 			}
 			counts.remaining--
 			countCGetSubOperationResult(&counts, result, op.AffectedSOPInstanceUID)
@@ -222,7 +248,7 @@ func serveCGetCommand(ctx context.Context, assoc *ul.Association, pcID byte, com
 	if counts.failed > 0 || counts.warning > 0 {
 		status = StatusCGetSubOperationsCompleteOneOrMoreFailures
 	}
-	return sendCGetResponse(ctx, assoc, pcID, *req, model.SOPClassUID, status, "", counts)
+	return sendCGetResponse(ctx, assoc, pcID, *req, model.SOPClassUID, status, finalComment, counts)
 }
 
 func sendCGetOperationError(ctx context.Context, assoc *ul.Association, pcID byte, req CGetRequest, sopClassUID string, counts cMoveSubOperationCounts, err error) error {
@@ -272,9 +298,13 @@ func runCGetSubOperation(loadCtx, responseCtx context.Context, client *StoreClie
 	if dataset == nil {
 		return CGetSubOperationResult{Status: StatusCGetUnableToProcess, Err: fmt.Errorf("dicom dimse: C-GET sub-operation dataset is nil")}
 	}
-	result, err := client.storeWithOptions(responseCtx, dataset, CStoreOptions{
+	if op.MessageID != 0 {
+		messageID = op.MessageID
+	}
+	result, err := client.storeWithinAssociationOperation(responseCtx, dataset, CStoreOptions{
 		AffectedSOPClassUID:    op.AffectedSOPClassUID,
 		AffectedSOPInstanceUID: op.AffectedSOPInstanceUID,
+		TransferSyntaxUIDs:     op.TransferSyntaxUIDs,
 		MessageID:              messageID,
 		Priority:               priority,
 	}, monitor.receiveCStoreResponse)

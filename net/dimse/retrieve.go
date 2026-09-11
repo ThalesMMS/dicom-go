@@ -12,7 +12,7 @@ import (
 
 // CMoveRequest represents a C-MOVE-RQ DIMSE command.
 // The Identifier (query dataset) is transmitted as the command's accompanying
-// dataset (i.e., CommandDataSetType == DataSetPresent) rather than as a command
+// dataset (i.e., CommandDataSetType != NoDataSet) rather than as a command
 // element.
 //
 // This package models the common C-MOVE command fields plus the optional Move
@@ -151,8 +151,9 @@ func ParseCMoveRequest(obj *object.Object) (*CMoveRequest, error) {
 	if err != nil {
 		return nil, err
 	}
-	if dataSetType != DataSetPresent {
-		return nil, fmt.Errorf("dicom dimse: C-MOVE request dataset type 0x%04X, want dataset present 0x%04X", dataSetType, DataSetPresent)
+	// PS3.7 Table 9.3-9: every value except 0101H denotes a dataset.
+	if dataSetType == NoDataSet {
+		return nil, fmt.Errorf("dicom dimse: C-MOVE request requires a dataset")
 	}
 	req := &CMoveRequest{
 		AffectedSOPClassUID: sopClassUID,

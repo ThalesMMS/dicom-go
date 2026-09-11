@@ -45,13 +45,15 @@ func TestServeStudyRootCGetReportsCustomHandlerStatus(t *testing.T) {
 	defer cancel()
 
 	final, serverErr := runStudyRootCGetStatusTest(t, ctx, CGetHandlerFunc(func(context.Context, CGetRequestContext) ([]CGetSubOperation, error) {
-		return nil, NewCGetSCPError(StatusCGetCancel, "caller canceled", nil)
+		err := NewCGetSCPError(StatusCGetCancel, "caller canceled", nil)
+		err.FailedSuboperations = 2
+		return nil, err
 	}))
 	var statusErr *CGetSCPError
 	if !errors.As(serverErr, &statusErr) || statusErr.Status != StatusCGetCancel {
 		t.Fatalf("ServeStudyRootCGet() error = %v, want CGetSCPError cancel", serverErr)
 	}
-	assertCGetCounts(t, "final", final, StatusCGetCancel, 0, 0, 0, 0)
+	assertCGetCounts(t, "final", final, StatusCGetCancel, 0, 0, 2, 0)
 }
 
 func TestServeStudyRootCGetRejectsPatientLevel(t *testing.T) {
@@ -99,6 +101,42 @@ func TestServeStudyRootCGetMapsStoreFailureIntoFinalCounters(t *testing.T) {
 		t.Fatalf("ServeStudyRootCGet() error = %v, want nil", serverErr)
 	}
 	assertCGetCounts(t, "final", final, StatusCGetSubOperationsCompleteOneOrMoreFailures, 0, 1, 1, 0)
+	if got := final.FailedSOPInstanceUIDListOrNil; len(got) != 1 || got[0] != "1.2.3.4.6" {
+		t.Fatalf("final FailedSOPInstanceUIDListOrNil = %v, want [1.2.3.4.6]", got)
+	}
+}
+
+func TestServeStudyRootCGetPropagatesSubOperationStoreOptions(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	var receivedMessageID uint16
+	final, serverErr := runStudyRootCGetStatusTest(
+		t,
+		ctx,
+		CGetHandlerFunc(func(context.Context, CGetRequestContext) ([]CGetSubOperation, error) {
+			first := cGetSubOperation("1.2.3.4.5")
+			first.MessageID = 41
+			first.TransferSyntaxUIDs = []string{transfer.ImplicitVRLittleEndian.UID}
+			second := cGetSubOperation("1.2.3.4.6")
+			second.TransferSyntaxUIDs = []string{transfer.ExplicitVRLittleEndian.UID}
+			return []CGetSubOperation{first, second}, nil
+		}),
+		withCGetStoreHandler(CGetStoreHandlerFunc(func(_ context.Context, req CGetStoreRequestContext) (uint16, error) {
+			receivedMessageID = req.Request.MessageID
+			return StatusSuccess, nil
+		})),
+	)
+	if serverErr != nil {
+		t.Fatalf("ServeStudyRootCGet() error = %v, want graceful sub-operation failure", serverErr)
+	}
+	if receivedMessageID != 41 {
+		t.Fatalf("C-STORE MessageID = %d, want explicit override 41", receivedMessageID)
+	}
+	assertCGetCounts(t, "final", final, StatusCGetSubOperationsCompleteOneOrMoreFailures, 0, 1, 1, 0)
+	if final.ErrorComment == "" {
+		t.Fatal("final ErrorComment is empty, want failed sub-operation detail")
+	}
 	if got := final.FailedSOPInstanceUIDListOrNil; len(got) != 1 || got[0] != "1.2.3.4.6" {
 		t.Fatalf("final FailedSOPInstanceUIDListOrNil = %v, want [1.2.3.4.6]", got)
 	}

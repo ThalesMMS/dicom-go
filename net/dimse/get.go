@@ -104,8 +104,9 @@ func ParseCGetRequest(obj *object.Object) (*CGetRequest, error) {
 	if err != nil {
 		return nil, err
 	}
-	if dataSetType != DataSetPresent {
-		return nil, fmt.Errorf("dicom dimse: C-GET request dataset type 0x%04X, want dataset present 0x%04X", dataSetType, DataSetPresent)
+	// PS3.7 Table 9.3-6: every value except 0101H denotes a dataset.
+	if dataSetType == NoDataSet {
+		return nil, fmt.Errorf("dicom dimse: C-GET request requires a dataset")
 	}
 	return &CGetRequest{AffectedSOPClassUID: sopClassUID, MessageID: messageID, Priority: priority}, nil
 }

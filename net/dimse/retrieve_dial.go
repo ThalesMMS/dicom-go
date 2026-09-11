@@ -9,7 +9,7 @@ import (
 )
 
 // RetrieveDialOptions describes how to establish an association suitable for
-// scoped Query/Retrieve (C-MOVE) operations.
+// scoped Query/Retrieve (C-MOVE or C-GET) operations.
 //
 // This is a convenience wrapper around ul.DialContext.
 //
@@ -28,6 +28,9 @@ type RetrieveDialOptions struct {
 
 	// Contexts are the proposed presentation contexts.
 	Contexts []ul.PresentationContext
+	// RoleSelections proposes alternate SCU/SCP roles. C-GET callers use this
+	// to accept Storage sub-operations as an SCP on the same association.
+	RoleSelections []ul.RoleSelectionItem
 
 	// Implementation identifiers are passed through to UL negotiation.
 	ImplementationClassUID    string
@@ -48,6 +51,7 @@ func DialRetrieveSCU(ctx context.Context, opts RetrieveDialOptions) (*ul.Associa
 		CallingAETitle:            opts.CallingAETitle,
 		MaxPDU:                    opts.MaxPDU,
 		Contexts:                  opts.Contexts,
+		RoleSelections:            opts.RoleSelections,
 		ImplementationClassUID:    opts.ImplementationClassUID,
 		ImplementationVersionName: opts.ImplementationVersionName,
 	})

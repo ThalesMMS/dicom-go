@@ -14,6 +14,18 @@ const (
 	QueryRetrieveModelPatientRoot QueryRetrieveModel = "PATIENT_ROOT"
 )
 
+// ParseQueryRetrieveModel accepts CLI-friendly study-root/patient-root names
+// as well as the canonical STUDY_ROOT/PATIENT_ROOT values.
+func ParseQueryRetrieveModel(value string) (QueryRetrieveModel, error) {
+	normalized := strings.ToUpper(strings.TrimSpace(value))
+	normalized = strings.NewReplacer("-", "_", " ", "_").Replace(normalized)
+	model := QueryRetrieveModel(normalized)
+	if _, err := queryRetrieveModel(model); err != nil {
+		return "", err
+	}
+	return model, nil
+}
+
 type queryRetrieveModelDefinition struct {
 	levels       []string
 	requiredKeys map[string][]string

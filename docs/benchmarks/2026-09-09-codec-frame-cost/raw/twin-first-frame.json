@@ -1,0 +1,26 @@
+{
+  "inputKind": "zip",
+  "studies": 1,
+  "series": 1,
+  "slices": 234,
+  "transferSyntaxUID": "1.2.840.10008.1.2.1",
+  "firstDecodeNanoseconds": 375,
+  "firstPresentNanoseconds": 1552625,
+  "secondPresentNanoseconds": 250,
+  "firstFrameNanoseconds": 1553000,
+  "secondPresentCacheHit": true,
+  "presented": {
+    "shell": "headless",
+    "mode": "published",
+    "cacheHit": true,
+    "cacheMiss": false,
+    "cancelled": false,
+    "prefetch": false,
+    "queueWaitNanoseconds": 0,
+    "decodeNanoseconds": 375,
+    "windowNanoseconds": 0,
+    "renderNanoseconds": 1552625,
+    "paintNanoseconds": 0,
+    "firstFrameNanoseconds": 1553000
+  }
+}

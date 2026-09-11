@@ -268,10 +268,12 @@ func Build(input []FrameMetadata) Timeline {
 	}
 	duplicateSpatial := hasDuplicateSpatialPosition(frames)
 	hasExplicitPosition := false
+	needsExplicitOffsetLookup := false
 	hasAcquisitionTime := false
 	var earliestAcquisition time.Time
 	for _, frame := range frames {
 		hasExplicitPosition = hasExplicitPosition || frame.HasTemporalPosition
+		needsExplicitOffsetLookup = needsExplicitOffsetLookup || (!frame.HasTemporalPosition && frame.HasOffset)
 		if frame.HasAcquisitionTime {
 			hasAcquisitionTime = true
 			if earliestAcquisition.IsZero() || frame.AcquisitionTime.Before(earliestAcquisition) {
@@ -280,11 +282,15 @@ func Build(input []FrameMetadata) Timeline {
 		}
 		timeline.Gated = timeline.Gated || frame.HasTrigger || frame.HasPhase
 	}
-	explicitOffsets := map[int]time.Duration{}
-	for _, frame := range frames {
-		if frame.HasTemporalPosition && frame.HasOffset {
-			explicitOffsets[frame.TemporalPosition] = frame.Offset
+	var explicitOffsetIndex temporalOffsetIndex
+	if hasExplicitPosition && needsExplicitOffsetLookup {
+		explicitOffsets := map[int]time.Duration{}
+		for _, frame := range frames {
+			if frame.HasTemporalPosition && frame.HasOffset {
+				explicitOffsets[frame.TemporalPosition] = frame.Offset
+			}
 		}
+		explicitOffsetIndex = newTemporalOffsetIndex(explicitOffsets)
 	}
 	occurrence := map[string]int{}
 	type pointBuilder struct {
@@ -298,7 +304,7 @@ func Build(input []FrameMetadata) Timeline {
 		spatialKey := frameSpatialKey(frame)
 		ordinal := occurrence[spatialKey]
 		occurrence[spatialKey] = ordinal + 1
-		key, position, hasPosition, usedOccurrenceFallback := temporalKeyWithProvenance(frame, hasExplicitPosition, explicitOffsets, duplicateSpatial && hasAcquisitionTime, ordinal)
+		key, position, hasPosition, usedOccurrenceFallback := temporalKeyWithProvenance(frame, hasExplicitPosition, explicitOffsetIndex, duplicateSpatial && hasAcquisitionTime, ordinal)
 		builder := builders[key]
 		if builder == nil {
 			builder = &pointBuilder{key: key, point: TimePoint{
@@ -332,26 +338,82 @@ func Build(input []FrameMetadata) Timeline {
 }
 
 func temporalKey(frame FrameMetadata, hasExplicit bool, explicitOffsets map[int]time.Duration, duplicateSpatial bool, occurrence int) (string, int, bool) {
-	key, position, hasPosition, _ := temporalKeyWithProvenance(frame, hasExplicit, explicitOffsets, duplicateSpatial, occurrence)
+	key, position, hasPosition, _ := temporalKeyWithProvenance(frame, hasExplicit, newTemporalOffsetIndex(explicitOffsets), duplicateSpatial, occurrence)
 	return key, position, hasPosition
 }
 
-func temporalKeyWithProvenance(frame FrameMetadata, hasExplicit bool, explicitOffsets map[int]time.Duration, duplicateSpatial bool, occurrence int) (string, int, bool, bool) {
+type temporalOffsetEntry struct {
+	offset   time.Duration
+	position int
+}
+
+type temporalOffsetIndex []temporalOffsetEntry
+
+func newTemporalOffsetIndex(offsets map[int]time.Duration) temporalOffsetIndex {
+	entries := make(temporalOffsetIndex, 0, len(offsets))
+	for position, offset := range offsets {
+		entries = append(entries, temporalOffsetEntry{offset: offset, position: position})
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].offset != entries[j].offset {
+			return entries[i].offset < entries[j].offset
+		}
+		return entries[i].position < entries[j].position
+	})
+	unique := entries[:0]
+	for _, entry := range entries {
+		if len(unique) > 0 && unique[len(unique)-1].offset == entry.offset {
+			continue
+		}
+		unique = append(unique, entry)
+	}
+	return unique
+}
+
+func (index temporalOffsetIndex) nearest(target time.Duration) (int, bool) {
+	insertion := sort.Search(len(index), func(i int) bool { return index[i].offset >= target })
+	bestPosition := 0
+	bestDelta := uint64(0)
+	found := false
+	consider := func(entryIndex int) {
+		if entryIndex < 0 || entryIndex >= len(index) {
+			return
+		}
+		entry := index[entryIndex]
+		delta := durationDistance(target, entry.offset)
+		if delta > uint64(time.Microsecond) {
+			return
+		}
+		if !found || delta < bestDelta || (delta == bestDelta && entry.position < bestPosition) {
+			bestPosition, bestDelta, found = entry.position, delta, true
+		}
+	}
+	consider(insertion - 1)
+	consider(insertion)
+	return bestPosition, found
+}
+
+func durationDistance(a, b time.Duration) uint64 {
+	if a >= b {
+		return uint64(a) - uint64(b)
+	}
+	return uint64(b) - uint64(a)
+}
+
+func absDuration(value time.Duration) time.Duration {
+	if value < 0 {
+		return -value
+	}
+	return value
+}
+
+func temporalKeyWithProvenance(frame FrameMetadata, hasExplicit bool, explicitOffsets temporalOffsetIndex, duplicateSpatial bool, occurrence int) (string, int, bool, bool) {
 	if frame.HasTemporalPosition {
 		return "position:" + strconv.Itoa(frame.TemporalPosition), frame.TemporalPosition, true, false
 	}
 	if hasExplicit {
 		if frame.HasOffset {
-			bestPosition, bestDelta, found := 0, time.Duration(0), false
-			for position, offset := range explicitOffsets {
-				delta := absDuration(frame.Offset - offset)
-				if delta > time.Microsecond {
-					continue
-				}
-				if !found || delta < bestDelta || (delta == bestDelta && position < bestPosition) {
-					bestPosition, bestDelta, found = position, delta, true
-				}
-			}
+			bestPosition, found := explicitOffsets.nearest(frame.Offset)
 			if found {
 				return "position:" + strconv.Itoa(bestPosition), bestPosition, true, false
 			}
@@ -728,13 +790,6 @@ func millisecondsDuration(value float64) (time.Duration, bool) {
 		return 0, false
 	}
 	return time.Duration(math.Round(value * float64(time.Millisecond))), true
-}
-
-func absDuration(value time.Duration) time.Duration {
-	if value < 0 {
-		return -value
-	}
-	return value
 }
 
 func addDuration(a, b time.Duration) (time.Duration, bool) {

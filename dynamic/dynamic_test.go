@@ -335,8 +335,9 @@ func BenchmarkBuildDynamicTimeline400Frames(b *testing.B) {
 		}
 	}
 	b.ReportAllocs()
+	b.ResetTimer()
 	for range b.N {
-		_ = Build(frames)
+		benchmarkDynamicTimeline = Build(frames)
 	}
 }
 

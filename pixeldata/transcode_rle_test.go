@@ -7,10 +7,10 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"runtime"
 	"testing"
 
 	"github.com/ThalesMMS/dicom-go/core"
+	"github.com/ThalesMMS/dicom-go/internal/testutil"
 	"github.com/ThalesMMS/dicom-go/object"
 	"github.com/ThalesMMS/dicom-go/pixeldata"
 	"github.com/ThalesMMS/dicom-go/pixeldata/codecfixture"
@@ -207,18 +207,13 @@ func TestTranscodePathRLEPublishesValidatedPrivateFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Mode().Perm() != 0o600 {
-		t.Fatalf("destination mode = %o, want 600", info.Mode().Perm())
-	}
+	assertTranscodeDestinationPermissions(t, destinationPath, info)
 	if gotSource, err := os.ReadFile(sourcePath); err != nil || !bytes.Equal(gotSource, sourceBytes) {
 		t.Fatalf("source changed: err=%v", err)
 	}
 }
 
 func TestTranscodePathRLEAtomicallyReplacesExistingDestination(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("Windows does not safely replace an existing destination")
-	}
 	dir := t.TempDir()
 	sourcePath := filepath.Join(dir, "source.dcm")
 	destinationPath := filepath.Join(dir, "destination.dcm")
@@ -331,9 +326,7 @@ func TestTranscodePathRejectsSymlinkEntries(t *testing.T) {
 		t.Fatal(err)
 	}
 	sourceLink := filepath.Join(dir, "source-link.dcm")
-	if err := os.Symlink(realSource, sourceLink); err != nil {
-		t.Skipf("symlink unavailable: %v", err)
-	}
+	testutil.SymlinkOrSkip(t, realSource, sourceLink)
 	_, err = pixeldata.TranscodePath(context.Background(), sourceLink, filepath.Join(dir, "output.dcm"), transfer.ExplicitVRLittleEndian, pixeldata.TranscodeOptions{})
 	if err == nil {
 		t.Fatal("TranscodePath accepted a source symlink")
@@ -344,9 +337,7 @@ func TestTranscodePathRejectsSymlinkEntries(t *testing.T) {
 		t.Fatal(err)
 	}
 	destinationLink := filepath.Join(dir, "destination-link.dcm")
-	if err := os.Symlink(destinationTarget, destinationLink); err != nil {
-		t.Fatal(err)
-	}
+	testutil.SymlinkOrSkip(t, destinationTarget, destinationLink)
 	_, err = pixeldata.TranscodePath(context.Background(), realSource, destinationLink, transfer.ExplicitVRLittleEndian, pixeldata.TranscodeOptions{})
 	if !errors.Is(err, pixeldata.ErrTranscodeDestinationUnsafe) {
 		t.Fatalf("destination symlink error = %v, want ErrTranscodeDestinationUnsafe", err)

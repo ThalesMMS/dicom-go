@@ -4,215 +4,72 @@ package pixeldata
 
 import (
 	"errors"
+	"fmt"
 	"os"
-	"path/filepath"
-	"strings"
-	"unsafe"
 
-	"golang.org/x/sys/windows"
+	"github.com/ThalesMMS/dicom-go/internal/nofollow"
 )
 
-type transcodeFileRenameInformation struct {
-	ReplaceIfExists uint32
-	RootDirectory   windows.Handle
-	FileNameLength  uint32
-	FileName        [1]uint16
+func openTranscodeFileNoFollow(path string) (*os.File, error) { return nofollow.OpenFile(path) }
+func openTranscodeDirectoryNoFollow(path string) (*os.File, error) {
+	return nofollow.OpenDirectory(path)
 }
+func createTranscodeFileAt(parent *os.File, name string) (*os.File, error) {
+	return nofollow.CreateAt(parent, name)
+}
+func openTranscodeFileAt(parent *os.File, name string) (*os.File, error) {
+	return nofollow.OpenAt(parent, name)
+}
+func removeTranscodeFileAt(parent *os.File, name string) error {
+	return nofollow.RemoveAt(parent, name)
+}
+func validTranscodeEntryName(name string) bool { return nofollow.ValidName(name) }
 
 func transcodePathSupported() bool      { return true }
-func transcodeCanReplaceExisting() bool { return false }
-
-func openTranscodeFileNoFollow(path string) (*os.File, error) {
-	return openTranscodeWindowsNoFollow(path, false)
-}
-
-func openTranscodeDirectoryNoFollow(path string) (*os.File, error) {
-	return openTranscodeWindowsNoFollow(path, true)
-}
-
-func openTranscodeWindowsNoFollow(path string, directory bool) (*os.File, error) {
-	absPath, err := filepath.Abs(path)
-	if err != nil {
-		return nil, err
-	}
-	volume := filepath.VolumeName(absPath)
-	if volume == "" {
-		return nil, errors.New("dicom pixeldata: invalid transcode path")
-	}
-	root := volume + string(filepath.Separator)
-	relative := strings.TrimPrefix(filepath.Clean(absPath), root)
-	if relative == "" || relative == "." {
-		if !directory {
-			return nil, errors.New("dicom pixeldata: invalid transcode source")
-		}
-		return openTranscodeWindowsRoot(root)
-	}
-	rootFile, err := openTranscodeWindowsRoot(root)
-	if err != nil {
-		return nil, err
-	}
-	defer rootFile.Close()
-	return openTranscodeWindowsRelative(rootFile, relative, directory, false, false)
-}
-
-func openTranscodeWindowsRoot(root string) (*os.File, error) {
-	rootName, err := windows.UTF16PtrFromString(root)
-	if err != nil {
-		return nil, err
-	}
-	handle, err := windows.CreateFile(
-		rootName,
-		windows.FILE_GENERIC_READ,
-		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
-		nil,
-		windows.OPEN_EXISTING,
-		windows.FILE_FLAG_BACKUP_SEMANTICS|windows.FILE_FLAG_OPEN_REPARSE_POINT,
-		0,
-	)
-	if err != nil {
-		return nil, err
-	}
-	var info windows.ByHandleFileInformation
-	if err := windows.GetFileInformationByHandle(handle, &info); err != nil || info.FileAttributes&windows.FILE_ATTRIBUTE_DIRECTORY == 0 || info.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-		_ = windows.CloseHandle(handle)
-		return nil, errors.New("dicom pixeldata: invalid transcode root")
-	}
-	file := os.NewFile(uintptr(handle), root)
-	if file == nil {
-		_ = windows.CloseHandle(handle)
-		return nil, errors.New("dicom pixeldata: create directory from handle")
-	}
-	return file, nil
-}
-
-func openTranscodeWindowsRelative(parent *os.File, relative string, directory, create, deleteAccess bool) (*os.File, error) {
-	if parent == nil || relative == "" {
-		return nil, errors.New("dicom pixeldata: invalid relative entry")
-	}
-	objectName, err := windows.NewNTUnicodeString(relative)
-	if err != nil {
-		return nil, err
-	}
-	attributes := &windows.OBJECT_ATTRIBUTES{
-		Length:        uint32(unsafe.Sizeof(windows.OBJECT_ATTRIBUTES{})),
-		RootDirectory: windows.Handle(parent.Fd()),
-		ObjectName:    objectName,
-		Attributes:    windows.OBJ_CASE_INSENSITIVE | windows.OBJ_DONT_REPARSE,
-	}
-	var securityDescriptor *windows.SECURITY_DESCRIPTOR
-	if create {
-		securityDescriptor, err = windows.SecurityDescriptorFromString("D:P(A;;GA;;;OW)")
-		if err != nil {
-			return nil, err
-		}
-		attributes.SecurityDescriptor = securityDescriptor
-	}
-	desiredAccess := uint32(windows.FILE_GENERIC_READ)
-	disposition := uint32(windows.FILE_OPEN)
-	if create {
-		desiredAccess |= windows.FILE_GENERIC_WRITE
-		disposition = windows.FILE_CREATE
-	}
-	if create || deleteAccess {
-		desiredAccess |= windows.DELETE
-	}
-	createOptions := uint32(windows.FILE_SYNCHRONOUS_IO_NONALERT)
-	if directory {
-		createOptions |= windows.FILE_DIRECTORY_FILE
-	} else {
-		createOptions |= windows.FILE_NON_DIRECTORY_FILE
-	}
-	var handle windows.Handle
-	var status windows.IO_STATUS_BLOCK
-	err = windows.NtCreateFile(
-		&handle,
-		desiredAccess,
-		attributes,
-		&status,
-		nil,
-		0,
-		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
-		disposition,
-		createOptions,
-		0,
-		0,
-	)
-	if err != nil {
-		return nil, err
-	}
-	file := os.NewFile(uintptr(handle), relative)
-	if file == nil {
-		_ = windows.CloseHandle(handle)
-		return nil, errors.New("dicom pixeldata: create file from handle")
-	}
-	return file, nil
-}
-
-func createTranscodeFileAt(parent *os.File, name string) (*os.File, error) {
-	if !validTranscodeEntryName(name) {
-		return nil, errors.New("dicom pixeldata: invalid temporary entry")
-	}
-	return openTranscodeWindowsRelative(parent, name, false, true, true)
-}
-
-func openTranscodeFileAt(parent *os.File, name string) (*os.File, error) {
-	if !validTranscodeEntryName(name) {
-		return nil, errors.New("dicom pixeldata: invalid directory entry")
-	}
-	return openTranscodeWindowsRelative(parent, name, false, false, false)
-}
-
-func removeTranscodeFileAt(parent *os.File, name string) error {
-	if parent == nil || !validTranscodeEntryName(name) {
-		return errors.New("dicom pixeldata: invalid directory entry")
-	}
-	file, err := openTranscodeWindowsRelative(parent, name, false, false, true)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-	disposition := byte(1)
-	var status windows.IO_STATUS_BLOCK
-	return windows.NtSetInformationFile(windows.Handle(file.Fd()), &status, &disposition, 1, windows.FileDispositionInformation)
-}
-
+func transcodeCanReplaceExisting() bool { return true }
 func replaceTranscodedFileAt(parent, temporary *os.File, temporaryName, destinationName string, previous transcodeFileSnapshot) error {
 	if parent == nil || temporary == nil || !validTranscodeEntryName(temporaryName) || !validTranscodeEntryName(destinationName) {
 		return errors.New("dicom pixeldata: invalid publish entry")
 	}
-	if previous.exists {
-		return ErrTranscodeDestinationUnsafe
+	return replaceTranscodedWindowsFileAt(parent, temporary, destinationName, previous, defaultTranscodeWindowsReplaceOperations())
+}
+
+type transcodeWindowsReplaceOperations struct {
+	inspectTemporary   func(*os.File) (os.FileInfo, error)
+	renameTemporary    func(parent, temporary *os.File, destinationName string, replace bool) error
+	destinationMatches func(parent *os.File, destinationName string, expected os.FileInfo) bool
+	closeTemporary     func(*os.File) error
+}
+
+func defaultTranscodeWindowsReplaceOperations() transcodeWindowsReplaceOperations {
+	return transcodeWindowsReplaceOperations{
+		inspectTemporary:   (*os.File).Stat,
+		renameTemporary:    renameTranscodedWindowsFileAt,
+		destinationMatches: sameTranscodeEntryAt,
+		closeTemporary:     (*os.File).Close,
 	}
-	name, err := windows.UTF16FromString(destinationName)
+}
+
+func replaceTranscodedWindowsFileAt(parent, temporary *os.File, destinationName string, previous transcodeFileSnapshot, operations transcodeWindowsReplaceOperations) error {
+	temporaryInfo, err := operations.inspectTemporary(temporary)
 	if err != nil {
-		return err
+		return fmt.Errorf("dicom pixeldata: inspect publish temporary: %w", err)
 	}
-	if len(name)-1 > windows.MAX_LONG_PATH {
-		return errors.New("dicom pixeldata: destination name too long")
+	if err := operations.renameTemporary(parent, temporary, destinationName, previous.exists); err != nil {
+		return fmt.Errorf("dicom pixeldata: atomically publish destination: %w", err)
 	}
-	nameBytes := (len(name) - 1) * 2
-	var layout transcodeFileRenameInformation
-	bufferSize := int(unsafe.Offsetof(layout.FileName)) + nameBytes
-	buffer := make([]byte, bufferSize)
-	information := (*transcodeFileRenameInformation)(unsafe.Pointer(&buffer[0]))
-	information.ReplaceIfExists = 0
-	information.RootDirectory = windows.Handle(parent.Fd())
-	information.FileNameLength = uint32(nameBytes)
-	copy((*[windows.MAX_LONG_PATH]uint16)(unsafe.Pointer(&information.FileName[0]))[:nameBytes/2:nameBytes/2], name[:len(name)-1])
-	var status windows.IO_STATUS_BLOCK
-	renameErr := windows.NtSetInformationFile(windows.Handle(temporary.Fd()), &status, &buffer[0], uint32(bufferSize), windows.FileRenameInformation)
-	closeErr := temporary.Close()
-	if renameErr != nil {
-		return renameErr
+	// Once the atomic rename succeeds, the new destination is authoritative.
+	// Never roll it back to the previous file if verification or close fails.
+	if !operations.destinationMatches(parent, destinationName, temporaryInfo) {
+		return fmt.Errorf("dicom pixeldata: verify published destination: %w", ErrTranscodeDestinationUnsafe)
 	}
-	return closeErr
+	if err := operations.closeTemporary(temporary); err != nil {
+		return fmt.Errorf("dicom pixeldata: close published destination: %w", err)
+	}
+	return nil
 }
 
+func renameTranscodedWindowsFileAt(parent, temporary *os.File, name string, replace bool) error {
+	return nofollow.RenameAt(parent, temporary, name, replace)
+}
 func syncTranscodeDirectory(*os.File) error { return nil }
-
-func validTranscodeEntryName(name string) bool {
-	return name != "" && name != "." && name != ".." && filepath.Base(name) == name
-}

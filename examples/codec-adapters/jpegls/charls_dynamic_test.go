@@ -158,7 +158,7 @@ func TestCharLSDecoderRejectsMetadataMismatch(t *testing.T) {
 	}
 }
 
-func TestCharLSDecoderRejectsUnsupportedRGBInterleave(t *testing.T) {
+func TestCharLSDecoderConvertsPlanarRGBInterleave(t *testing.T) {
 	frame := []byte{
 		255, 0, 0,
 		0, 255, 0,
@@ -168,13 +168,15 @@ func TestCharLSDecoderRejectsUnsupportedRGBInterleave(t *testing.T) {
 	encoded := encodeCharLSTestFrame(t, charlsFrameSpec{
 		rows: 2, columns: 2, bitsAllocated: 8, samplesPerPixel: 3,
 	}, frame)
-	tc := charlsFixtureCase("charls-jpegls-unsupported-rgb-interleave", transfer.JPEGLSLossless, jpeglsMetadataOptions{
+	// The test encoder uses ILV=0: the input above is three planes.
+	want := []byte{255, 255, 255, 0, 0, 255, 0, 0, 255, 0, 0, 255}
+	tc := charlsFixtureCase("charls-jpegls-planar-rgb-interleave", transfer.JPEGLSLossless, jpeglsMetadataOptions{
 		rows: 2, columns: 2, bitsAllocated: 8, samplesPerPixel: 3, photometric: "RGB",
-	}, encoded, nil)
+	}, encoded, want)
 
 	result := runCharLSFixtureCase(t, tc)
-	if !errors.Is(result.Err, ErrUnsupportedMetadata) {
-		t.Fatalf("RunCase() error = %v, want ErrUnsupportedMetadata", result.Err)
+	if result.Err != nil {
+		t.Fatal(result.Err)
 	}
 }
 
@@ -190,6 +192,18 @@ func TestCharLSDecoderRejectsNearLosslessDataForLosslessSyntax(t *testing.T) {
 	result := runCharLSFixtureCase(t, tc)
 	if !errors.Is(result.Err, ErrUnsupportedMetadata) {
 		t.Fatalf("RunCase() error = %v, want ErrUnsupportedMetadata", result.Err)
+	}
+}
+
+func TestCharLSDecoderAcceptsZeroErrorUnderNearLosslessSyntax(t *testing.T) {
+	frame := []byte{0, 64, 128, 255}
+	encoded := encodeCharLSTestFrame(t, charlsFrameSpec{rows: 2, columns: 2, bitsAllocated: 8, samplesPerPixel: 1}, frame)
+	tc := charlsFixtureCase("charls-near-syntax-zero-error", transfer.JPEGLSNearLossless, jpeglsMetadataOptions{rows: 2, columns: 2, bitsAllocated: 8}, encoded, frame)
+	if result := runCharLSFixtureCase(t, tc); result.Err != nil {
+		t.Fatal(result.Err)
+	}
+	if err := validateCharLSInterleave(pixeldata.Metadata{SamplesPerPixel: 3}, 1); !errors.Is(err, ErrUnsupportedMetadata) {
+		t.Fatal("unqualified ILV=1 accepted")
 	}
 }
 

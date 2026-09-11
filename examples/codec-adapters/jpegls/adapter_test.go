@@ -11,6 +11,7 @@ import (
 	"github.com/ThalesMMS/dicom-go/core"
 	"github.com/ThalesMMS/dicom-go/object"
 	"github.com/ThalesMMS/dicom-go/pixeldata"
+	"github.com/ThalesMMS/dicom-go/pixeldata/encapsulated"
 	"github.com/ThalesMMS/dicom-go/transfer"
 )
 
@@ -41,6 +42,27 @@ func TestRegisterRegistersJPEGLSSyntaxes(t *testing.T) {
 	}
 }
 
+func TestRegisterNearLosslessDoesNotReplaceBuiltinLossless(t *testing.T) {
+	registry := pixeldata.NewMemoryRegistry()
+	lossless := NewLossless(&fakeDecoder{})
+	if err := registry.RegisterCodec(transfer.JPEGLSLossless.UID, lossless); err != nil {
+		t.Fatal(err)
+	}
+	if err := RegisterNearLossless(registry, &fakeDecoder{}); err != nil {
+		t.Fatal(err)
+	}
+	gotLossless, ok := registry.GetCodec(transfer.JPEGLSLossless.UID)
+	if !ok || gotLossless != lossless {
+		t.Fatal("near-lossless registration replaced the existing lossless codec")
+	}
+	if _, ok := registry.GetCodec(transfer.JPEGLSNearLossless.UID); !ok {
+		t.Fatal("near-lossless codec not registered")
+	}
+	if err := RegisterNearLossless(nil, &fakeDecoder{}); !errors.Is(err, pixeldata.ErrCodecRegistryNil) {
+		t.Fatalf("RegisterNearLossless(nil) error = %v, want ErrCodecRegistryNil", err)
+	}
+}
+
 func TestDecodeFramesJPEGLSLossless(t *testing.T) {
 	obj, pixel := jpeglsObject(t, jpeglsMetadataOptions{}, []byte("encoded"))
 	decoder := &fakeDecoder{outputs: [][]byte{{1, 2}}}
@@ -57,6 +79,25 @@ func TestDecodeFramesJPEGLSLossless(t *testing.T) {
 	}
 	if !slices.Equal(decoder.fragments[0], []byte("encoded")) {
 		t.Fatalf("decoder fragment = %q, want encoded", decoder.fragments[0])
+	}
+}
+
+func TestDecodeBorrowsFragmentAndOwnsDecodedOutput(t *testing.T) {
+	fragment := []byte{1, 2}
+	obj, pixel := jpeglsObject(t, jpeglsMetadataOptions{}, fragment)
+	decoder := &borrowedJPEGLSDecoder{source: pixel.Sequence.Fragments[0]}
+
+	frames, err := NewLossless(decoder).Decode(pixel, obj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !decoder.sawView {
+		t.Fatal("decoder received a copied fragment, want a borrowed read-only view")
+	}
+	before := append([]byte(nil), pixel.Sequence.Fragments[0]...)
+	frames.Data[0][0] ^= 0xff
+	if !slices.Equal(pixel.Sequence.Fragments[0], before) {
+		t.Fatal("decoded JPEG-LS output retained the borrowed compressed fragment")
 	}
 }
 
@@ -215,6 +256,29 @@ type fakeDecoder struct {
 	err       error
 	inputs    []DecoderInput
 	fragments [][]byte
+}
+
+func TestAdapterRejectsAggregateOutputBeforeBackend(t *testing.T) {
+	fragments := make([][]byte, 1000)
+	for i := range fragments {
+		fragments[i] = []byte{0xff, 0xd8, 0xff, 0xd9}
+	}
+	obj, pixel := jpeglsObject(t, jpeglsMetadataOptions{rows: 1024, columns: 1024, numberOfFrames: 1000}, fragments...)
+	decoder := &fakeDecoder{}
+	got, err := NewLossless(decoder).Decode(pixel, obj)
+	if !errors.Is(err, encapsulated.ErrResourceLimit) || len(got.Data) != 0 || len(decoder.inputs) != 0 {
+		t.Fatalf("calls=%d frames=%d error=%v", len(decoder.inputs), len(got.Data), err)
+	}
+}
+
+type borrowedJPEGLSDecoder struct {
+	source  []byte
+	sawView bool
+}
+
+func (d *borrowedJPEGLSDecoder) DecodeJPEGLS(fragment []byte, _ DecoderInput) ([]byte, error) {
+	d.sawView = len(fragment) > 0 && len(d.source) > 0 && &fragment[0] == &d.source[0]
+	return fragment, nil
 }
 
 func (d *fakeDecoder) DecodeJPEGLS(fragment []byte, input DecoderInput) ([]byte, error) {

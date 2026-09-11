@@ -173,6 +173,19 @@ func (charLSDecoder) DecodeJPEGLS(fragment []byte, input DecoderInput) ([]byte, 
 		return nil, err
 	}
 
+	if interleave == charlsInterleaveNone && input.Metadata.SamplesPerPixel == 3 {
+		// CharLS returns component planes for ILV=0. The FrameEncoder and
+		// pixeldata contracts use little-endian, sample-interleaved bytes.
+		output := make([]byte, len(destination))
+		step := int(input.Metadata.BitsAllocated / 8)
+		planeBytes := len(destination) / 3
+		for offset := 0; offset < planeBytes; offset += step {
+			for component := 0; component < 3; component++ {
+				copy(output[offset*3+component*step:], destination[component*planeBytes+offset:component*planeBytes+offset+step])
+			}
+		}
+		return output, nil
+	}
 	return append([]byte(nil), destination...), nil
 }
 
@@ -206,8 +219,8 @@ func validateCharLSFrameInfo(metadata pixeldata.Metadata, info charlsFrameInfo) 
 
 func validateCharLSNearLossless(expectNearLossless bool, near int) error {
 	switch {
-	case expectNearLossless && near == 0:
-		return fmt.Errorf("%w: near-lossless transfer syntax received JPEG-LS NEAR=0", ErrUnsupportedMetadata)
+	case near < 0 || near > 255:
+		return fmt.Errorf("%w: JPEG-LS NEAR outside parameter range", ErrUnsupportedMetadata)
 	case !expectNearLossless && near != 0:
 		return fmt.Errorf("%w: lossless transfer syntax received JPEG-LS NEAR=%d", ErrUnsupportedMetadata, near)
 	default:
@@ -222,7 +235,7 @@ func validateCharLSInterleave(metadata pixeldata.Metadata, interleave int32) err
 			return fmt.Errorf("%w: monochrome JPEG-LS interleave mode=%d", ErrUnsupportedMetadata, interleave)
 		}
 	case 3:
-		if interleave != charlsInterleaveSample {
+		if interleave != charlsInterleaveSample && interleave != charlsInterleaveNone {
 			return fmt.Errorf("%w: RGB JPEG-LS interleave mode=%d", ErrUnsupportedMetadata, interleave)
 		}
 	default:

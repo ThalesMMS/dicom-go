@@ -8,12 +8,14 @@
 package jpegls
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
 
 	"github.com/ThalesMMS/dicom-go/object"
 	"github.com/ThalesMMS/dicom-go/pixeldata"
+	"github.com/ThalesMMS/dicom-go/pixeldata/encapsulated"
 	"github.com/ThalesMMS/dicom-go/transfer"
 )
 
@@ -34,6 +36,9 @@ type DecoderInput struct {
 
 // Decoder is implemented by a dependency-specific JPEG-LS backend.
 type Decoder interface {
+	// DecodeJPEGLS receives a borrowed, read-only compressed fragment. It must
+	// not retain or mutate fragment after returning. The adapter defensively
+	// owns the decoded result before publishing it through pixeldata.Frames.
 	DecodeJPEGLS(fragment []byte, input DecoderInput) ([]byte, error)
 }
 
@@ -61,6 +66,16 @@ func Register(registry pixeldata.Registry, decoder Decoder) error {
 	if err := registry.RegisterCodec(transfer.JPEGLSLossless.UID, NewLossless(decoder)); err != nil {
 		return err
 	}
+	return RegisterNearLossless(registry, decoder)
+}
+
+// RegisterNearLossless registers only the JPEG-LS Near-Lossless adapter. It is
+// intended for profiles that already contain dicom-go's built-in Lossless
+// decoder and need CharLS only for transfer syntax 1.2.840.10008.1.2.4.81.
+func RegisterNearLossless(registry pixeldata.Registry, decoder Decoder) error {
+	if registry == nil {
+		return pixeldata.ErrCodecRegistryNil
+	}
 	return registry.RegisterCodec(transfer.JPEGLSNearLossless.UID, NewNearLossless(decoder))
 }
 
@@ -72,8 +87,21 @@ func RegisterDefault(decoder Decoder) error {
 	return Register(pixeldata.DefaultRegistry, decoder)
 }
 
-// Decode decodes one encapsulated JPEG-LS fragment per output frame.
+// Decode assembles JPEG-LS Items through the shared bounded frame contract.
 func (c *Codec) Decode(pixel pixeldata.PixelData, obj *object.Object) (pixeldata.Frames, error) {
+	return c.DecodeContext(context.Background(), pixel, obj)
+}
+
+// DecodeContext honors ctx between frames and while assembling fragments.
+// Native CharLS backends are not guaranteed to abort a single in-flight
+// frame; cancelation is checked before each frame is admitted.
+func (c *Codec) DecodeContext(ctx context.Context, pixel pixeldata.PixelData, obj *object.Object) (pixeldata.Frames, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return pixeldata.Frames{}, err
+	}
 	if !pixel.Encapsulated {
 		return pixeldata.Frames{}, fmt.Errorf("%w: JPEG-LS requires encapsulated pixel data", pixeldata.ErrIncompatiblePixelData)
 	}
@@ -88,28 +116,48 @@ func (c *Codec) Decode(pixel pixeldata.PixelData, obj *object.Object) (pixeldata
 	if err := validateMetadata(metadata); err != nil {
 		return pixeldata.Frames{}, err
 	}
-
-	fragments := pixel.Sequence.Fragments
-	if len(fragments) == 0 {
-		return pixeldata.Frames{}, fmt.Errorf("%w: no JPEG-LS frame fragments", ErrUnsupportedFragmentLayout)
-	}
-	if metadata.NumberOfFrames != len(fragments) {
-		return pixeldata.Frames{}, fmt.Errorf(
-			"%w: %w: NumberOfFrames=%d fragments=%d",
-			ErrUnsupportedFragmentLayout,
-			pixeldata.ErrPixelDataSizeMismatch,
-			metadata.NumberOfFrames,
-			len(fragments),
-		)
+	const maxRequestBytes = uint64(512 << 20)
+	frameBytes := metadata.FrameSize()
+	if frameBytes <= 0 || uint64(frameBytes) > maxRequestBytes/uint64(metadata.NumberOfFrames) {
+		return pixeldata.Frames{}, fmt.Errorf("%w: %w: decoded request exceeds limit", ErrUnsupportedMetadata, encapsulated.ErrResourceLimit)
 	}
 
-	frames := make([][]byte, len(fragments))
-	for i, fragment := range fragments {
-		decoded, err := c.decoder.DecodeJPEGLS(fragment, DecoderInput{
+	if err := ctx.Err(); err != nil {
+		return pixeldata.Frames{}, err
+	}
+	codestreams, err := encapsulated.FromFragments(ctx, pixel.Sequence, obj, metadata.NumberOfFrames, encapsulated.JPEGLS, encapsulated.Limits{})
+	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return pixeldata.Frames{}, err
+		}
+		if errors.Is(err, encapsulated.ErrFrameCount) {
+			err = errors.Join(pixeldata.ErrPixelDataSizeMismatch, err)
+		}
+		return pixeldata.Frames{}, fmt.Errorf("%w: %w", ErrUnsupportedFragmentLayout, err)
+	}
+	if uint64(frameBytes)*uint64(metadata.NumberOfFrames)+uint64(frameBytes)+codestreams.InputBytes()+codestreams.MaxFrameBytes() > maxRequestBytes {
+		return pixeldata.Frames{}, fmt.Errorf("%w: %w: request working set exceeds limit", ErrUnsupportedMetadata, encapsulated.ErrResourceLimit)
+	}
+	frames := make([][]byte, codestreams.Len())
+	for i := range frames {
+		if err := ctx.Err(); err != nil {
+			return pixeldata.Frames{}, err
+		}
+		view, err := codestreams.Frame(ctx, i)
+		if err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return pixeldata.Frames{}, err
+			}
+			return pixeldata.Frames{}, fmt.Errorf("%w: %w", ErrUnsupportedFragmentLayout, err)
+		}
+		decoded, err := c.decoder.DecodeJPEGLS(view.Data, DecoderInput{
 			Metadata:     metadata,
 			NearLossless: c.nearLossless,
 		})
 		if err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return pixeldata.Frames{}, err
+			}
 			if errors.Is(err, ErrDecoderUnavailable) {
 				if err != ErrDecoderUnavailable {
 					return pixeldata.Frames{}, fmt.Errorf("%w: frame %d: %w", ErrDecoderUnavailable, i, err)
@@ -126,6 +174,9 @@ func (c *Codec) Decode(pixel pixeldata.PixelData, obj *object.Object) (pixeldata
 			}
 			return pixeldata.Frames{}, fmt.Errorf("%w: frame %d: %w", ErrMalformedFrame, i, err)
 		}
+		if err := ctx.Err(); err != nil {
+			return pixeldata.Frames{}, err
+		}
 		if got, want := int64(len(decoded)), metadata.FrameSize(); got != want {
 			return pixeldata.Frames{}, fmt.Errorf(
 				"%w: frame %d decoded=%d expected=%d",
@@ -138,6 +189,9 @@ func (c *Codec) Decode(pixel pixeldata.PixelData, obj *object.Object) (pixeldata
 		frames[i] = append([]byte(nil), decoded...)
 	}
 
+	if err := ctx.Err(); err != nil {
+		return pixeldata.Frames{}, err
+	}
 	return pixeldata.Frames{
 		Rows:    int(metadata.Rows),
 		Columns: int(metadata.Columns),

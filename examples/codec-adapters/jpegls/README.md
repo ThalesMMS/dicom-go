@@ -1,24 +1,35 @@
 # JPEG-LS optional adapter
 
-This nested module provides the supported opt-in JPEG-LS pixel data adapter for
-`dicom-go`. It stays outside the base module so applications that do not decode
-JPEG-LS do not inherit native decoder dependencies.
+This nested module provides the optional native JPEG-LS pixel data adapter for
+`dicom-go`. The base module already provides dependency-free JPEG-LS Lossless
+(`1.2.840.10008.1.2.4.80`) decode and explicit encode for its qualified pure-Go
+subset, plus explicit unsigned Near-Lossless decode/encode. This module stays
+separate so applications can select and independently qualify a CharLS backend
+without imposing a native dependency on other consumers.
 
-The default build keeps the adapter boundary pure Go. Applications register an
-explicit `Decoder` implementation through `Register` or `RegisterDefault`. The
-production decoder is `NewCharLSDecoder()`, enabled only with the
-`jpegls_charls` build tag.
+The default build keeps the adapter boundary pure Go. Applications that compose
+it with `pixeldata/builtin` register an explicit `Decoder` implementation for
+Near-Lossless through `RegisterNearLossless`. Standalone consumers may use
+`Register` or `RegisterDefault` when the injected backend must own both JPEG-LS
+transfer syntax UIDs. The native decoder is `NewCharLSDecoder()`, enabled only
+with the `jpegls_charls` build tag.
 
 Supported boundaries:
 
-- registers JPEG-LS Lossless and Near-Lossless transfer syntax UIDs explicitly;
+- registers JPEG-LS Near-Lossless alone, or both Lossless and Near-Lossless,
+  through distinct explicit APIs;
 - validates common pixel metadata before decode;
-- supports one encapsulated fragment per output frame;
+- reuses the bounded shared JPEG-LS frame assembler for single/multiple Items;
 - decodes native frame bytes for supported grayscale 8-bit and 16-bit data
-  through CharLS when the `jpegls_charls` profile is enabled;
+  through CharLS when the `jpegls_charls` profile is enabled; RGB ILV=0 component
+  planes are normalized to sample order and ILV=2 is supported; ILV=1 is excluded;
 - returns typed errors for unavailable decoders, unsupported metadata,
   unsupported fragment layouts, malformed frames returned by decoder backends,
-  and decoded frame size mismatches.
+  and decoded frame size mismatches;
+- implements `pixeldata.ContextCodec` and checks cancellation before admitting
+  each frame. Native CharLS is not guaranteed to abort a single in-flight
+  frame; `errors.Is(err, context.Canceled)` / `DeadlineExceeded` are preserved
+  and are not classified as malformed frames.
 
 ## CharLS backend
 
@@ -46,9 +57,13 @@ incompatible runtimes with `ErrDecoderUnavailable` before decoding.
 Registration with the native backend is explicit:
 
 ```go
-import jpeglscodec "github.com/ThalesMMS/dicom-go/examples/codec-adapters/jpegls"
+import (
+	jpeglscodec "github.com/ThalesMMS/dicom-go/examples/codec-adapters/jpegls"
+	"github.com/ThalesMMS/dicom-go/pixeldata"
+)
 
-if err := jpeglscodec.RegisterDefault(jpeglscodec.NewCharLSDecoder()); err != nil {
+registry := pixeldata.NewMemoryRegistry()
+if err := jpeglscodec.Register(registry, jpeglscodec.NewCharLSDecoder()); err != nil {
 	panic(err)
 }
 ```
@@ -56,10 +71,11 @@ if err := jpeglscodec.RegisterDefault(jpeglscodec.NewCharLSDecoder()); err != ni
 Without `-tags jpegls_charls`, `NewCharLSDecoder()` returns a decoder that
 reports `ErrDecoderUnavailable`.
 
-Twin-Viewer enables this backend only in its explicit `jpegls_charls` codec
-profile. Its plain `jpegls` profile remains the no-decoder boundary that reports
-`JPEG-LS decoder unavailable`, and default Twin-Viewer/default `dicom-go` builds
-remain usable without native CharLS.
+Twin-Viewer receives JPEG-LS Lossless through the builtin pure-Go registry in
+every profile. Its explicit `jpegls_charls` profile adds the CharLS-backed
+Near-Lossless decoder. The plain `jpegls` profile registers only the unavailable
+Near-Lossless boundary, so `.81` reports `JPEG-LS decoder unavailable` while
+`.80` remains available without native CharLS.
 
 ## Tests
 
@@ -75,8 +91,16 @@ Run the CharLS-backed tests when the native library is installed:
 CGO_ENABLED=0 go test -tags jpegls_charls ./...
 ```
 
-From the `dicom-go-dev` root:
+From the `dicom-go` root:
 
 ```sh
 make codec-jpegls-charls-check
 ```
+
+The base-module JPEG-LS qualification uses bit-exact pydicom/GDCM fixtures for
+decode and a separate CharLS interoperability gate for streams emitted by the
+pure-Go encoder.
+
+The explicit pure-Go Near-Lossless encoder is independently qualified by
+`TestCharLSDecodesPureGoNearLosslessEncoderFullSamples`: 216 frames and
+1,839,024 samples. See [policy and reproduction](../../../docs/JPEGLS_NEAR_LOSSLESS_ENCODER.md).

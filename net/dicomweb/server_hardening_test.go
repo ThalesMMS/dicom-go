@@ -24,6 +24,7 @@ import (
 
 	"github.com/ThalesMMS/dicom-go/dicomjson"
 	"github.com/ThalesMMS/dicom-go/internal/dicomtest"
+	"github.com/ThalesMMS/dicom-go/internal/testutil"
 	"github.com/ThalesMMS/dicom-go/transfer"
 )
 
@@ -85,9 +86,7 @@ func TestNewServerScavengesOnlyInactiveOwnedSpoolFiles(t *testing.T) {
 	unrelated := writeSpool("unrelated", []byte("keep"), 2*time.Hour)
 	symlinkTarget := writeSpool("symlink-target", []byte("keep"), 2*time.Hour)
 	symlink := filepath.Join(directory, ".dicomweb-json-link")
-	if err := os.Symlink(symlinkTarget, symlink); err != nil {
-		t.Fatal(err)
-	}
+	symlinkCreated := testutil.TrySymlink(t, symlinkTarget, symlink)
 
 	if _, err := NewServer(ServerOptions{
 		Backend: completeServerTestBackend(), AllowUnauthenticated: true, SpoolDirectory: directory,
@@ -101,9 +100,13 @@ func TestNewServerScavengesOnlyInactiveOwnedSpoolFiles(t *testing.T) {
 			t.Fatalf("owned inactive spool entry %q remains: %v", filepath.Base(removed), err)
 		}
 	}
-	for _, preserved := range []string{active, unrelated, symlink, symlinkTarget} {
-		if _, err := os.Lstat(preserved); err != nil {
-			t.Fatalf("preserved spool entry %q: %v", filepath.Base(preserved), err)
+	preserved := []string{active, unrelated, symlinkTarget}
+	if symlinkCreated {
+		preserved = append(preserved, symlink)
+	}
+	for _, path := range preserved {
+		if _, err := os.Lstat(path); err != nil {
+			t.Fatalf("preserved spool entry %q: %v", filepath.Base(path), err)
 		}
 	}
 }
@@ -170,8 +173,10 @@ func TestServerRejectsInvalidQIDOAndUnsupportedMedia(t *testing.T) {
 		{"/studies", "application/dicom+json;q=.5", http.StatusNotAcceptable},
 		{"/studies", "application/dicom+json;q=01", http.StatusNotAcceptable},
 		{"/studies", "application/dicom+json;q=0.1234", http.StatusNotAcceptable},
-		{"/studies", "*/*;q=1, application/dicom+json;q=0", http.StatusNotAcceptable},
+		{"/studies", "*/*;q=1, application/dicom+json;q=0", http.StatusOK},
 		{"/studies/1.02.3", `multipart/related; type="application/dicom"`, http.StatusBadRequest},
+		{"/studies/3.1", `multipart/related; type="application/dicom"`, http.StatusBadRequest},
+		{"/studies/1.40", `multipart/related; type="application/dicom"`, http.StatusBadRequest},
 	}
 	for _, test := range tests {
 		recorder := httptest.NewRecorder()
@@ -189,6 +194,33 @@ func TestServerRejectsInvalidQIDOAndUnsupportedMedia(t *testing.T) {
 	server.ServeHTTP(recorder, request)
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("multiple Accept fields status=%d body=%q", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestServerUIDValidationRetainsConfiguredByteLimit(t *testing.T) {
+	server := &Server{limits: ServerLimits{MaxUIDBytes: 5}}
+	for _, test := range []struct {
+		uid  string
+		want error
+	}{
+		{uid: "1.2.3"},
+		{uid: "1.2.34", want: ErrInvalidRequest},
+		{uid: "3.1", want: ErrInvalidRequest},
+		{uid: "1.40", want: ErrInvalidRequest},
+	} {
+		err := server.validateUID(test.uid)
+		if !errors.Is(err, test.want) || (test.want == nil && err != nil) {
+			t.Errorf("validateUID(%q) error = %v, want %v", test.uid, err, test.want)
+		}
+	}
+
+	server.limits.MaxUIDBytes = 100
+	valid64 := "2." + strings.Repeat("1", 62)
+	if err := server.validateUID(valid64); err != nil {
+		t.Fatalf("validateUID(64 bytes) error = %v", err)
+	}
+	if err := server.validateUID(valid64 + "1"); !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("validateUID(65 bytes) error = %v, want ErrInvalidRequest", err)
 	}
 }
 
@@ -320,7 +352,7 @@ func TestServerReturnsMethodNotAllowedForKnownResources(t *testing.T) {
 	}{
 		{http.MethodPut, "/studies", "GET, POST"},
 		{http.MethodPost, "/instances", "GET"},
-		{http.MethodPost, "/studies/1/series/2/instances/3", "GET"},
+		{http.MethodPost, "/studies/1.2/series/1.3/instances/1.4", "GET"},
 	} {
 		recorder := httptest.NewRecorder()
 		server.ServeHTTP(recorder, httptest.NewRequest(test.method, test.path, nil).WithContext(context.Background()))
@@ -728,7 +760,7 @@ func TestServerWADONegotiatesWrappersScopesAndBackendMedia(t *testing.T) {
 	}
 
 	backend.retrieve = func(_ context.Context, _ RetrieveRequest, yield func(RetrievePart) error) error {
-		return yield(RetrievePart{Ref: InstanceRef{StudyInstanceUID: "9.9.9", SeriesInstanceUID: "9.9.9.1", SOPInstanceUID: "9.9.9.1.1"}, ContentType: "application/dicom", Reader: &trackingReadCloser{Reader: strings.NewReader("cross-scope"), closed: &closed}})
+		return yield(RetrievePart{Ref: InstanceRef{StudyInstanceUID: "2.9.9", SeriesInstanceUID: "2.9.9.1", SOPInstanceUID: "2.9.9.1.1"}, ContentType: "application/dicom", Reader: &trackingReadCloser{Reader: strings.NewReader("cross-scope"), closed: &closed}})
 	}
 	recorder := httptest.NewRecorder()
 	request := httptest.NewRequest(http.MethodGet, "/studies/1.2.3", nil).WithContext(context.Background())
@@ -763,7 +795,7 @@ func TestServerAlwaysClosesPanickingReadersAndRejectsUnsafeMedia(t *testing.T) {
 				return BulkDataPart{ContentType: "application/octet-stream", Reader: panicking}, nil
 			}
 		}
-		path := map[string]string{"retrieve": "/studies/1.2.3", "frame": "/studies/1/series/2/instances/3/frames/1", "bulk": "/bulkdata/token"}[kind]
+		path := map[string]string{"retrieve": "/studies/1.2.3", "frame": "/studies/1.2/series/1.3/instances/1.4/frames/1", "bulk": "/bulkdata/token"}[kind]
 		accept := map[string]string{"retrieve": `multipart/related; type="application/dicom"`, "frame": `multipart/related; type="application/octet-stream"`, "bulk": `multipart/related; type="application/octet-stream"`}[kind]
 		recorder := httptest.NewRecorder()
 		request := httptest.NewRequest(http.MethodGet, path, nil).WithContext(context.Background())
@@ -779,7 +811,7 @@ func TestServerAlwaysClosesPanickingReadersAndRejectsUnsafeMedia(t *testing.T) {
 		return yield(FramePartStream{FrameNumber: 1, ContentType: "text/plain\r\nX-Evil: yes", Reader: &trackingReadCloser{Reader: strings.NewReader("x"), closed: &mediaClosed}})
 	}
 	recorder := httptest.NewRecorder()
-	request := httptest.NewRequest(http.MethodGet, "/studies/1/series/2/instances/3/frames/1", nil).WithContext(context.Background())
+	request := httptest.NewRequest(http.MethodGet, "/studies/1.2/series/1.3/instances/1.4/frames/1", nil).WithContext(context.Background())
 	request.Header.Set("Accept", `multipart/related; type="image/*"`)
 	server.ServeHTTP(recorder, request)
 	if recorder.Code != http.StatusInternalServerError || mediaClosed.Load() != 1 {
@@ -794,14 +826,14 @@ func TestServerFramesAcceptsNormativeCompressedWildcards(t *testing.T) {
 	}
 	server, _ := NewServer(ServerOptions{Backend: backend, AllowUnauthenticated: true})
 	recorder := httptest.NewRecorder()
-	request := httptest.NewRequest(http.MethodGet, "/studies/1/series/2/instances/3/frames/1", nil).WithContext(context.Background())
+	request := httptest.NewRequest(http.MethodGet, "/studies/1.2/series/1.3/instances/1.4/frames/1", nil).WithContext(context.Background())
 	request.Header.Set("Accept", `multipart/related; type="image/*"`)
 	server.ServeHTTP(recorder, request)
 	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Header().Get("Content-Type"), `type="image/jpeg"`) {
 		t.Fatalf("status=%d Content-Type=%q body=%q", recorder.Code, recorder.Header().Get("Content-Type"), recorder.Body.String())
 	}
 	recorder = httptest.NewRecorder()
-	request = httptest.NewRequest(http.MethodGet, "/studies/1/series/2/instances/3/frames/1", nil).WithContext(context.Background())
+	request = httptest.NewRequest(http.MethodGet, "/studies/1.2/series/1.3/instances/1.4/frames/1", nil).WithContext(context.Background())
 	request.Header.Set("Accept", `multipart/related; type="image/*"; q=1, multipart/related; type="image/jpeg"; q=0`)
 	server.ServeHTTP(recorder, request)
 	if recorder.Code != http.StatusNotAcceptable {
@@ -828,7 +860,7 @@ func TestServerFramesRejectsMismatchedMediaTypeAndTransferSyntax(t *testing.T) {
 	}
 	server, _ := NewServer(ServerOptions{Backend: backend, AllowUnauthenticated: true})
 	recorder := httptest.NewRecorder()
-	request := httptest.NewRequest(http.MethodGet, "/studies/1/series/2/instances/3/frames/1", nil).WithContext(context.Background())
+	request := httptest.NewRequest(http.MethodGet, "/studies/1.2/series/1.3/instances/1.4/frames/1", nil).WithContext(context.Background())
 	request.Header.Set("Accept", `multipart/related; type="image/*"`)
 	server.ServeHTTP(recorder, request)
 	if recorder.Code != http.StatusInternalServerError || closed.Load() != 1 {
@@ -845,7 +877,7 @@ func TestServerFramesRejectsMismatchedMediaTypeAndTransferSyntax(t *testing.T) {
 		return err
 	}
 	recorder = httptest.NewRecorder()
-	request = httptest.NewRequest(http.MethodGet, "/studies/1/series/2/instances/3/frames/1,2", nil).WithContext(context.Background())
+	request = httptest.NewRequest(http.MethodGet, "/studies/1.2/series/1.3/instances/1.4/frames/1,2", nil).WithContext(context.Background())
 	request.Header.Set("Accept", `multipart/related; type="image/*"`)
 	server.ServeHTTP(recorder, request)
 	if !secondAccepted.Load() {
@@ -974,7 +1006,7 @@ func TestServerRejectsTransferSyntaxesForbiddenInWebServices(t *testing.T) {
 	}
 	server, _ := NewServer(ServerOptions{Backend: backend, AllowUnauthenticated: true})
 	recorder := httptest.NewRecorder()
-	request := httptest.NewRequest(http.MethodGet, "/studies/1/series/2/instances/3", nil).WithContext(context.Background())
+	request := httptest.NewRequest(http.MethodGet, "/studies/1.2/series/1.3/instances/1.4", nil).WithContext(context.Background())
 	request.Header.Set("Accept", `multipart/related; type="application/dicom"`)
 	server.ServeHTTP(recorder, request)
 	if recorder.Code != http.StatusInternalServerError || retrieveClosed.Load() != 1 {

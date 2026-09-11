@@ -214,7 +214,7 @@ func TestServerWADOStreamsStudyMetadataFramesAndBulk(t *testing.T) {
 		t.Fatalf("metadata = %#v", metadata)
 	}
 
-	req, _ = http.NewRequest(http.MethodGet, httpServer.URL+"/studies/1/series/2/instances/3/frames/1,2", nil)
+	req, _ = http.NewRequest(http.MethodGet, httpServer.URL+"/studies/1.2/series/1.3/instances/1.4/frames/1,2", nil)
 	req.Header.Set("Accept", `multipart/related; type="application/octet-stream"`)
 	resp, err = http.DefaultClient.Do(req)
 	if err != nil {

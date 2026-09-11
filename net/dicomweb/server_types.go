@@ -39,17 +39,19 @@ var (
 type Operation string
 
 const (
-	OperationSearchStudies    Operation = "search_studies"
-	OperationSearchSeries     Operation = "search_series"
-	OperationSearchInstances  Operation = "search_instances"
-	OperationRetrieveStudy    Operation = "retrieve_study"
-	OperationRetrieveSeries   Operation = "retrieve_series"
-	OperationRetrieveInstance Operation = "retrieve_instance"
-	OperationRetrieveMetadata Operation = "retrieve_metadata"
-	OperationRetrieveFrames   Operation = "retrieve_frames"
-	OperationRetrieveBulkData Operation = "retrieve_bulk_data"
-	OperationStoreInstances   Operation = "store_instances"
-	OperationUnknown          Operation = "unknown"
+	OperationSearchStudies     Operation = "search_studies"
+	OperationSearchSeries      Operation = "search_series"
+	OperationSearchInstances   Operation = "search_instances"
+	OperationRetrieveStudy     Operation = "retrieve_study"
+	OperationRetrieveSeries    Operation = "retrieve_series"
+	OperationRetrieveInstance  Operation = "retrieve_instance"
+	OperationRetrieveMetadata  Operation = "retrieve_metadata"
+	OperationRetrieveFrames    Operation = "retrieve_frames"
+	OperationRetrieveRendered  Operation = "retrieve_rendered"
+	OperationRetrieveThumbnail Operation = "retrieve_thumbnail"
+	OperationRetrieveBulkData  Operation = "retrieve_bulk_data"
+	OperationStoreInstances    Operation = "store_instances"
+	OperationUnknown           Operation = "unknown"
 )
 
 // AuditEvent contains only closed-schema operational metadata. It deliberately
@@ -75,6 +77,7 @@ type Authorizer func(context.Context, *http.Request, Operation) error
 type ServerLimits struct {
 	MaxRequestBytes       int64
 	MaxPartBytes          int64
+	MaxMetadataBytes      int64
 	MaxDecodedPartBytes   int64
 	MaxResponseBytes      int64
 	MaxRequestURIBytes    int
@@ -90,6 +93,7 @@ type ServerLimits struct {
 	MaxResults            int
 	MaxOffset             int
 	MaxFrames             int
+	MaxRenderedPixels     int64
 	MaxConcurrentRequests int
 	MaxDuration           time.Duration
 }
@@ -100,6 +104,7 @@ func DefaultServerLimits() ServerLimits {
 	return ServerLimits{
 		MaxRequestBytes:       2 << 30,
 		MaxPartBytes:          1 << 30,
+		MaxMetadataBytes:      64 << 20,
 		MaxDecodedPartBytes:   2 << 30,
 		MaxResponseBytes:      64 << 20,
 		MaxRequestURIBytes:    16 << 10,
@@ -115,6 +120,7 @@ func DefaultServerLimits() ServerLimits {
 		MaxResults:            100_000,
 		MaxOffset:             10_000_000,
 		MaxFrames:             10_000,
+		MaxRenderedPixels:     64 << 20,
 		MaxConcurrentRequests: 64,
 		MaxDuration:           5 * time.Minute,
 	}
@@ -132,7 +138,11 @@ type HTTPServerOptions struct {
 // ServerOptions configures an embeddable DICOMweb handler.
 type ServerOptions struct {
 	Backend any
-	Limits  ServerLimits
+	// Renderer resolves and renders WADO-RS rendered and thumbnail resources.
+	// It is separate from Backend so applications can compose storage and
+	// presentation implementations without coupling either to a UI.
+	Renderer Renderer
+	Limits   ServerLimits
 	// ServiceRoot is the externally visible mount path (for example,
 	// "/dicomweb"). It is used for same-origin URLs and Warning headers. Mount
 	// the handler with http.StripPrefix when it is non-empty.
@@ -211,7 +221,9 @@ type SearchResult struct {
 	MultipleValueMatchingApplied bool
 }
 
-// SearchBackend streams DICOM JSON result datasets synchronously through yield.
+// SearchBackend streams result datasets synchronously through yield. The
+// server encodes them as the negotiated DICOM JSON or Native DICOM XML media
+// type without coupling the backend to either wire representation.
 type SearchBackend interface {
 	Search(context.Context, SearchRequest, func(Dataset) error) (SearchResult, error)
 }
@@ -233,7 +245,8 @@ type MetadataRequest struct {
 	SOPInstanceUID    string
 }
 
-// MetadataBackend streams DICOM JSON metadata datasets synchronously.
+// MetadataBackend streams metadata datasets synchronously. The server encodes
+// them as the negotiated DICOM JSON or Native DICOM XML representation.
 type MetadataBackend interface {
 	Metadata(context.Context, MetadataRequest, func(Dataset) error) error
 }
@@ -286,8 +299,12 @@ type FrameRequest struct {
 	Accept []MediaPreference
 }
 
-// FramePartStream is one synchronous frame payload. If Reader implements
-// io.Closer, the server closes it after yield returns.
+// FramePartStream is one synchronous frame payload. Reader is valid only for
+// the duration of the callback that receives it. A server closes a Reader that
+// implements io.Closer after its backend callback returns. After a client
+// callback returns nil, the client drains unread bytes before advancing; it
+// closes the HTTP response when retrieval returns. Size may be -1 when the
+// length is unknown.
 type FramePartStream struct {
 	FrameNumber       int
 	ContentType       string
@@ -299,6 +316,77 @@ type FramePartStream struct {
 // FrameBackend streams requested frame payloads in request order.
 type FrameBackend interface {
 	RetrieveFrames(context.Context, FrameRequest, func(FramePartStream) error) error
+}
+
+// RenderLevel identifies the parent DICOM resource of a rendered response.
+type RenderLevel string
+
+const (
+	RenderLevelStudy    RenderLevel = "study"
+	RenderLevelSeries   RenderLevel = "series"
+	RenderLevelInstance RenderLevel = "instance"
+	RenderLevelFrames   RenderLevel = "frames"
+)
+
+// RenderViewport requests aspect-preserving scaling and, for non-thumbnail
+// resources, an optional source crop. Nil source values use the DICOM defaults.
+type RenderViewport struct {
+	Width        int
+	Height       int
+	SourceX      *float64
+	SourceY      *float64
+	SourceWidth  *float64
+	SourceHeight *float64
+}
+
+// RenderWindow requests a VOI window transformation.
+type RenderWindow struct {
+	Center   float64
+	Width    float64
+	Function string
+}
+
+// RenderRequest is a validated, bounded WADO-RS render request. Frames are
+// one-based and preserve URI order. A thumbnail request always expects exactly
+// one output representation, even when its parent is a collection.
+type RenderRequest struct {
+	Level       RenderLevel
+	Ref         InstanceRef
+	Frames      []int
+	Thumbnail   bool
+	Accept      []MediaPreference
+	Viewport    *RenderViewport
+	Window      *RenderWindow
+	Quality     int
+	QualitySet  bool
+	Annotations []string
+	ICCProfile  string
+	// MaxPixels and MaxOutputBytes are request-wide budgets. Renderers must
+	// check them before decoding or allocating source/output images.
+	MaxPixels      int64
+	MaxOutputBytes int64
+}
+
+// RenderedPart is one synchronous rendered representation. The server closes
+// Reader after yield returns when it implements io.Closer. Ref and FrameNumber
+// are used only to construct and validate protocol Content-Location values.
+type RenderedPart struct {
+	Ref         InstanceRef
+	FrameNumber int
+	ContentType string
+	Width       int
+	Height      int
+	Reader      io.Reader
+	Size        int64
+}
+
+// Renderer streams rendered representations synchronously. Implementations
+// own resource lookup and image rendering; the DICOMweb server owns routing,
+// validation, content negotiation, response framing, and finite limits.
+// An image/jpeg representation must be an 8-bit JPEG Baseline image as required
+// by DICOM PS3.18; implementations must not pass through arbitrary DICOM JPEG.
+type Renderer interface {
+	Render(context.Context, RenderRequest, func(RenderedPart) error) error
 }
 
 // BulkDataRequest contains an opaque, backend-defined token from an authorized
@@ -389,9 +477,9 @@ type ExistenceBackend interface {
 
 func normalizeServerLimits(limits ServerLimits) (ServerLimits, error) {
 	defaults := DefaultServerLimits()
-	if limits.MaxRequestBytes < 0 || limits.MaxPartBytes < 0 || limits.MaxDecodedPartBytes < 0 || limits.MaxResponseBytes < 0 ||
+	if limits.MaxRequestBytes < 0 || limits.MaxPartBytes < 0 || limits.MaxMetadataBytes < 0 || limits.MaxDecodedPartBytes < 0 || limits.MaxResponseBytes < 0 ||
 		limits.MaxRequestURIBytes < 0 || limits.MaxHeaderBytes < 0 || limits.MaxPartHeaderBytes < 0 || limits.MaxQueryValueBytes < 0 || limits.MaxUIDBytes < 0 || limits.MaxJSONValueBytes < 0 || limits.MaxJSONValues < 0 || limits.MaxJSONDepth < 0 || limits.MaxParts < 0 || limits.MaxQueryFields < 0 ||
-		limits.MaxResults < 0 || limits.MaxOffset < 0 || limits.MaxFrames < 0 || limits.MaxConcurrentRequests < 0 || limits.MaxDuration < 0 {
+		limits.MaxResults < 0 || limits.MaxOffset < 0 || limits.MaxFrames < 0 || limits.MaxRenderedPixels < 0 || limits.MaxConcurrentRequests < 0 || limits.MaxDuration < 0 {
 		return ServerLimits{}, ErrInvalidServerOptions
 	}
 	if limits.MaxRequestBytes == 0 {
@@ -399,6 +487,9 @@ func normalizeServerLimits(limits ServerLimits) (ServerLimits, error) {
 	}
 	if limits.MaxPartBytes == 0 {
 		limits.MaxPartBytes = defaults.MaxPartBytes
+	}
+	if limits.MaxMetadataBytes == 0 {
+		limits.MaxMetadataBytes = defaults.MaxMetadataBytes
 	}
 	if limits.MaxDecodedPartBytes == 0 {
 		limits.MaxDecodedPartBytes = defaults.MaxDecodedPartBytes
@@ -445,6 +536,9 @@ func normalizeServerLimits(limits ServerLimits) (ServerLimits, error) {
 	if limits.MaxFrames == 0 {
 		limits.MaxFrames = defaults.MaxFrames
 	}
+	if limits.MaxRenderedPixels == 0 {
+		limits.MaxRenderedPixels = defaults.MaxRenderedPixels
+	}
 	if limits.MaxConcurrentRequests == 0 {
 		limits.MaxConcurrentRequests = defaults.MaxConcurrentRequests
 	}
@@ -453,6 +547,9 @@ func normalizeServerLimits(limits ServerLimits) (ServerLimits, error) {
 	}
 	if limits.MaxPartBytes > limits.MaxRequestBytes {
 		limits.MaxPartBytes = limits.MaxRequestBytes
+	}
+	if limits.MaxMetadataBytes > limits.MaxPartBytes {
+		limits.MaxMetadataBytes = limits.MaxPartBytes
 	}
 	return limits, nil
 }

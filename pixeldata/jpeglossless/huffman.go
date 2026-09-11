@@ -117,17 +117,44 @@ func (br *bitReader) readBits(n int) (int, error) {
 	return v, nil
 }
 
-// alignToRestart discards the rest of the current byte and skips the next
-// restart marker (FF D0–D7).
-func (br *bitReader) alignToRestart() error {
+// alignToRestart validates entropy fill bits and consumes the exact expected
+// RST marker in the RST0..RST7 sequence.
+func (br *bitReader) alignToRestart(want byte) error {
+	if err := br.validateFillBits(); err != nil {
+		return err
+	}
 	br.nbits = 0
-	if br.pos+1 >= len(br.data) || br.data[br.pos] != 0xFF {
-		return fmt.Errorf("%w: expected restart marker", ErrInvalidStream)
+	if br.pos >= len(br.data) || br.data[br.pos] != 0xff {
+		return fmt.Errorf("%w: expected restart marker 0xFF%02X", ErrInvalidStream, want)
 	}
-	m := br.data[br.pos+1]
-	if m < 0xD0 || m > 0xD7 {
-		return fmt.Errorf("%w: 0xFF%02X is not a restart marker", ErrInvalidStream, m)
+	for br.pos < len(br.data) && br.data[br.pos] == 0xff {
+		br.pos++
 	}
-	br.pos += 2
+	if br.pos >= len(br.data) || br.data[br.pos] != want {
+		return fmt.Errorf("%w: invalid restart marker, want 0xFF%02X", ErrInvalidStream, want)
+	}
+	br.pos++
+	return nil
+}
+
+func (br *bitReader) finishEntropy() (int, error) {
+	if err := br.validateFillBits(); err != nil {
+		return 0, err
+	}
+	br.nbits = 0
+	if br.pos >= len(br.data) || br.data[br.pos] != 0xff {
+		return 0, fmt.Errorf("%w: trailing entropy data or missing marker", ErrInvalidStream)
+	}
+	return br.pos, nil
+}
+
+func (br *bitReader) validateFillBits() error {
+	if br.nbits == 0 {
+		return nil
+	}
+	mask := byte((1 << br.nbits) - 1)
+	if br.cur&mask != mask {
+		return fmt.Errorf("%w: invalid entropy fill bits", ErrInvalidStream)
+	}
 	return nil
 }

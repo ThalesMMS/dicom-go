@@ -2,6 +2,7 @@ package jpeg
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"image"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/ThalesMMS/dicom-go/object"
 	"github.com/ThalesMMS/dicom-go/pixeldata"
+	"github.com/ThalesMMS/dicom-go/pixeldata/encapsulated"
 )
 
 // DICOM JPEG transfer syntax UIDs supported by this adapter.
@@ -18,26 +20,43 @@ const (
 	// UID is the DICOM JPEG Baseline (Process 1) transfer syntax UID.
 	UID = "1.2.840.10008.1.2.4.50"
 	// UIDExtended is the DICOM JPEG Extended (Process 2 & 4) transfer syntax
-	// UID. This adapter supports the 8-bit SOF0/SOF1 subset accepted by
-	// image/jpeg, not 12-bit Process 4.
+	// UID. The codec supports 8-bit Process 2 through image/jpeg and the DICOM
+	// 12-bit unsigned monochrome Process 4 subset through its pure-Go decoder.
 	UIDExtended = "1.2.840.10008.1.2.4.51"
 )
 
 var (
 	ErrInvalidFragment            = errors.New("dicom: invalid JPEG still-image fragment")
 	ErrUnsupportedBitsAllocated   = errors.New("dicom: unsupported JPEG still-image BitsAllocated")
+	ErrUnsupportedBitsStored      = errors.New("dicom: unsupported JPEG still-image BitsStored")
+	ErrUnsupportedHighBit         = errors.New("dicom: unsupported JPEG still-image HighBit")
 	ErrUnsupportedSamplesPerPixel = errors.New("dicom: unsupported JPEG still-image SamplesPerPixel")
 	ErrImageSizeMismatch          = errors.New("dicom: JPEG still-image size does not match metadata")
 )
 
+type codecMode uint8
+
+const (
+	codecModeAuto codecMode = iota
+	codecModeBaseline
+	codecModeExtended
+)
+
 // Codec decodes DICOM JPEG Baseline and supported JPEG Extended encapsulated
-// pixel data using image/jpeg.
-type Codec struct{}
+// pixel data. Registered instances are transfer-syntax-specific; New retains
+// the historical dual-syntax behavior for direct callers.
+type Codec struct {
+	mode codecMode
+}
 
 // New returns a DICOM JPEG Baseline/Extended pixel data codec.
 func New() *Codec {
-	return &Codec{}
+	return &Codec{mode: codecModeAuto}
 }
+
+func newBaselineCodec() *Codec { return &Codec{mode: codecModeBaseline} }
+
+func newExtendedCodec() *Codec { return &Codec{mode: codecModeExtended} }
 
 // Register registers the JPEG Baseline and JPEG Extended codecs in the provided
 // pixel data registry.
@@ -45,22 +64,22 @@ func Register(registry pixeldata.Registry) error {
 	if registry == nil {
 		return pixeldata.ErrCodecRegistryNil
 	}
-	if err := registry.RegisterCodec(UID, New()); err != nil {
+	if err := registry.RegisterCodec(UID, newBaselineCodec()); err != nil {
 		return err
 	}
-	return registry.RegisterCodec(UIDExtended, New())
+	return registry.RegisterCodec(UIDExtended, newExtendedCodec())
 }
 
 // RegisterDefault registers the JPEG Baseline and JPEG Extended codecs in
 // pixeldata.DefaultRegistry.
 func RegisterDefault() error {
-	if err := pixeldata.RegisterCodec(UID, New()); err != nil {
+	if err := pixeldata.RegisterCodec(UID, newBaselineCodec()); err != nil {
 		return err
 	}
-	return pixeldata.RegisterCodec(UIDExtended, New())
+	return pixeldata.RegisterCodec(UIDExtended, newExtendedCodec())
 }
 
-func (*Codec) Decode(pixel pixeldata.PixelData, obj *object.Object) (pixeldata.Frames, error) {
+func (c *Codec) Decode(pixel pixeldata.PixelData, obj *object.Object) (pixeldata.Frames, error) {
 	if !pixel.Encapsulated {
 		return pixeldata.Frames{}, fmt.Errorf("%w: JPEG still-image codec requires encapsulated pixel data", pixeldata.ErrIncompatiblePixelData)
 	}
@@ -69,11 +88,32 @@ func (*Codec) Decode(pixel pixeldata.PixelData, obj *object.Object) (pixeldata.F
 	if err != nil {
 		return pixeldata.Frames{}, err
 	}
-	if metadata.BitsAllocated != 8 {
+	highPrecision := metadata.BitsAllocated == 16 && c.mode != codecModeBaseline
+	if c.mode == codecModeBaseline && metadata.BitsAllocated != 8 {
 		return pixeldata.Frames{}, fmt.Errorf("%w: BitsAllocated=%d", ErrUnsupportedBitsAllocated, metadata.BitsAllocated)
+	}
+	if metadata.BitsAllocated != 8 && !highPrecision {
+		return pixeldata.Frames{}, fmt.Errorf("%w: BitsAllocated=%d", ErrUnsupportedBitsAllocated, metadata.BitsAllocated)
+	}
+	if !highPrecision && metadata.BitsStored != 8 {
+		return pixeldata.Frames{}, fmt.Errorf("%w: BitsStored=%d", ErrUnsupportedBitsStored, metadata.BitsStored)
+	}
+	if !highPrecision && metadata.HighBit != 7 {
+		return pixeldata.Frames{}, fmt.Errorf("%w: HighBit=%d", ErrUnsupportedHighBit, metadata.HighBit)
+	}
+	if highPrecision && metadata.BitsStored != extendedProcess4Precision {
+		// Preserve the historical classification for a 16-bit native layout
+		// that is not the qualified Process 4 representation.
+		return pixeldata.Frames{}, fmt.Errorf("%w: BitsStored=%d", ErrUnsupportedBitsAllocated, metadata.BitsStored)
+	}
+	if highPrecision && metadata.HighBit != extendedProcess4Precision-1 {
+		return pixeldata.Frames{}, fmt.Errorf("%w: HighBit=%d", ErrUnsupportedHighBit, metadata.HighBit)
 	}
 	if metadata.SamplesPerPixel != 1 && metadata.SamplesPerPixel != 3 {
 		return pixeldata.Frames{}, fmt.Errorf("%w: SamplesPerPixel=%d", ErrUnsupportedSamplesPerPixel, metadata.SamplesPerPixel)
+	}
+	if highPrecision && metadata.SamplesPerPixel != 1 {
+		return pixeldata.Frames{}, fmt.Errorf("%w: JPEG Extended Process 4 requires one component", ErrUnsupportedSamplesPerPixel)
 	}
 	if metadata.PixelRepresentation != 0 {
 		return pixeldata.Frames{}, fmt.Errorf("%w: PixelRepresentation=%d", pixeldata.ErrUnsupportedPixelRepresentation, metadata.PixelRepresentation)
@@ -90,21 +130,68 @@ func (*Codec) Decode(pixel pixeldata.PixelData, obj *object.Object) (pixeldata.F
 		)
 	}
 
-	fragments := pixel.Sequence.Fragments
-	if len(fragments) == 0 {
-		return pixeldata.Frames{}, fmt.Errorf("%w: no frame fragments", ErrInvalidFragment)
+	codestreams, err := encapsulated.FromFragments(context.Background(), pixel.Sequence, obj, metadata.NumberOfFrames, encapsulated.JPEG, encapsulated.Limits{})
+	if err != nil {
+		if errors.Is(err, encapsulated.ErrFrameCount) {
+			err = errors.Join(pixeldata.ErrPixelDataSizeMismatch, err)
+		}
+		return pixeldata.Frames{}, fmt.Errorf("%w: %w", ErrInvalidFragment, err)
 	}
-	if metadata.NumberOfFrames != len(fragments) {
-		return pixeldata.Frames{}, fmt.Errorf(
-			"%w: NumberOfFrames=%d fragments=%d",
-			pixeldata.ErrPixelDataSizeMismatch,
-			metadata.NumberOfFrames,
-			len(fragments),
-		)
+	if highPrecision {
+		if err := validateExtendedProcess4Request(metadata, pixel.Sequence.Fragments); err != nil {
+			return pixeldata.Frames{}, err
+		}
+	}
+	// Retained native output, source payload, the largest joined compressed
+	// frame and one decoder image coexist. Check them before any image decode.
+	frameBytes := metadata.FrameSize()
+	const maxRequestBytes = uint64(512 << 20)
+	if frameBytes <= 0 || uint64(frameBytes) > maxRequestBytes/uint64(metadata.NumberOfFrames) {
+		return pixeldata.Frames{}, fmt.Errorf("%w: decoded request exceeds resource limit", ErrInvalidFragment)
+	}
+	requestBytes := uint64(frameBytes)*uint64(metadata.NumberOfFrames) + codestreams.InputBytes() + codestreams.MaxFrameBytes() + uint64(metadata.Rows)*uint64(metadata.Columns)*4
+	if requestBytes > maxRequestBytes {
+		return pixeldata.Frames{}, fmt.Errorf("%w: request working set exceeds resource limit", ErrInvalidFragment)
 	}
 
-	frames := make([][]byte, len(fragments))
-	for i, fragment := range fragments {
+	frames := make([][]byte, codestreams.Len())
+	for i := range frames {
+		view, err := codestreams.Frame(context.Background(), i)
+		if err != nil {
+			return pixeldata.Frames{}, fmt.Errorf("%w: %w", ErrInvalidFragment, err)
+		}
+		fragment := view.Data
+		sof, err := jpegFrameSOFMarker(fragment)
+		if err != nil {
+			return pixeldata.Frames{}, fmt.Errorf("%w: frame %d: %w", ErrInvalidFragment, i, err)
+		}
+		if c.mode == codecModeBaseline && sof != 0xc0 {
+			return pixeldata.Frames{}, fmt.Errorf("%w: frame %d: JPEG Baseline requires SOF0", ErrInvalidFragment, i)
+		}
+		if c.mode == codecModeExtended && sof != 0xc1 {
+			return pixeldata.Frames{}, fmt.Errorf("%w: frame %d: JPEG Extended requires SOF1", ErrInvalidFragment, i)
+		}
+		if highPrecision {
+			if sof != 0xc1 {
+				return pixeldata.Frames{}, fmt.Errorf("%w: BitsAllocated=%d requires JPEG Extended SOF1", ErrUnsupportedBitsAllocated, metadata.BitsAllocated)
+			}
+			frame, err := decodeExtendedProcess4(fragment, metadata)
+			if err != nil {
+				return pixeldata.Frames{}, fmt.Errorf("%w: frame %d: %w", ErrInvalidFragment, i, err)
+			}
+			frames[i] = frame
+			continue
+		}
+		if err := encapsulated.ValidateFrame(context.Background(), fragment, encapsulated.JPEG); err != nil {
+			return pixeldata.Frames{}, fmt.Errorf("%w: %w", ErrInvalidFragment, err)
+		}
+		config, err := stdjpeg.DecodeConfig(bytes.NewReader(fragment))
+		if err != nil {
+			return pixeldata.Frames{}, fmt.Errorf("%w: %w", ErrInvalidFragment, err)
+		}
+		if config.Width != int(metadata.Columns) || config.Height != int(metadata.Rows) {
+			return pixeldata.Frames{}, ErrImageSizeMismatch
+		}
 		img, err := stdjpeg.Decode(bytes.NewReader(fragment))
 		if err != nil {
 			return pixeldata.Frames{}, fmt.Errorf("%w: frame %d: %w", ErrInvalidFragment, i, err)

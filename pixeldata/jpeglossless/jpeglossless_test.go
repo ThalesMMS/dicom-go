@@ -329,6 +329,12 @@ func TestJPEGLosslessRejectsInvalidSOF3PrecisionAndPointTransform(t *testing.T) 
 			},
 		},
 		{
+			name: "precision below Process 14 minimum",
+			mutate: func(t *testing.T, fragment []byte) {
+				setSOF3Precision(t, fragment, 1)
+			},
+		},
+		{
 			name: "precision above 16 bits",
 			mutate: func(t *testing.T, fragment []byte) {
 				setSOF3Precision(t, fragment, 17)

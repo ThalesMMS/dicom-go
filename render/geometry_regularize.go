@@ -207,7 +207,7 @@ func regularizePatientGrid(source *Volume) (*Volume, error) {
 	// spacing or gantry geometry is irregular. Cache a normalized copy of the
 	// regular grid as the explicit parent so its descriptor and payload describe
 	// the same voxel coordinates.
-	sourceDescriptor, err := target.snapshotDescriptor(VolumeDerivationNormalized, 0)
+	sourceDescriptor, err := target.snapshotDescriptor(VolumeDerivationNormalized, 0, true)
 	if err != nil {
 		return nil, fmt.Errorf("render: describe source generation: %w", err)
 	}
@@ -228,7 +228,7 @@ func regularizePatientGrid(source *Volume) (*Volume, error) {
 		return nil, fmt.Errorf("render: lease source generation: %w", err)
 	}
 	parentGeneration := sourceGeneration
-	descriptor, err := target.snapshotDescriptor(VolumeDerivationRegularized, parentGeneration)
+	descriptor, err := target.snapshotDescriptor(VolumeDerivationRegularized, parentGeneration, false)
 	if err != nil {
 		_ = parentLease.Release()
 		return nil, err

@@ -78,6 +78,11 @@ const (
 	VolumeDerivationUnknown VolumeDerivation = iota
 	VolumeDerivationNormalized
 	VolumeDerivationRegularized
+	// VolumeDerivationVRPrefiltered is a render-only float32 generation. Its
+	// source relationship is carried by VRPreparedVolume.SourceIdentity because
+	// the prepared payload lives in a separate store and cannot name a foreign
+	// store generation as ParentGeneration.
+	VolumeDerivationVRPrefiltered
 )
 
 func (d VolumeDerivation) String() string {
@@ -86,6 +91,8 @@ func (d VolumeDerivation) String() string {
 		return "normalized"
 	case VolumeDerivationRegularized:
 		return "regularized"
+	case VolumeDerivationVRPrefiltered:
+		return "vr_prefiltered"
 	default:
 		return "unknown"
 	}
@@ -230,6 +237,15 @@ type VolumeSnapshot struct {
 
 // Descriptor returns a value copy of the immutable snapshot header.
 func (s VolumeSnapshot) Descriptor() (VolumeDescriptor, error) {
+	if s.lease != nil {
+		s.lease.mu.Lock()
+		if !s.lease.released && s.lease.descriptorOverride != nil {
+			descriptor := *s.lease.descriptorOverride
+			s.lease.mu.Unlock()
+			return descriptor, nil
+		}
+		s.lease.mu.Unlock()
+	}
 	record, err := s.record()
 	if err != nil {
 		return VolumeDescriptor{}, err
@@ -471,15 +487,18 @@ func validateVolumeDescriptor(descriptor VolumeDescriptor, generationPending boo
 	}
 	if descriptor.Derivation != VolumeDerivationUnknown &&
 		descriptor.Derivation != VolumeDerivationNormalized &&
-		descriptor.Derivation != VolumeDerivationRegularized {
+		descriptor.Derivation != VolumeDerivationRegularized &&
+		descriptor.Derivation != VolumeDerivationVRPrefiltered {
 		return fail("unknown derivation %d", descriptor.Derivation)
 	}
 	if descriptor.Derivation == VolumeDerivationRegularized && descriptor.ParentGeneration == 0 {
 		return fail("regularized generation lacks parent")
 	}
-	if (descriptor.Derivation == VolumeDerivationUnknown || descriptor.Derivation == VolumeDerivationNormalized) &&
+	if (descriptor.Derivation == VolumeDerivationUnknown ||
+		descriptor.Derivation == VolumeDerivationNormalized ||
+		descriptor.Derivation == VolumeDerivationVRPrefiltered) &&
 		descriptor.ParentGeneration != 0 {
-		return fail("normalized generation has parent %d", descriptor.ParentGeneration)
+		return fail("root generation has parent %d", descriptor.ParentGeneration)
 	}
 	if descriptor.Components != 1 {
 		return fail("components %d, want 1", descriptor.Components)

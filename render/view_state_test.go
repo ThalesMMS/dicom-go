@@ -11,17 +11,129 @@ import (
 
 func TestFreezeViewStateOwnsVariableMembers(t *testing.T) {
 	state := validVRViewState()
+	state.ContractVersion = ViewStateContractVersionV2
+	state.StructSize = ViewStateHeaderSizeV2
+	state.VR.CutMask = VoxelMask{
+		Dimensions: [3]uint32{2, 2, 1},
+		Words:      []uint32{0b1001},
+	}
 	frozen, err := FreezeViewState(state)
 	if err != nil {
 		t.Fatal(err)
 	}
 	state.VR.ClippingPlanesLPS[0][0] = 9
 	state.VR.TransferLUT.Samples[0].R = 1
+	state.VR.CutMask.Words[0] = 0
 	if frozen.VR.ClippingPlanesLPS[0][0] != 1 {
 		t.Fatal("frozen clipping planes alias caller memory")
 	}
 	if frozen.VR.TransferLUT.Samples[0].R != 0 {
 		t.Fatal("frozen transfer LUT aliases caller memory")
+	}
+	if frozen.VR.CutMask.Words[0] != 0b1001 {
+		t.Fatal("frozen cut mask aliases caller memory")
+	}
+}
+
+func TestValidateViewStateV2AcceptsEndoscopyCropAndCut(t *testing.T) {
+	state := validVRViewState()
+	state.ContractVersion = ViewStateContractVersionV2
+	state.StructSize = ViewStateHeaderSizeV2
+	state.VR.Projection = ProjectionEndoscopy
+	state.VR.Crop = NormalizedCropBox{
+		Enabled: 1,
+		Min:     [3]float64{0.1, 0.2, 0.3},
+		Max:     [3]float64{0.9, 0.8, 0.7},
+	}
+	state.VR.CutMask = VoxelMask{
+		Dimensions: [3]uint32{2, 2, 1},
+		Words:      []uint32{0b1001},
+	}
+	if err := ValidateViewState(state); err != nil {
+		t.Fatalf("valid V2 VR state rejected: %v", err)
+	}
+}
+
+func TestValidateViewStateV3RequiresPhysicalOpacityUnitDistance(t *testing.T) {
+	state := validVRViewState()
+	state.ContractVersion = ViewStateContractVersionV3
+	state.StructSize = ViewStateHeaderSizeV3
+	state.VR.OpacityUnitDistanceMM = 1
+	if err := ValidateViewState(state); err != nil {
+		t.Fatalf("valid V3 VR state rejected: %v", err)
+	}
+	state.VR.OpacityUnitDistanceMM = 0
+	if err := ValidateViewState(state); !errors.Is(err, ErrInvalidViewState) {
+		t.Fatalf("V3 zero opacity unit error = %v", err)
+	}
+
+	legacy := validVRViewState()
+	if err := ValidateViewState(legacy); err != nil {
+		t.Fatalf("V1 zero opacity unit compatibility rejected: %v", err)
+	}
+	if got := legacy.VR.EffectiveOpacityUnitDistanceMM(); got != DefaultVROpacityUnitDistanceMM {
+		t.Fatalf("legacy opacity unit fallback = %v", got)
+	}
+}
+
+func TestValidateViewStateV4RequiresFrozenOpaqueBackground(t *testing.T) {
+	state := validVRViewState()
+	state.ContractVersion = ViewStateContractVersionV4
+	state.StructSize = ViewStateHeaderSizeV4
+	state.VR.OpacityUnitDistanceMM = 1
+	state.VR.BackgroundRGBA = [4]float64{0.1, 0.2, 0.3, 1}
+	if err := ValidateViewState(state); err != nil {
+		t.Fatalf("valid V4 VR state rejected: %v", err)
+	}
+
+	for _, background := range [][4]float64{
+		{},
+		{0, 0, 0, 0.5},
+		{-0.1, 0, 0, 1},
+		{0, 0, 1.1, 1},
+		{math.NaN(), 0, 0, 1},
+	} {
+		state.VR.BackgroundRGBA = background
+		if err := ValidateViewState(state); !errors.Is(err, ErrInvalidViewState) {
+			t.Fatalf("V4 background %v error = %v", background, err)
+		}
+	}
+
+	legacy := validVRViewState()
+	legacy.VR.BackgroundRGBA = [4]float64{0, 0, 0, 1}
+	if err := ValidateViewState(legacy); !errors.Is(err, ErrInvalidViewState) {
+		t.Fatalf("V1 accepted unversioned background: %v", err)
+	}
+}
+
+func TestValidateViewStateV1RejectsV2Fields(t *testing.T) {
+	state := validVRViewState()
+	state.ContractVersion = ViewStateContractVersionV1
+	state.StructSize = ViewStateHeaderSizeV1
+	state.VR.Projection = ProjectionEndoscopy
+	if err := ValidateViewState(state); !errors.Is(err, ErrInvalidViewState) {
+		t.Fatalf("V1 endoscopy error = %v", err)
+	}
+}
+
+func TestValidateViewStateV2RejectsMalformedCropAndCut(t *testing.T) {
+	state := validVRViewState()
+	state.ContractVersion = ViewStateContractVersionV2
+	state.StructSize = ViewStateHeaderSizeV2
+	state.VR.Crop = NormalizedCropBox{Enabled: 1, Min: [3]float64{0.8, 0, 0}, Max: [3]float64{0.2, 1, 1}}
+	if err := ValidateViewState(state); !errors.Is(err, ErrInvalidViewState) {
+		t.Fatalf("inverted crop error = %v", err)
+	}
+
+	state.VR.Crop = NormalizedCropBox{}
+	state.VR.CutMask = VoxelMask{Dimensions: [3]uint32{65, 1, 1}, Words: []uint32{1}}
+	if err := ValidateViewState(state); !errors.Is(err, ErrInvalidViewState) {
+		t.Fatalf("short cut mask error = %v", err)
+	}
+
+	state.VR.CutMask = VoxelMask{Dimensions: [3]uint32{math.MaxUint32, math.MaxUint32, 1}}
+	if err := ValidateViewState(state); !errors.Is(err, ErrInvalidViewState) {
+		t.Fatalf("boundary cut mask error = %v", err)
 	}
 }
 

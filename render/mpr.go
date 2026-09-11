@@ -1,6 +1,7 @@
 package render
 
 import (
+	"context"
 	"fmt"
 	"image"
 	"image/color"
@@ -25,10 +26,12 @@ const (
 	GantryTiltSourceGeometry
 )
 
-// MPRRenderOptions controls geometry choices shared by single-plane and
-// projection MPR rendering. The zero value applies gantry-tilt correction.
+// MPRRenderOptions controls geometry and resource limits shared by single-plane
+// and projection MPR rendering. The zero value applies gantry-tilt correction
+// and finite default limits.
 type MPRRenderOptions struct {
 	GantryTiltMode GantryTiltRenderMode
+	Limits         MPRLimits
 }
 
 func DefaultMPRRenderOptions() MPRRenderOptions {
@@ -54,13 +57,20 @@ func RenderMPRPlaneWithOptions(series *Stack, plane MPRPlane, index int, window 
 	if rows <= 0 || cols <= 0 {
 		return blankImage(512, 512), fmt.Errorf("render: invalid slice dimensions")
 	}
+	limits, err := normalizeMPRLimits(options.Limits)
+	if err != nil {
+		return blankImage(1, 1), err
+	}
 	window = normalizeWindow(window, series.DefaultWindow)
 	mapper := prepareWindow(window)
 	if plane == MPRPlaneCoronal || plane == MPRPlaneSagittal {
 		correctTilt := options.GantryTiltMode != GantryTiltSourceGeometry
 		if vol, sampler, err := stackVolumeSampler(series, correctTilt); err == nil {
-			img, rendered := renderCachedMPRPlane(vol, sampler, plane, index, mapper, correctTilt)
+			img, rendered, renderErr := renderCachedMPRPlane(vol, sampler, plane, index, mapper, correctTilt, limits)
 			sampler.Close()
+			if renderErr != nil {
+				return blankImage(1, 1), renderErr
+			}
 			if rendered {
 				return img, nil
 			}
@@ -70,6 +80,9 @@ func RenderMPRPlaneWithOptions(series *Stack, plane MPRPlane, index int, window 
 	}
 	switch plane {
 	case MPRPlaneAxial:
+		if _, err := validateMPROutput(cols, rows, 1, 1, limits); err != nil {
+			return blankImage(1, 1), err
+		}
 		if index < 0 {
 			index = 0
 		}
@@ -85,6 +98,9 @@ func RenderMPRPlaneWithOptions(series *Stack, plane MPRPlane, index int, window 
 			index = rows - 1
 		}
 		height := orthogonalMPRHeight(series, seriesColumnSpacing(series))
+		if _, err := validateMPROutput(cols, height, 1, 1, limits); err != nil {
+			return blankImage(1, 1), err
+		}
 		img := image.NewGray(image.Rect(0, 0, cols, height))
 		for outZ := 0; outZ < height; outZ++ {
 			slice := series.Frames[orthogonalDisplaySliceIndex(outZ, height, len(series.Frames))]
@@ -101,6 +117,9 @@ func RenderMPRPlaneWithOptions(series *Stack, plane MPRPlane, index int, window 
 			index = cols - 1
 		}
 		height := orthogonalMPRHeight(series, seriesRowSpacing(series))
+		if _, err := validateMPROutput(rows, height, 1, 1, limits); err != nil {
+			return blankImage(1, 1), err
+		}
 		img := image.NewGray(image.Rect(0, 0, rows, height))
 		for outZ := 0; outZ < height; outZ++ {
 			slice := series.Frames[orthogonalDisplaySliceIndex(outZ, height, len(series.Frames))]
@@ -132,17 +151,18 @@ func stackVolumeSampler(series *Stack, regularize bool) (*Volume, *volumeSampler
 	return vol, sampler, nil
 }
 
-func renderCachedMPRPlane(vol *Volume, sampler *volumeSampler, plane MPRPlane, index int, mapper preparedVOI, correctGantryTilt bool) (image.Image, bool) {
+func renderCachedMPRPlane(vol *Volume, sampler *volumeSampler, plane MPRPlane, index int, mapper preparedVOI, correctGantryTilt bool, limits MPRLimits) (image.Image, bool, error) {
 	if vol == nil || sampler == nil {
-		return nil, false
+		return nil, false, nil
 	}
 	rows, cols, depth := sampler.rows, sampler.cols, sampler.depth
 	if rows <= 0 || cols <= 0 || depth <= 0 {
-		return nil, false
+		return nil, false, nil
 	}
 	if correctGantryTilt {
 		if corrected, width, height, ok := vol.correctedOrthogonalPlane(plane, index); ok {
-			return resliceObliqueWithSampler(vol, sampler, corrected, width, height, mapper), true
+			img, err := resliceObliqueWithSamplerLimitsContext(context.Background(), vol, sampler, corrected, width, height, mapper, limits)
+			return img, true, err
 		}
 	}
 	switch plane {
@@ -154,6 +174,9 @@ func renderCachedMPRPlane(vol *Volume, sampler *volumeSampler, plane MPRPlane, i
 			index = rows - 1
 		}
 		height := orthogonalVolumeHeight(depth, vol.SliceSpacing, vol.ColSpacing)
+		if _, err := validateMPROutput(cols, height, 1, 1, limits); err != nil {
+			return nil, true, err
+		}
 		img := image.NewGray(image.Rect(0, 0, cols, height))
 		parallelRows(height, func(outZ int) {
 			z := orthogonalDisplaySliceIndex(outZ, height, depth)
@@ -164,7 +187,7 @@ func renderCachedMPRPlane(vol *Volume, sampler *volumeSampler, plane MPRPlane, i
 				}
 			}
 		})
-		return img, true
+		return img, true, nil
 	case MPRPlaneSagittal:
 		if index < 0 {
 			index = 0
@@ -173,6 +196,9 @@ func renderCachedMPRPlane(vol *Volume, sampler *volumeSampler, plane MPRPlane, i
 			index = cols - 1
 		}
 		height := orthogonalVolumeHeight(depth, vol.SliceSpacing, vol.RowSpacing)
+		if _, err := validateMPROutput(rows, height, 1, 1, limits); err != nil {
+			return nil, true, err
+		}
 		img := image.NewGray(image.Rect(0, 0, rows, height))
 		parallelRows(height, func(outZ int) {
 			z := orthogonalDisplaySliceIndex(outZ, height, depth)
@@ -183,9 +209,9 @@ func renderCachedMPRPlane(vol *Volume, sampler *volumeSampler, plane MPRPlane, i
 				}
 			}
 		})
-		return img, true
+		return img, true, nil
 	default:
-		return nil, false
+		return nil, false, nil
 	}
 }
 

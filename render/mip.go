@@ -1,6 +1,7 @@
 package render
 
 import (
+	"context"
 	"fmt"
 	"image"
 	"image/color"
@@ -56,12 +57,19 @@ func RenderSlabWithOptions(series *Stack, plane MPRPlane, center, thickness int,
 	if rows <= 0 || cols <= 0 {
 		return blankImage(512, 512), fmt.Errorf("render: invalid slice dimensions")
 	}
+	limits, err := normalizeMPRLimits(options.Limits)
+	if err != nil {
+		return blankImage(1, 1), err
+	}
 	window = normalizeWindow(window, series.DefaultWindow)
 	mapper := prepareWindow(window)
 	correctTilt := options.GantryTiltMode != GantryTiltSourceGeometry
 	if vol, sampler, err := stackVolumeSampler(series, correctTilt); err == nil {
-		img, rendered := renderCachedSlab(vol, sampler, plane, center, thickness, mode, mapper, correctTilt)
+		img, rendered, renderErr := renderCachedSlab(vol, sampler, plane, center, thickness, mode, mapper, correctTilt, limits)
 		sampler.Close()
+		if renderErr != nil {
+			return blankImage(1, 1), renderErr
+		}
 		if rendered {
 			return img, nil
 		}
@@ -72,6 +80,9 @@ func RenderSlabWithOptions(series *Stack, plane MPRPlane, center, thickness int,
 	switch plane {
 	case MPRPlaneAxial:
 		start, end := mipProjectionRange(center, thickness, len(series.Frames))
+		if _, err := validateMPROutput(cols, rows, end-start+1, 1, limits); err != nil {
+			return blankImage(1, 1), err
+		}
 		img := image.NewGray(image.Rect(0, 0, cols, rows))
 		for y := 0; y < rows; y++ {
 			for x := 0; x < cols; x++ {
@@ -87,6 +98,9 @@ func RenderSlabWithOptions(series *Stack, plane MPRPlane, center, thickness int,
 	case MPRPlaneCoronal:
 		start, end := mipProjectionRange(center, thickness, rows)
 		height := orthogonalMPRHeight(series, seriesColumnSpacing(series))
+		if _, err := validateMPROutput(cols, height, end-start+1, 1, limits); err != nil {
+			return blankImage(1, 1), err
+		}
 		img := image.NewGray(image.Rect(0, 0, cols, height))
 		for outZ := 0; outZ < height; outZ++ {
 			slice := series.Frames[orthogonalDisplaySliceIndex(outZ, height, len(series.Frames))]
@@ -103,6 +117,9 @@ func RenderSlabWithOptions(series *Stack, plane MPRPlane, center, thickness int,
 	case MPRPlaneSagittal:
 		start, end := mipProjectionRange(center, thickness, cols)
 		height := orthogonalMPRHeight(series, seriesRowSpacing(series))
+		if _, err := validateMPROutput(rows, height, end-start+1, 1, limits); err != nil {
+			return blankImage(1, 1), err
+		}
 		img := image.NewGray(image.Rect(0, 0, rows, height))
 		for outZ := 0; outZ < height; outZ++ {
 			slice := series.Frames[orthogonalDisplaySliceIndex(outZ, height, len(series.Frames))]
@@ -121,28 +138,34 @@ func RenderSlabWithOptions(series *Stack, plane MPRPlane, center, thickness int,
 	}
 }
 
-func renderCachedSlab(vol *Volume, sampler *volumeSampler, plane MPRPlane, center, thickness int, mode SlabMode, mapper preparedVOI, correctGantryTilt bool) (image.Image, bool) {
+func renderCachedSlab(vol *Volume, sampler *volumeSampler, plane MPRPlane, center, thickness int, mode SlabMode, mapper preparedVOI, correctGantryTilt bool, limits MPRLimits) (image.Image, bool, error) {
 	if vol == nil || sampler == nil {
-		return nil, false
+		return nil, false, nil
 	}
 	rows, cols, depth := sampler.rows, sampler.cols, sampler.depth
 	if rows <= 0 || cols <= 0 || depth <= 0 {
-		return nil, false
+		return nil, false, nil
 	}
 	if correctGantryTilt {
 		if corrected, width, height, ok := vol.correctedOrthogonalPlane(plane, center); ok {
 			slabAxis, step, sampleCount := vol.correctedSlabAxis(plane, vol.Rows, vol.Cols)
 			clampedCenter := clampIndex(center, sampleCount)
 			start, end := mipProjectionRange(clampedCenter, thickness, sampleCount)
-			return resliceObliqueSlabRangeWithSampler(
+			img, err := resliceObliqueSlabRangeWithSamplerLimitsContext(
+				context.Background(),
 				vol, sampler, corrected, slabAxis, width, height,
 				float64(start-clampedCenter), end-start+1, step, mode, mapper,
-			), true
+				limits,
+			)
+			return img, true, err
 		}
 	}
 	switch plane {
 	case MPRPlaneAxial:
 		start, end := mipProjectionRange(center, thickness, depth)
+		if _, err := validateMPROutput(cols, rows, end-start+1, 1, limits); err != nil {
+			return nil, true, err
+		}
 		img := image.NewGray(image.Rect(0, 0, cols, rows))
 		parallelRows(rows, func(y int) {
 			offset := img.PixOffset(0, y)
@@ -152,10 +175,13 @@ func renderCachedSlab(vol *Volume, sampler *volumeSampler, plane MPRPlane, cente
 				}
 			}
 		})
-		return img, true
+		return img, true, nil
 	case MPRPlaneCoronal:
 		start, end := mipProjectionRange(center, thickness, rows)
 		height := orthogonalVolumeHeight(depth, vol.SliceSpacing, vol.ColSpacing)
+		if _, err := validateMPROutput(cols, height, end-start+1, 1, limits); err != nil {
+			return nil, true, err
+		}
 		img := image.NewGray(image.Rect(0, 0, cols, height))
 		parallelRows(height, func(outZ int) {
 			z := orthogonalDisplaySliceIndex(outZ, height, depth)
@@ -166,10 +192,13 @@ func renderCachedSlab(vol *Volume, sampler *volumeSampler, plane MPRPlane, cente
 				}
 			}
 		})
-		return img, true
+		return img, true, nil
 	case MPRPlaneSagittal:
 		start, end := mipProjectionRange(center, thickness, cols)
 		height := orthogonalVolumeHeight(depth, vol.SliceSpacing, vol.RowSpacing)
+		if _, err := validateMPROutput(rows, height, end-start+1, 1, limits); err != nil {
+			return nil, true, err
+		}
 		img := image.NewGray(image.Rect(0, 0, rows, height))
 		parallelRows(height, func(outZ int) {
 			z := orthogonalDisplaySliceIndex(outZ, height, depth)
@@ -180,9 +209,9 @@ func renderCachedSlab(vol *Volume, sampler *volumeSampler, plane MPRPlane, cente
 				}
 			}
 		})
-		return img, true
+		return img, true, nil
 	default:
-		return nil, false
+		return nil, false, nil
 	}
 }
 

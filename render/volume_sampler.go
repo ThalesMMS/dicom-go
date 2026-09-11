@@ -26,12 +26,12 @@ func (v *Volume) AcquireReader() (*VolumeReader, error) {
 	if v.closed.Load() {
 		return nil, ErrVolumeStoreClosed
 	}
-	sampler, ok := newVolumeSampler(v)
-	if !ok {
+	sampler, err := newVolumeSamplerWithError(v)
+	if err != nil {
 		if v.closed.Load() {
 			return nil, ErrVolumeStoreClosed
 		}
-		return nil, fmt.Errorf("render: volume sampler unavailable")
+		return nil, err
 	}
 	return &VolumeReader{source: v, sampler: sampler}, nil
 }
@@ -102,6 +102,19 @@ func newVolumeSamplerWithError(vol *Volume) (*volumeSampler, error) {
 	lease, err := vol.acquireDirectSnapshot()
 	if err != nil {
 		return nil, err
+	}
+	return newVolumeSamplerFromLease(vol, lease)
+}
+
+// newVolumeSamplerFromLease resolves one already-acquired immutable generation
+// into the lock-free sampler used by CPU rendering and render-only preparation.
+// Ownership of lease transfers to the returned sampler; failures release it.
+func newVolumeSamplerFromLease(vol *Volume, lease *VolumeLease) (*volumeSampler, error) {
+	if vol == nil || lease == nil || vol.Cols <= 0 || vol.Rows <= 0 || vol.Depth <= 0 {
+		if lease != nil {
+			_ = lease.Release()
+		}
+		return nil, fmt.Errorf("render: invalid volume sampler lease")
 	}
 	// Resolve the immutable backing record once while the lease is active.
 	// Sampling through VolumeSnapshot.ModalityAt would intentionally revalidate
@@ -264,6 +277,10 @@ type volumeGradientCell struct {
 }
 
 func (cell *volumeGradientCell) gradient(s *volumeSampler, sample volumeTextureSample) Vec3 {
+	return s.gradientOpacityVector(cell.gradientIndex(s, sample))
+}
+
+func (cell *volumeGradientCell) gradientIndex(s *volumeSampler, sample volumeTextureSample) Vec3 {
 	if cell == nil || s == nil {
 		return Vec3{}
 	}
@@ -281,9 +298,6 @@ func (cell *volumeGradientCell) gradient(s *volumeSampler, sample volumeTextureS
 func (cell *volumeGradientCell) prepare(s *volumeSampler, sample volumeTextureSample) {
 	cell.sampler = s
 	cell.x0, cell.y0, cell.z0 = sample.x0, sample.y0, sample.z0
-	xScale := float64(s.cols-1) / float64(maxInt(s.cols, 2))
-	yScale := float64(s.rows-1) / float64(maxInt(s.rows, 2))
-	zScale := float64(s.depth-1) / float64(maxInt(s.depth, 2))
 	c := [2][2][2]float64{
 		{{sample.c000, sample.c100}, {sample.c010, sample.c110}},
 		{{sample.c001, sample.c101}, {sample.c011, sample.c111}},
@@ -292,24 +306,24 @@ func (cell *volumeGradientCell) prepare(s *volumeSampler, sample volumeTextureSa
 		for y := 0; y < 2; y++ {
 			left := s.valueOrZero(sample.x0-1, sample.y0+y, sample.z0+z)
 			right := s.valueOrZero(sample.x0+2, sample.y0+y, sample.z0+z)
-			cell.gradients[z][y][0].X = (c[z][y][1] - left) * xScale
-			cell.gradients[z][y][1].X = (right - c[z][y][0]) * xScale
+			cell.gradients[z][y][0].X = c[z][y][1] - left
+			cell.gradients[z][y][1].X = right - c[z][y][0]
 		}
 	}
 	for z := 0; z < 2; z++ {
 		for x := 0; x < 2; x++ {
 			below := s.valueOrZero(sample.x0+x, sample.y0-1, sample.z0+z)
 			above := s.valueOrZero(sample.x0+x, sample.y0+2, sample.z0+z)
-			cell.gradients[z][0][x].Y = (c[z][1][x] - below) * yScale
-			cell.gradients[z][1][x].Y = (above - c[z][0][x]) * yScale
+			cell.gradients[z][0][x].Y = c[z][1][x] - below
+			cell.gradients[z][1][x].Y = above - c[z][0][x]
 		}
 	}
 	for y := 0; y < 2; y++ {
 		for x := 0; x < 2; x++ {
 			behind := s.valueOrZero(sample.x0+x, sample.y0+y, sample.z0-1)
 			inFront := s.valueOrZero(sample.x0+x, sample.y0+y, sample.z0+2)
-			cell.gradients[0][y][x].Z = (c[1][y][x] - behind) * zScale
-			cell.gradients[1][y][x].Z = (inFront - c[0][y][x]) * zScale
+			cell.gradients[0][y][x].Z = c[1][y][x] - behind
+			cell.gradients[1][y][x].Z = inFront - c[0][y][x]
 		}
 	}
 }
@@ -338,6 +352,32 @@ func (s *volumeSampler) gradientAt(tex Vec3) Vec3 {
 	hz1, _ := s.textureAt(Vec3{tex.X, tex.Y, tex.Z + dz})
 	hz0, _ := s.textureAt(Vec3{tex.X, tex.Y, tex.Z - dz})
 	return Vec3{X: hx1 - hx0, Y: hy1 - hy0, Z: hz1 - hz0}
+}
+
+// gradientIndexAt matches the WebGPU central-difference stencil: samples are
+// one complete voxel apart in index space. The result is not yet divided by
+// two so both backends apply the same 0.5 during patient-space conversion.
+func (s *volumeSampler) gradientIndexAt(tex Vec3) Vec3 {
+	index := Vec3{
+		X: tex.X * float64(s.cols-1),
+		Y: tex.Y * float64(s.rows-1),
+		Z: tex.Z * float64(s.depth-1),
+	}
+	hx1, _ := s.trilinearAt(index.Add(Vec3{X: 1}))
+	hx0, _ := s.trilinearAt(index.Add(Vec3{X: -1}))
+	hy1, _ := s.trilinearAt(index.Add(Vec3{Y: 1}))
+	hy0, _ := s.trilinearAt(index.Add(Vec3{Y: -1}))
+	hz1, _ := s.trilinearAt(index.Add(Vec3{Z: 1}))
+	hz0, _ := s.trilinearAt(index.Add(Vec3{Z: -1}))
+	return Vec3{X: hx1 - hx0, Y: hy1 - hy0, Z: hz1 - hz0}
+}
+
+func (s *volumeSampler) gradientOpacityVector(indexGradient Vec3) Vec3 {
+	return Vec3{
+		X: indexGradient.X * float64(s.cols-1) / float64(maxInt(s.cols, 2)),
+		Y: indexGradient.Y * float64(s.rows-1) / float64(maxInt(s.rows, 2)),
+		Z: indexGradient.Z * float64(s.depth-1) / float64(maxInt(s.depth, 2)),
+	}
 }
 
 func (s *volumeSampler) displayGrayMapped(value float64, mapper preparedVOI) uint8 {

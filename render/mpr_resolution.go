@@ -1,9 +1,6 @@
 package render
 
-import (
-	"fmt"
-	"math"
-)
+import "math"
 
 const (
 	// MaxObliqueOutputDimension is the hard per-axis safety ceiling for an MPR
@@ -51,12 +48,18 @@ type ObliqueResolution struct {
 // resolution × slab combination to exhaust memory or CPU. It returns an error
 // when a non-zero caller ceiling cannot accommodate the minimum 2x2 output.
 func (v *Volume) PlanObliqueResolution(plane Plane, request ObliqueResolutionRequest) (ObliqueResolution, error) {
+	if !validMPRPlane(plane) {
+		return ObliqueResolution{}, invalidMPRField("Plane")
+	}
+	if request.SlabSamples < 0 {
+		return ObliqueResolution{}, invalidMPRField("SlabSamples")
+	}
 	maxDimension := request.MaxDimension
 	bounded := false
 	if maxDimension == 0 {
 		maxDimension = MaxObliqueOutputDimension
 	} else if maxDimension < 2 {
-		return ObliqueResolution{}, fmt.Errorf("dicom/render: MaxDimension %d cannot fit the minimum 2x2 output", maxDimension)
+		return ObliqueResolution{}, invalidMPRField("MaxDimension")
 	}
 	if maxDimension > MaxObliqueOutputDimension {
 		maxDimension = MaxObliqueOutputDimension
@@ -70,7 +73,7 @@ func (v *Volume) PlanObliqueResolution(plane Plane, request ObliqueResolutionReq
 		}
 		maxWorkingBytes = DefaultObliqueWorkingSetBytes
 	} else if maxWorkingBytes < 0 {
-		return ObliqueResolution{}, fmt.Errorf("dicom/render: MaxWorkingBytes %d must not be negative", maxWorkingBytes)
+		return ObliqueResolution{}, invalidMPRField("MaxWorkingBytes")
 	}
 
 	uLength := finitePositiveOr(plane.U.Length(), 1)
@@ -78,7 +81,13 @@ func (v *Volume) PlanObliqueResolution(plane Plane, request ObliqueResolutionReq
 	longEdge := request.TargetLongEdge
 	if longEdge <= 0 {
 		spacing := finestVolumeSpacing(v)
-		longEdge = int(math.Round(math.Max(uLength, vLength)/spacing)) + 1
+		nativeLongEdge := math.Max(uLength, vLength) / spacing
+		if math.IsNaN(nativeLongEdge) || math.IsInf(nativeLongEdge, 0) || nativeLongEdge >= float64(maxDimension-1) {
+			longEdge = maxDimension
+			bounded = true
+		} else {
+			longEdge = int(math.Round(nativeLongEdge)) + 1
+		}
 	}
 	if longEdge < 2 {
 		longEdge = 2
@@ -101,11 +110,7 @@ func (v *Volume) PlanObliqueResolution(plane Plane, request ObliqueResolutionReq
 	bytesPerPixel := int64(1 + 8*slabSamples)
 	minWorkingBytes := int64(4) * bytesPerPixel
 	if maxWorkingBytes < minWorkingBytes {
-		return ObliqueResolution{}, fmt.Errorf(
-			"dicom/render: MaxWorkingBytes %d cannot fit the minimum 2x2 output requiring %d bytes",
-			maxWorkingBytes,
-			minWorkingBytes,
-		)
+		return ObliqueResolution{}, limitedMPRField("MaxWorkingBytes")
 	}
 	maxPixels := maxWorkingBytes / bytesPerPixel
 	pixels := int64(width) * int64(height)

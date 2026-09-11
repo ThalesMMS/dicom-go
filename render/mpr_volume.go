@@ -129,6 +129,10 @@ type Volume struct {
 	huMin     float64
 	huMax     float64
 	huRangeOK bool
+
+	vrPreparedMu     sync.Mutex
+	vrPrepared       map[vrPreparedCacheKey]*vrPreparedCacheEntry
+	vrPreparedClosed bool
 }
 
 // BuildVolume constructs the patient-space volume from a series. It requires a
@@ -517,6 +521,42 @@ func (v *Volume) AcquireSnapshot() (*VolumeLease, error) {
 	return v.AcquireSnapshotContext(context.Background())
 }
 
+// AcquireSourceSnapshot returns the immutable acquired-grid generation without
+// geometry regularization. It is intended for explicit source-geometry
+// inspection. Stacks whose per-slice geometry cannot be represented by one
+// affine are rejected rather than silently misregistered.
+func (v *Volume) AcquireSourceSnapshot() (*VolumeLease, error) {
+	return v.AcquireSourceSnapshotContext(context.Background())
+}
+
+// AcquireSourceSnapshotContext is AcquireSourceSnapshot with cancellation.
+func (v *Volume) AcquireSourceSnapshotContext(ctx context.Context) (*VolumeLease, error) {
+	if v == nil {
+		return nil, fmt.Errorf("render: nil volume")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if !v.geometry.SourceAffine {
+		return nil, fmt.Errorf("%w: source geometry is not representable by one affine", ErrInvalidVolumeSnapshot)
+	}
+	lease, err := v.acquireDirectSnapshotContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+	descriptor, err := v.snapshotDescriptor(VolumeDerivationNormalized, 0, true)
+	if err != nil {
+		_ = lease.Release()
+		return nil, err
+	}
+	descriptor.VolumeGeneration = lease.Generation()
+	lease.descriptorOverride = &descriptor
+	return lease, nil
+}
+
 // AcquireSnapshotContext is AcquireSnapshot with cancellation while a caller
 // waits for or performs the one-time CPU normalization. A canceled build is not
 // cached, so a later caller can retry the same volume.
@@ -698,7 +738,7 @@ func (v *Volume) buildDirectSnapshot(ctx context.Context) (VolumePreparationStat
 	}
 
 	canonicalStarted := time.Now()
-	descriptor, err := v.snapshotDescriptor(VolumeDerivationNormalized, 0)
+	descriptor, err := v.snapshotDescriptor(VolumeDerivationNormalized, 0, false)
 	if err != nil {
 		stats.CanonicalizationDuration = time.Since(canonicalStarted)
 		stats.TotalDuration = time.Since(started)
@@ -716,16 +756,24 @@ func (v *Volume) buildDirectSnapshot(ctx context.Context) (VolumePreparationStat
 	return stats, generation, err
 }
 
-func (v *Volume) snapshotDescriptor(derivation VolumeDerivation, parent uint64) (VolumeDescriptor, error) {
+func (v *Volume) snapshotDescriptor(derivation VolumeDerivation, parent uint64, sourceGeometry bool) (VolumeDescriptor, error) {
 	if v == nil || v.Cols <= 0 || v.Rows <= 0 || v.Depth <= 0 ||
-		v.Cols > math.MaxUint32 || v.Rows > math.MaxUint32 || v.Depth > math.MaxUint32 {
+		uint64(v.Cols) > math.MaxUint32 || uint64(v.Rows) > math.MaxUint32 || uint64(v.Depth) > math.MaxUint32 {
 		return VolumeDescriptor{}, fmt.Errorf("%w: invalid volume dimensions", ErrInvalidVolumeSnapshot)
 	}
+	origin := v.Origin
+	zStep := v.Normal.Scale(v.SliceSpacing)
+	snapshotSliceSpacing := v.SliceSpacing
+	if sourceGeometry && v.geometry.SourceAffine && len(v.sliceOrigins) > 1 {
+		origin = v.sliceOrigins[0]
+		zStep = v.sliceOrigins[len(v.sliceOrigins)-1].Sub(origin).Scale(1 / float64(len(v.sliceOrigins)-1))
+		snapshotSliceSpacing = zStep.Length()
+	}
 	indexToPatient, patientToIndex, ok := geometryAffinePair(
-		v.Origin,
+		origin,
 		v.AxisX.Scale(v.ColSpacing),
 		v.AxisY.Scale(v.RowSpacing),
-		v.Normal.Scale(v.SliceSpacing),
+		zStep,
 	)
 	if !ok {
 		return VolumeDescriptor{}, fmt.Errorf("%w: invalid patient affine", ErrInvalidVolumeSnapshot)
@@ -745,7 +793,7 @@ func (v *Volume) snapshotDescriptor(derivation VolumeDerivation, parent uint64) 
 		SliceStrideBytes:  sliceStride,
 		ByteLength:        uint64(v.Depth) * sliceStride,
 		RescaleSlope:      1,
-		SpacingMM:         [3]float64{v.ColSpacing, v.RowSpacing, v.SliceSpacing},
+		SpacingMM:         [3]float64{v.ColSpacing, v.RowSpacing, snapshotSliceSpacing},
 		IndexToPatientLPS: indexToPatient,
 		PatientLPSToIndex: patientToIndex,
 	}, nil
@@ -829,6 +877,9 @@ func (v *Volume) Close() error {
 	var err error
 	v.closeOnce.Do(func() {
 		v.closed.Store(true)
+		if closeErr := v.closeVRPreparedVolumes(); err == nil {
+			err = closeErr
+		}
 		v.regularizedOnce.Do(func() {
 			v.regularizedErr = ErrVolumeStoreClosed
 		})
@@ -836,7 +887,9 @@ func (v *Volume) Close() error {
 		v.snapshotErr = ErrVolumeStoreClosed
 		v.snapshotMu.Unlock()
 		if v.regularized != nil && v.regularized != v {
-			err = v.regularized.Close()
+			if closeErr := v.regularized.Close(); err == nil {
+				err = closeErr
+			}
 		}
 		if v.store != nil {
 			closeErr := v.store.Close()

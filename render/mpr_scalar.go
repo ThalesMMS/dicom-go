@@ -35,6 +35,19 @@ func (p *ScalarPlane) Bytes() int64 {
 	return int64(len(p.values))*8 + int64(len(p.valid))
 }
 
+// ValueAt returns one retained modality value. ok is false outside the plane
+// or where patient-space sampling found no source voxel.
+func (p *ScalarPlane) ValueAt(x, y int) (float64, bool) {
+	if p == nil || x < 0 || y < 0 || x >= p.width || y >= p.height {
+		return 0, false
+	}
+	index := y*p.width + x
+	if index >= len(p.values) || index >= len(p.valid) || p.valid[index] == 0 {
+		return 0, false
+	}
+	return p.values[index], true
+}
+
 // ApplyWindow applies VOI/LUT presentation without recomputing MPR geometry.
 func (p *ScalarPlane) ApplyWindow(window WindowLevel) image.Image {
 	img, _ := p.ApplyWindowContext(context.Background(), window)
@@ -65,7 +78,10 @@ func (p *ScalarPlane) ApplyWindowContext(ctx context.Context, window WindowLevel
 			img.Pix[index] = displayGrayMapped(float64(p.values[index]), mapper, p.photometric)
 		}
 	})
-	return img, err
+	if err != nil {
+		return nil, err
+	}
+	return img, nil
 }
 
 // RenderScalarSlabWithOptionsContext renders an orthogonal MPR plane in
@@ -97,6 +113,10 @@ func RenderScalarSlabWithOptionsContext(
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	limits, err := normalizeMPRLimits(options.Limits)
+	if err != nil {
+		return nil, err
+	}
 
 	correctTilt := options.GantryTiltMode != GantryTiltSourceGeometry
 	defaultVOI := normalizeWindow(
@@ -108,20 +128,20 @@ func RenderScalarSlabWithOptionsContext(
 	// float32 volume. Preserve that distinction exactly.
 	if plane == MPRPlaneAxial && mode == SlabNone {
 		return renderFallbackScalarSlabContext(
-			ctx, series, plane, center, thickness, mode, rows, cols, defaultVOI,
+			ctx, series, plane, center, thickness, mode, rows, cols, defaultVOI, limits,
 		)
 	}
 	if vol, sampler, err := stackVolumeSampler(series, correctTilt); err == nil {
 		defer sampler.Close()
 		if scalar, rendered, renderErr := renderCachedScalarSlabContext(
-			ctx, vol, sampler, plane, center, thickness, mode, correctTilt, defaultVOI,
+			ctx, vol, sampler, plane, center, thickness, mode, correctTilt, defaultVOI, limits,
 		); rendered || renderErr != nil {
 			return scalar, renderErr
 		}
 	} else if isNonCorrectableGeometry(err) {
 		return nil, err
 	}
-	return renderFallbackScalarSlabContext(ctx, series, plane, center, thickness, mode, rows, cols, defaultVOI)
+	return renderFallbackScalarSlabContext(ctx, series, plane, center, thickness, mode, rows, cols, defaultVOI, limits)
 }
 
 func renderCachedScalarSlabContext(
@@ -133,6 +153,7 @@ func renderCachedScalarSlabContext(
 	mode SlabMode,
 	correctGantryTilt bool,
 	defaultVOI WindowLevel,
+	limits MPRLimits,
 ) (*ScalarPlane, bool, error) {
 	if vol == nil || sampler == nil || sampler.rows <= 0 || sampler.cols <= 0 || sampler.depth <= 0 {
 		return nil, false, nil
@@ -140,7 +161,7 @@ func renderCachedScalarSlabContext(
 	if correctGantryTilt {
 		if corrected, width, height, ok := vol.correctedOrthogonalPlane(plane, center); ok {
 			if mode == SlabNone || thickness <= 1 {
-				scalar, err := resliceScalarWithSamplerContext(ctx, sampler, corrected, width, height, defaultVOI)
+				scalar, err := resliceScalarWithSamplerContext(ctx, sampler, corrected, width, height, defaultVOI, limits)
 				return scalar, true, err
 			}
 			slabAxis, step, sampleCount := vol.correctedSlabAxis(plane, vol.Rows, vol.Cols)
@@ -148,7 +169,7 @@ func renderCachedScalarSlabContext(
 			start, end := mipProjectionRange(clampedCenter, thickness, sampleCount)
 			scalar, err := resliceScalarSlabWithSamplerContext(
 				ctx, sampler, corrected, slabAxis, width, height,
-				float64(start-clampedCenter), end-start+1, step, mode, defaultVOI,
+				float64(start-clampedCenter), end-start+1, step, mode, defaultVOI, limits,
 			)
 			return scalar, true, err
 		}
@@ -158,7 +179,10 @@ func renderCachedScalarSlabContext(
 	switch plane {
 	case MPRPlaneAxial:
 		start, end := scalarProjectionRange(center, thickness, depth, mode)
-		scalar := newScalarPlane(cols, rows, sampler.photometric, defaultVOI)
+		scalar, allocationErr := newScalarPlane(cols, rows, end-start+1, sampler.photometric, defaultVOI, limits)
+		if allocationErr != nil {
+			return nil, true, allocationErr
+		}
 		err := parallelRowsContext(ctx, rows, func(y int) {
 			for x := 0; x < cols; x++ {
 				value, ok := reduceCachedScalarContext(ctx, mode, start, end, func(z int) (float64, bool) {
@@ -167,11 +191,17 @@ func renderCachedScalarSlabContext(
 				scalar.set(x, y, value, ok)
 			}
 		})
-		return scalar, true, err
+		if err != nil {
+			return nil, true, err
+		}
+		return scalar, true, nil
 	case MPRPlaneCoronal:
 		start, end := scalarProjectionRange(center, thickness, rows, mode)
 		height := orthogonalVolumeHeight(depth, vol.SliceSpacing, vol.ColSpacing)
-		scalar := newScalarPlane(cols, height, sampler.photometric, defaultVOI)
+		scalar, allocationErr := newScalarPlane(cols, height, end-start+1, sampler.photometric, defaultVOI, limits)
+		if allocationErr != nil {
+			return nil, true, allocationErr
+		}
 		err := parallelRowsContext(ctx, height, func(outZ int) {
 			z := orthogonalDisplaySliceIndex(outZ, height, depth)
 			for x := 0; x < cols; x++ {
@@ -181,11 +211,17 @@ func renderCachedScalarSlabContext(
 				scalar.set(x, outZ, value, ok)
 			}
 		})
-		return scalar, true, err
+		if err != nil {
+			return nil, true, err
+		}
+		return scalar, true, nil
 	case MPRPlaneSagittal:
 		start, end := scalarProjectionRange(center, thickness, cols, mode)
 		height := orthogonalVolumeHeight(depth, vol.SliceSpacing, vol.RowSpacing)
-		scalar := newScalarPlane(rows, height, sampler.photometric, defaultVOI)
+		scalar, allocationErr := newScalarPlane(rows, height, end-start+1, sampler.photometric, defaultVOI, limits)
+		if allocationErr != nil {
+			return nil, true, allocationErr
+		}
 		err := parallelRowsContext(ctx, height, func(outZ int) {
 			z := orthogonalDisplaySliceIndex(outZ, height, depth)
 			for y := 0; y < rows; y++ {
@@ -195,7 +231,10 @@ func renderCachedScalarSlabContext(
 				scalar.set(y, outZ, value, ok)
 			}
 		})
-		return scalar, true, err
+		if err != nil {
+			return nil, true, err
+		}
+		return scalar, true, nil
 	default:
 		return nil, false, nil
 	}
@@ -209,13 +248,17 @@ func renderFallbackScalarSlabContext(
 	mode SlabMode,
 	rows, cols int,
 	defaultVOI WindowLevel,
+	limits MPRLimits,
 ) (*ScalarPlane, error) {
 	photometric := firstRenderableSlice(series).Metadata.PhotometricInterpretation
 	switch plane {
 	case MPRPlaneAxial:
 		start, end := scalarProjectionRange(center, thickness, len(series.Frames), mode)
-		scalar := newScalarPlane(cols, rows, photometric, defaultVOI)
-		err := parallelRowsContext(ctx, rows, func(y int) {
+		scalar, err := newScalarPlane(cols, rows, end-start+1, photometric, defaultVOI, limits)
+		if err != nil {
+			return nil, err
+		}
+		err = parallelRowsContext(ctx, rows, func(y int) {
 			for x := 0; x < cols; x++ {
 				value, ok := reduceCachedScalarContext(ctx, mode, start, end, func(z int) (float64, bool) {
 					value, _, ok := sampleVoxel(series.Frames[z], x, y)
@@ -224,12 +267,18 @@ func renderFallbackScalarSlabContext(
 				scalar.set(x, y, value, ok)
 			}
 		})
-		return scalar, err
+		if err != nil {
+			return nil, err
+		}
+		return scalar, nil
 	case MPRPlaneCoronal:
 		start, end := scalarProjectionRange(center, thickness, rows, mode)
 		height := orthogonalMPRHeight(series, seriesColumnSpacing(series))
-		scalar := newScalarPlane(cols, height, photometric, defaultVOI)
-		err := parallelRowsContext(ctx, height, func(outZ int) {
+		scalar, err := newScalarPlane(cols, height, end-start+1, photometric, defaultVOI, limits)
+		if err != nil {
+			return nil, err
+		}
+		err = parallelRowsContext(ctx, height, func(outZ int) {
 			frame := series.Frames[orthogonalDisplaySliceIndex(outZ, height, len(series.Frames))]
 			for x := 0; x < cols; x++ {
 				value, ok := reduceCachedScalarContext(ctx, mode, start, end, func(y int) (float64, bool) {
@@ -239,12 +288,18 @@ func renderFallbackScalarSlabContext(
 				scalar.set(x, outZ, value, ok)
 			}
 		})
-		return scalar, err
+		if err != nil {
+			return nil, err
+		}
+		return scalar, nil
 	case MPRPlaneSagittal:
 		start, end := scalarProjectionRange(center, thickness, cols, mode)
 		height := orthogonalMPRHeight(series, seriesRowSpacing(series))
-		scalar := newScalarPlane(rows, height, photometric, defaultVOI)
-		err := parallelRowsContext(ctx, height, func(outZ int) {
+		scalar, err := newScalarPlane(rows, height, end-start+1, photometric, defaultVOI, limits)
+		if err != nil {
+			return nil, err
+		}
+		err = parallelRowsContext(ctx, height, func(outZ int) {
 			frame := series.Frames[orthogonalDisplaySliceIndex(outZ, height, len(series.Frames))]
 			for y := 0; y < rows; y++ {
 				value, ok := reduceCachedScalarContext(ctx, mode, start, end, func(x int) (float64, bool) {
@@ -254,7 +309,10 @@ func renderFallbackScalarSlabContext(
 				scalar.set(y, outZ, value, ok)
 			}
 		})
-		return scalar, err
+		if err != nil {
+			return nil, err
+		}
+		return scalar, nil
 	default:
 		return nil, fmt.Errorf("render: unsupported slab plane %q", plane)
 	}
@@ -262,18 +320,31 @@ func renderFallbackScalarSlabContext(
 
 // ResliceObliqueScalarContext renders one arbitrary plane without VOI.
 func ResliceObliqueScalarContext(ctx context.Context, vol *Volume, plane Plane, outW, outH int) (*ScalarPlane, error) {
+	return ResliceObliqueScalarWithLimitsContext(ctx, vol, plane, outW, outH, MPRLimits{})
+}
+
+// ResliceObliqueScalarWithLimitsContext validates resource ceilings before
+// retaining float64 modality values and the validity mask.
+func ResliceObliqueScalarWithLimitsContext(ctx context.Context, vol *Volume, plane Plane, outW, outH int, limits MPRLimits) (*ScalarPlane, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if vol == nil || outW <= 0 || outH <= 0 {
-		return newScalarPlane(maxInt(outW, 1), maxInt(outH, 1), "", defaultScalarVOI()), nil
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	limits, err := validateMPRReslice(plane, outW, outH, 1, 9, limits)
+	if err != nil {
+		return nil, err
+	}
+	if vol == nil {
+		return newScalarPlane(outW, outH, 1, "", defaultScalarVOI(), limits)
 	}
 	sampler, ok := newVolumeSampler(vol)
 	if !ok {
-		return newScalarPlane(outW, outH, vol.Photometric(), defaultScalarVOI()), nil
+		return newScalarPlane(outW, outH, 1, vol.Photometric(), defaultScalarVOI(), limits)
 	}
 	defer sampler.Close()
-	return resliceScalarWithSamplerContext(ctx, sampler, plane, outW, outH, defaultScalarVOI())
+	return resliceScalarWithSamplerContext(ctx, sampler, plane, outW, outH, defaultScalarVOI(), limits)
 }
 
 // ResliceObliqueSlabScalarContext renders an arbitrary thick slab without VOI.
@@ -284,24 +355,51 @@ func ResliceObliqueSlabScalarContext(
 	outW, outH, thickness int,
 	mode SlabMode,
 ) (*ScalarPlane, error) {
-	if thickness <= 1 || mode == SlabNone {
-		return ResliceObliqueScalarContext(ctx, vol, plane, outW, outH)
-	}
+	return ResliceObliqueSlabScalarWithLimitsContext(ctx, vol, plane, outW, outH, thickness, mode, MPRLimits{})
+}
+
+// ResliceObliqueSlabScalarWithLimitsContext is the bounded scalar thick-slab
+// variant. Dimension, retained bytes, and sample work are checked up front.
+func ResliceObliqueSlabScalarWithLimitsContext(
+	ctx context.Context,
+	vol *Volume,
+	plane Plane,
+	outW, outH, thickness int,
+	mode SlabMode,
+	limits MPRLimits,
+) (*ScalarPlane, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if vol == nil || outW <= 0 || outH <= 0 {
-		return newScalarPlane(maxInt(outW, 1), maxInt(outH, 1), "", defaultScalarVOI()), nil
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if mode < SlabNone || mode > SlabAverage {
+		return nil, invalidMPRField("SlabMode")
+	}
+	slabSamples := 1
+	if thickness > 1 && mode != SlabNone {
+		slabSamples = thickness
+	}
+	limits, err := validateMPRReslice(plane, outW, outH, slabSamples, 9, limits)
+	if err != nil {
+		return nil, err
+	}
+	if thickness <= 1 || mode == SlabNone {
+		return ResliceObliqueScalarWithLimitsContext(ctx, vol, plane, outW, outH, limits)
+	}
+	if vol == nil {
+		return newScalarPlane(outW, outH, slabSamples, "", defaultScalarVOI(), limits)
 	}
 	sampler, ok := newVolumeSampler(vol)
 	if !ok {
-		return newScalarPlane(outW, outH, vol.Photometric(), defaultScalarVOI()), nil
+		return newScalarPlane(outW, outH, slabSamples, vol.Photometric(), defaultScalarVOI(), limits)
 	}
 	defer sampler.Close()
 	half := float64(thickness-1) / 2
 	return resliceScalarSlabWithSamplerContext(
 		ctx, sampler, plane, plane.U.Cross(plane.V), outW, outH,
-		-half, thickness, vol.SliceSpacing, mode, defaultScalarVOI(),
+		-half, thickness, vol.SliceSpacing, mode, defaultScalarVOI(), limits,
 	)
 }
 
@@ -311,11 +409,15 @@ func resliceScalarWithSamplerContext(
 	plane Plane,
 	outW, outH int,
 	defaultVOI WindowLevel,
+	limits MPRLimits,
 ) (*ScalarPlane, error) {
-	scalar := newScalarPlane(outW, outH, sampler.photometric, defaultVOI)
+	scalar, err := newScalarPlane(outW, outH, 1, sampler.photometric, defaultVOI, limits)
+	if err != nil {
+		return nil, err
+	}
 	denomW := float64(maxInt(outW-1, 1))
 	denomH := float64(maxInt(outH-1, 1))
-	err := parallelRowsContext(ctx, outH, func(y int) {
+	err = parallelRowsContext(ctx, outH, func(y int) {
 		t := float64(y) / denomH
 		rowBase := plane.Origin.Add(plane.V.Scale(t))
 		for x := 0; x < outW; x++ {
@@ -327,7 +429,10 @@ func resliceScalarWithSamplerContext(
 			scalar.set(x, y, value, ok)
 		}
 	})
-	return scalar, err
+	if err != nil {
+		return nil, err
+	}
+	return scalar, nil
 }
 
 func resliceScalarSlabWithSamplerContext(
@@ -341,15 +446,19 @@ func resliceScalarSlabWithSamplerContext(
 	step float64,
 	mode SlabMode,
 	defaultVOI WindowLevel,
+	limits MPRLimits,
 ) (*ScalarPlane, error) {
 	if step <= 0 {
 		step = 1
 	}
 	normal := slabAxis.Normalize()
-	scalar := newScalarPlane(outW, outH, sampler.photometric, defaultVOI)
+	scalar, err := newScalarPlane(outW, outH, sampleCount, sampler.photometric, defaultVOI, limits)
+	if err != nil {
+		return nil, err
+	}
 	denomW := float64(maxInt(outW-1, 1))
 	denomH := float64(maxInt(outH-1, 1))
-	err := parallelRowsContext(ctx, outH, func(y int) {
+	err = parallelRowsContext(ctx, outH, func(y int) {
 		t := float64(y) / denomH
 		for x := 0; x < outW; x++ {
 			if ctx.Err() != nil {
@@ -363,19 +472,26 @@ func resliceScalarSlabWithSamplerContext(
 			scalar.set(x, y, value, ok)
 		}
 	})
-	return scalar, err
+	if err != nil {
+		return nil, err
+	}
+	return scalar, nil
 }
 
-func newScalarPlane(width, height int, photometric string, defaultVOI WindowLevel) *ScalarPlane {
-	count := maxInt(width, 0) * maxInt(height, 0)
+func newScalarPlane(width, height, slabSamples int, photometric string, defaultVOI WindowLevel, limits MPRLimits) (*ScalarPlane, error) {
+	limits, err := validateMPROutput(width, height, slabSamples, 9, limits)
+	if err != nil {
+		return nil, err
+	}
+	count := int64(width) * int64(height)
 	return &ScalarPlane{
 		width:       width,
 		height:      height,
-		values:      make([]float64, count),
-		valid:       make([]byte, count),
+		values:      make([]float64, int(count)),
+		valid:       make([]byte, int(count)),
 		photometric: photometric,
 		defaultVOI:  normalizeWindow(defaultVOI, defaultScalarVOI()),
-	}
+	}, nil
 }
 
 func defaultScalarVOI() WindowLevel {

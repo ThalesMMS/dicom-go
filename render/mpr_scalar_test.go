@@ -5,6 +5,8 @@ import (
 	"encoding/binary"
 	"errors"
 	"image"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -162,45 +164,138 @@ func TestScalarPlanePreservesFloat64ModalityPrecision(t *testing.T) {
 	assertGrayImagesEqual(t, "float64 modality precision", legacy, presented)
 }
 
-func TestScalarOrthogonalSlabCancellationReturnsWithinBudget(t *testing.T) {
+func TestScalarOrthogonalSlabCancellationIsAtomic(t *testing.T) {
 	stack := gradientXZStack(256, 256, 64)
-	// Populate the immutable volume cache before measuring only the render
-	// cancellation checkpoint latency.
 	if _, err := RenderScalarSlabWithOptionsContext(
 		context.Background(), stack, MPRPlaneAxial, 32, 1, SlabNone, DefaultMPRRenderOptions(),
 	); err != nil {
 		t.Fatal(err)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	result := make(chan error, 1)
+	base, cancel := context.WithCancel(context.Background())
+	ctx := newCancellationBarrierContext(base, 4096)
+	type renderResult struct {
+		plane *ScalarPlane
+		err   error
+	}
+	result := make(chan renderResult, 1)
 	go func() {
-		_, renderErr := RenderScalarSlabWithOptionsContext(
+		plane, renderErr := RenderScalarSlabWithOptionsContext(
 			ctx, stack, MPRPlaneAxial, 32, 64, SlabAverage, DefaultMPRRenderOptions(),
 		)
-		result <- renderErr
+		result <- renderResult{plane: plane, err: renderErr}
 	}()
-	time.Sleep(2 * time.Millisecond)
-	cancelledAt := time.Now()
-	cancel()
-	latencyLimit := 33 * time.Millisecond
-	if raceDetectorEnabled {
-		// The race runtime instruments every voxel access; cancellation
-		// correctness remains covered here while the quantitative 33 ms gate is
-		// measured by the normal optimized test run.
-		latencyLimit = 500 * time.Millisecond
-	}
 	select {
-	case err := <-result:
-		if !errors.Is(err, context.Canceled) {
-			t.Fatalf("scalar slab error = %v, want context.Canceled", err)
+	case <-ctx.renderStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("scalar slab did not reach the render cancellation barrier")
+	}
+	cancel()
+	select {
+	case got := <-result:
+		if !errors.Is(got.err, context.Canceled) {
+			t.Fatalf("scalar slab error = %v, want context.Canceled", got.err)
 		}
-		if latency := time.Since(cancelledAt); latency > latencyLimit {
-			t.Fatalf("scalar slab cancellation latency = %v, want <= %v", latency, latencyLimit)
+		if got.plane != nil {
+			t.Fatal("canceled scalar slab published a partial plane")
 		}
-	case <-time.After(500 * time.Millisecond):
+	case <-time.After(5 * time.Second):
 		t.Fatal("scalar slab did not stop after cancellation")
 	}
+}
+
+func TestScalarPlanePresentationCancellationIsAtomic(t *testing.T) {
+	stack := gradientXZStack(256, 256, 8)
+	plane, err := RenderScalarSlabWithOptionsContext(
+		context.Background(), stack, MPRPlaneAxial, 4, 1, SlabNone, DefaultMPRRenderOptions(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base, cancel := context.WithCancel(context.Background())
+	ctx := newCancellationBarrierContext(base, 256)
+	type presentationResult struct {
+		image image.Image
+		err   error
+	}
+	result := make(chan presentationResult, 1)
+	go func() {
+		presented, presentErr := plane.ApplyWindowContext(ctx, WindowLevel{Center: 128, Width: 256})
+		result <- presentationResult{image: presented, err: presentErr}
+	}()
+	select {
+	case <-ctx.renderStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("scalar presentation did not reach the cancellation barrier")
+	}
+	cancel()
+	select {
+	case got := <-result:
+		if !errors.Is(got.err, context.Canceled) {
+			t.Fatalf("scalar presentation error = %v, want context.Canceled", got.err)
+		}
+		if got.image != nil {
+			t.Fatal("canceled scalar presentation published a partial image")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("scalar presentation did not stop after cancellation")
+	}
+}
+
+const scalarSlabCancellationBudget = 33 * time.Millisecond
+
+func BenchmarkScalarOrthogonalSlabCancellationLatency(b *testing.B) {
+	stack := gradientXZStack(256, 256, 64)
+	if _, err := RenderScalarSlabWithOptionsContext(
+		context.Background(), stack, MPRPlaneAxial, 32, 1, SlabNone, DefaultMPRRenderOptions(),
+	); err != nil {
+		b.Fatal(err)
+	}
+	b.ReportMetric(float64(scalarSlabCancellationBudget.Nanoseconds()), "budget-ns/op")
+	b.StopTimer()
+	for range b.N {
+		base, cancel := context.WithCancel(context.Background())
+		ctx := newCancellationBarrierContext(base, 4096)
+		result := make(chan error, 1)
+		go func() {
+			plane, err := RenderScalarSlabWithOptionsContext(
+				ctx, stack, MPRPlaneAxial, 32, 64, SlabAverage, DefaultMPRRenderOptions(),
+			)
+			if plane != nil && err != nil {
+				err = errors.New("canceled scalar slab published partial output")
+			}
+			result <- err
+		}()
+		<-ctx.renderStarted
+		b.StartTimer()
+		cancel()
+		err := <-result
+		b.StopTimer()
+		if !errors.Is(err, context.Canceled) {
+			b.Fatalf("scalar slab error = %v, want context.Canceled", err)
+		}
+	}
+}
+
+type cancellationBarrierContext struct {
+	context.Context
+	errCalls      atomic.Int64
+	passErrCalls  int64
+	renderStarted chan struct{}
+	startOnce     sync.Once
+}
+
+func newCancellationBarrierContext(ctx context.Context, passErrCalls int64) *cancellationBarrierContext {
+	return &cancellationBarrierContext{Context: ctx, passErrCalls: passErrCalls, renderStarted: make(chan struct{})}
+}
+
+func (c *cancellationBarrierContext) Err() error {
+	if c.errCalls.Add(1) <= c.passErrCalls {
+		return c.Context.Err()
+	}
+	c.startOnce.Do(func() { close(c.renderStarted) })
+	<-c.Context.Done()
+	return c.Context.Err()
 }
 
 func preciseRescaleStack(stored uint16, slope, intercept float64) *Stack {

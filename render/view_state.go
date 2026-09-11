@@ -7,10 +7,21 @@ import (
 )
 
 const (
-	ViewStateContractVersion uint32 = 1
+	ViewStateContractVersionV1 uint32 = 1
+	ViewStateContractVersionV2 uint32 = 2
+	ViewStateContractVersionV3 uint32 = 3
+	ViewStateContractVersionV4 uint32 = 4
+	// ViewStateContractVersion remains the V1 default for source compatibility.
+	// Callers using newer fields opt in explicitly with the matching version and
+	// header-size constants.
+	ViewStateContractVersion uint32 = ViewStateContractVersionV1
 	ViewStateHeaderSizeV1    uint32 = 48
+	ViewStateHeaderSizeV2    uint32 = 96
+	ViewStateHeaderSizeV3    uint32 = 112
+	ViewStateHeaderSizeV4    uint32 = 144
 	MaxViewOutputDimension   uint32 = 8192
 	MaxViewOutputBytes       uint64 = 256 << 20
+	MaxViewCutMaskBytes      uint64 = 64 << 20
 	MaxTransferLUTSamples           = 4096
 	MaxClippingPlanes               = 8
 )
@@ -47,6 +58,7 @@ const (
 	ProjectionUnknown Projection = iota
 	ProjectionPerspective
 	ProjectionParallel
+	ProjectionEndoscopy
 )
 
 type MPRViewState struct {
@@ -78,28 +90,60 @@ type TransferLUT struct {
 	Samples   []TransferSample
 }
 
+// NormalizedCropBox is expressed in texture coordinates [0,1]. Enabled is an
+// integer flag so the value-only contract has stable cross-language semantics.
+type NormalizedCropBox struct {
+	Enabled uint32
+	Min     [3]float64
+	Max     [3]float64
+}
+
+// VoxelMask stores one cut bit per X-major voxel. Words are packed in little-
+// endian bit order and travel as a binary worker sidecar, never as JSON.
+type VoxelMask struct {
+	Dimensions [3]uint32
+	Words      []uint32 `json:"-"`
+}
+
 type VRViewState struct {
-	PositionLPS         [3]float64
-	FocalPointLPS       [3]float64
-	ViewUpLPS           [3]float64
-	Projection          Projection
-	VerticalFOVRadians  float64
-	ParallelScaleMM     float64
-	NearMM              float64
-	FarMM               float64
-	Mode                VRMode
-	SampleDistanceMM    float64
-	ImageSampleDistance float64
-	ShadingEnabled      uint32
-	Ambient             float64
-	Diffuse             float64
-	Specular            float64
-	SpecularPower       float64
+	PositionLPS        [3]float64
+	FocalPointLPS      [3]float64
+	ViewUpLPS          [3]float64
+	Projection         Projection
+	VerticalFOVRadians float64
+	ParallelScaleMM    float64
+	NearMM             float64
+	FarMM              float64
+	Mode               VRMode
+	SampleDistanceMM   float64
+	// OpacityUnitDistanceMM is the physical distance at which transfer alpha is
+	// authored. V1/V2 zero values use the explicit 1 mm compatibility fallback;
+	// V3 requests carry a finite positive value.
+	OpacityUnitDistanceMM float64
+	ImageSampleDistance   float64
+	ShadingEnabled        uint32
+	Ambient               float64
+	Diffuse               float64
+	Specular              float64
+	SpecularPower         float64
 	// GradientOpacityScale modulates DVR sample opacity by the central-
 	// difference HU gradient magnitude. Zero disables the modulation.
 	GradientOpacityScale float64
-	ClippingPlanesLPS    []ClippingPlaneLPS
-	TransferLUT          TransferLUT
+	// BackgroundRGBA is linear and non-premultiplied. V4 viewport requests
+	// require an opaque value; V1-V3 leave it zero and use black compatibility
+	// semantics in the backend.
+	BackgroundRGBA    [4]float64
+	ClippingPlanesLPS []ClippingPlaneLPS
+	Crop              NormalizedCropBox
+	CutMask           VoxelMask
+	TransferLUT       TransferLUT
+}
+
+func (state VRViewState) EffectiveOpacityUnitDistanceMM() float64 {
+	if !finite(state.OpacityUnitDistanceMM) || state.OpacityUnitDistanceMM <= 0 {
+		return DefaultVROpacityUnitDistanceMM
+	}
+	return state.OpacityUnitDistanceMM
 }
 
 // ViewState is the value-only, backend-neutral rendering request frozen for
@@ -122,11 +166,21 @@ func ValidateViewState(state ViewState) error {
 	fail := func(format string, args ...any) error {
 		return fmt.Errorf("%w: %s", ErrInvalidViewState, fmt.Sprintf(format, args...))
 	}
-	if state.ContractVersion != ViewStateContractVersion {
+	minimumHeader := uint32(0)
+	switch state.ContractVersion {
+	case ViewStateContractVersionV1:
+		minimumHeader = ViewStateHeaderSizeV1
+	case ViewStateContractVersionV2:
+		minimumHeader = ViewStateHeaderSizeV2
+	case ViewStateContractVersionV3:
+		minimumHeader = ViewStateHeaderSizeV3
+	case ViewStateContractVersionV4:
+		minimumHeader = ViewStateHeaderSizeV4
+	default:
 		return fail("contract version %d", state.ContractVersion)
 	}
-	if state.StructSize < ViewStateHeaderSizeV1 {
-		return fail("struct size %d below V1 minimum %d", state.StructSize, ViewStateHeaderSizeV1)
+	if state.StructSize < minimumHeader {
+		return fail("struct size %d below V%d minimum %d", state.StructSize, state.ContractVersion, minimumHeader)
 	}
 	if state.VolumeGeneration == 0 || state.ViewGeneration == 0 {
 		return fail("zero volume or view generation")
@@ -145,7 +199,7 @@ func ValidateViewState(state ViewState) error {
 	case ViewKindMPR:
 		return validateMPRViewState(state.MPR, state.OutputWidth, state.OutputHeight, fail)
 	case ViewKindVR:
-		return validateVRViewState(state.VR, fail)
+		return validateVRViewState(state.VR, state.ContractVersion, fail)
 	default:
 		return fail("unsupported view kind %d", state.Kind)
 	}
@@ -239,7 +293,7 @@ func validateMPRDerivedGeometry(
 	return nil
 }
 
-func validateVRViewState(state VRViewState, fail func(string, ...any) error) error {
+func validateVRViewState(state VRViewState, contractVersion uint32, fail func(string, ...any) error) error {
 	if !finite3(state.PositionLPS) || !finite3(state.FocalPointLPS) || !finite3(state.ViewUpLPS) {
 		return fail("non-finite VR camera")
 	}
@@ -252,7 +306,10 @@ func validateVRViewState(state VRViewState, fail func(string, ...any) error) err
 		return fail("degenerate VR camera")
 	}
 	switch state.Projection {
-	case ProjectionPerspective:
+	case ProjectionPerspective, ProjectionEndoscopy:
+		if state.Projection == ProjectionEndoscopy && contractVersion < ViewStateContractVersionV2 {
+			return fail("endoscopy projection requires V2")
+		}
 		if !finite(state.VerticalFOVRadians) || state.VerticalFOVRadians <= 0 || state.VerticalFOVRadians >= math.Pi {
 			return fail("invalid perspective FOV")
 		}
@@ -275,6 +332,26 @@ func validateVRViewState(state VRViewState, fail func(string, ...any) error) err
 		!finite(state.ImageSampleDistance) || state.ImageSampleDistance <= 0 {
 		return fail("invalid VR sampling distance")
 	}
+	if contractVersion >= ViewStateContractVersionV3 {
+		if !finite(state.OpacityUnitDistanceMM) || state.OpacityUnitDistanceMM <= 0 {
+			return fail("invalid VR opacity unit distance")
+		}
+	} else if state.OpacityUnitDistanceMM != 0 &&
+		(!finite(state.OpacityUnitDistanceMM) || state.OpacityUnitDistanceMM <= 0) {
+		return fail("invalid VR opacity unit distance")
+	}
+	if contractVersion >= ViewStateContractVersionV4 {
+		if !finite4(state.BackgroundRGBA) || state.BackgroundRGBA[3] != 1 {
+			return fail("invalid opaque VR background")
+		}
+		for _, channel := range state.BackgroundRGBA[:3] {
+			if channel < 0 || channel > 1 {
+				return fail("VR background channel outside 0..1")
+			}
+		}
+	} else if state.BackgroundRGBA != [4]float64{} {
+		return fail("VR background requires V4")
+	}
 	if state.ShadingEnabled > 1 {
 		return fail("invalid shading flag %d", state.ShadingEnabled)
 	}
@@ -296,6 +373,19 @@ func validateVRViewState(state VRViewState, fail func(string, ...any) error) err
 		normal := [3]float64{plane[0], plane[1], plane[2]}
 		if !finite4(plane) || maxAbs3(normal) == 0 {
 			return fail("invalid clipping plane")
+		}
+	}
+	if contractVersion < ViewStateContractVersionV2 {
+		if state.Crop.Enabled != 0 || state.Crop.Min != [3]float64{} || state.Crop.Max != [3]float64{} ||
+			state.CutMask.Dimensions != [3]uint32{} || len(state.CutMask.Words) != 0 {
+			return fail("crop or cut mask requires V2")
+		}
+	} else {
+		if err := validateNormalizedCrop(state.Crop, fail); err != nil {
+			return err
+		}
+		if err := validateVoxelMask(state.CutMask, fail); err != nil {
+			return err
 		}
 	}
 	if !finite(state.TransferLUT.DomainMin) || !finite(state.TransferLUT.DomainMax) ||
@@ -324,7 +414,52 @@ func FreezeViewState(state ViewState) (ViewState, error) {
 	}
 	state.VR.ClippingPlanesLPS = append([]ClippingPlaneLPS(nil), state.VR.ClippingPlanesLPS...)
 	state.VR.TransferLUT.Samples = append([]TransferSample(nil), state.VR.TransferLUT.Samples...)
+	state.VR.CutMask.Words = append([]uint32(nil), state.VR.CutMask.Words...)
 	return state, nil
+}
+
+func validateNormalizedCrop(crop NormalizedCropBox, fail func(string, ...any) error) error {
+	if crop.Enabled > 1 {
+		return fail("invalid crop flag %d", crop.Enabled)
+	}
+	if crop.Enabled == 0 {
+		if crop.Min != [3]float64{} || crop.Max != [3]float64{} {
+			return fail("disabled crop carries bounds")
+		}
+		return nil
+	}
+	if !finite3(crop.Min) || !finite3(crop.Max) {
+		return fail("non-finite crop bounds")
+	}
+	for axis := range crop.Min {
+		if crop.Min[axis] < 0 || crop.Max[axis] > 1 || crop.Min[axis] > crop.Max[axis] {
+			return fail("invalid normalized crop bounds")
+		}
+	}
+	return nil
+}
+
+func validateVoxelMask(mask VoxelMask, fail func(string, ...any) error) error {
+	if mask.Dimensions == [3]uint32{} && len(mask.Words) == 0 {
+		return nil
+	}
+	if mask.Dimensions[0] == 0 || mask.Dimensions[1] == 0 || mask.Dimensions[2] == 0 {
+		return fail("cut mask has zero dimension")
+	}
+	voxels := uint64(mask.Dimensions[0])
+	for _, dimension := range mask.Dimensions[1:] {
+		if voxels > math.MaxUint64/uint64(dimension) {
+			return fail("cut mask dimensions overflow")
+		}
+		voxels *= uint64(dimension)
+	}
+	// Derive the ceiling without adding to voxels, so the size check remains
+	// correct even at the uint64 boundary.
+	words := (voxels-1)/32 + 1
+	if words > MaxViewCutMaskBytes/4 || uint64(len(mask.Words)) != words {
+		return fail("cut mask word count %d does not match %d voxels", len(mask.Words), voxels)
+	}
+	return nil
 }
 
 func finite(value float64) bool { return !math.IsNaN(value) && !math.IsInf(value, 0) }

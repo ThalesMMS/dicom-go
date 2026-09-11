@@ -21,6 +21,7 @@ const (
 	VolumeMemoryRegularized
 	VolumeMemoryRGBA
 	VolumeMemoryBackendCopy
+	VolumeMemoryVRPrepared
 )
 
 func (k VolumeMemoryKind) String() string {
@@ -31,6 +32,8 @@ func (k VolumeMemoryKind) String() string {
 		return "normalized_volume"
 	case VolumeMemoryRegularized:
 		return "regularized_volume"
+	case VolumeMemoryVRPrepared:
+		return "vr_prepared_volume"
 	case VolumeMemoryRGBA:
 		return "rgba_render_buffer"
 	case VolumeMemoryBackendCopy:
@@ -165,12 +168,25 @@ func (s *VolumeStore) ReplaceRegularizedFloat32(parentGeneration uint64, descrip
 }
 
 func (s *VolumeStore) replaceFloat32Owned(descriptor VolumeDescriptor, values []float32) (uint64, error) {
+	return s.replaceModalityFloat32Owned(descriptor, values, VolumeDerivationNormalized, 0)
+}
+
+func (s *VolumeStore) replaceVRPrefilteredFloat32Owned(descriptor VolumeDescriptor, values []float32) (uint64, error) {
+	return s.replaceModalityFloat32Owned(descriptor, values, VolumeDerivationVRPrefiltered, 0)
+}
+
+func (s *VolumeStore) replaceModalityFloat32Owned(
+	descriptor VolumeDescriptor,
+	values []float32,
+	derivation VolumeDerivation,
+	parentGeneration uint64,
+) (uint64, error) {
 	descriptor.ScalarFormat = VolumeScalarF32ModalityLE
 	descriptor.SampleDomain = VolumeSampleDomainModality
 	descriptor.RescaleSlope = 1
 	descriptor.RescaleIntercept = 0
-	descriptor.Derivation = VolumeDerivationNormalized
-	descriptor.ParentGeneration = 0
+	descriptor.Derivation = derivation
+	descriptor.ParentGeneration = parentGeneration
 	descriptor.VolumeGeneration = 0
 	descriptor.ByteLength = uint64(len(values)) * 4
 	if err := validateVolumeDescriptor(descriptor, true); err != nil {
@@ -255,6 +271,8 @@ func (s *VolumeStore) replaceOwned(descriptor VolumeDescriptor, payload volumePa
 	kind := VolumeMemoryNormalized
 	if descriptor.Derivation == VolumeDerivationRegularized {
 		kind = VolumeMemoryRegularized
+	} else if descriptor.Derivation == VolumeDerivationVRPrefiltered {
+		kind = VolumeMemoryVRPrepared
 	}
 	record := &volumeRecord{descriptor: descriptor, payload: payload, kind: kind}
 	if math.MaxUint64-s.liveBytes < payload.byteLen() {
@@ -475,10 +493,11 @@ func (s *VolumeStore) Close() error {
 
 // VolumeLease is an idempotent active-reader handle.
 type VolumeLease struct {
-	mu         sync.Mutex
-	store      *VolumeStore
-	generation uint64
-	released   bool
+	mu                 sync.Mutex
+	store              *VolumeStore
+	generation         uint64
+	descriptorOverride *VolumeDescriptor
+	released           bool
 }
 
 // Snapshot returns the immutable view tied to this lease.
@@ -569,6 +588,7 @@ func (l *VolumeLease) Release() error {
 	store, generation := l.store, l.generation
 	l.store = nil
 	l.generation = 0
+	l.descriptorOverride = nil
 	l.mu.Unlock()
 	return store.releaseReference(generation, false)
 }

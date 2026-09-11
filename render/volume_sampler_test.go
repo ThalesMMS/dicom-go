@@ -1,10 +1,29 @@
 package render
 
 import (
+	"errors"
 	"image"
 	"math"
 	"testing"
 )
+
+func TestAcquireReaderPreservesVolumeStoreBudgetError(t *testing.T) {
+	stack := gradientColumnStack(3, 4, 2)
+	store := NewVolumeStore(VolumeStoreOptions{MaxLiveBytes: 3*4*2*4 - 1})
+	if err := stack.SetVolumeStore(store); err != nil {
+		t.Fatal(err)
+	}
+	volume, err := stack.Volume()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer volume.Close()
+
+	_, err = volume.AcquireReader()
+	if !errors.Is(err, ErrVolumeBudgetExceeded) {
+		t.Fatalf("AcquireReader error = %v, want ErrVolumeBudgetExceeded", err)
+	}
+}
 
 func Test_volumeSamplerMatchesTrilinearAt(t *testing.T) {
 	vol, err := BuildVolume(gradientXZStack(6, 7, 4))

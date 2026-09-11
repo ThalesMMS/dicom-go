@@ -2,6 +2,7 @@ package render
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"math"
 	"testing"
@@ -92,6 +93,97 @@ func TestVolumeGeometryExposesDirectionalGantryTiltMetrics(t *testing.T) {
 	wantAngle := math.Atan(0.5) * 180 / math.Pi
 	if math.Abs(geometry.GantryTiltAngleDegrees-wantAngle) > 1e-9 {
 		t.Fatalf("GantryTiltAngleDegrees = %v, want %v", geometry.GantryTiltAngleDegrees, wantAngle)
+	}
+}
+
+func TestAcquireSourceSnapshotPreservesAcquiredAffine(t *testing.T) {
+	stack := tiltedGradientRowStack(4, 4, []Vec3{{0, 0, 0}, {0, -1, 2}, {0, -2, 4}}, 1, 1)
+	volume, err := BuildVolume(stack)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := volume.AcquireSourceSnapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Release() //nolint:errcheck
+	snapshot, err := lease.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	descriptor, err := snapshot.Descriptor()
+	if err != nil {
+		t.Fatal(err)
+	}
+	voxel := Vec3{X: 2, Y: 1, Z: 1.5}
+	want := volume.VoxelToPatient(voxel)
+	got := descriptor.IndexToPatientLPS.TransformPoint(voxel)
+	assertVec3Near(t, got, want, 1e-9)
+	if descriptor.Derivation != VolumeDerivationNormalized {
+		t.Fatalf("source derivation = %v, want normalized", descriptor.Derivation)
+	}
+}
+
+func TestCanonicalAndSourceSnapshotsKeepDistinctSubthresholdAffines(t *testing.T) {
+	stack := tiltedGradientRowStack(4, 4, []Vec3{{}, {Y: 0.01, Z: 1}, {Y: 0.02, Z: 2}}, 1, 1)
+	volume, err := BuildVolume(stack)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if volume.geometry.RequiresResampling || !volume.geometry.SourceAffine {
+		t.Fatalf("subthreshold geometry = %+v, want direct canonical and source-affine snapshots", volume.geometry)
+	}
+
+	canonicalLease, err := volume.AcquireSnapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer canonicalLease.Release() //nolint:errcheck
+	sourceLease, err := volume.AcquireSourceSnapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sourceLease.Release() //nolint:errcheck
+
+	canonical, err := canonicalLease.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonicalDescriptor, err := canonical.Descriptor()
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, err := sourceLease.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceDescriptor, err := source.Descriptor()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	canonicalStep := canonicalDescriptor.IndexToPatientLPS.TransformPoint(Vec3{Z: 1}).Sub(
+		canonicalDescriptor.IndexToPatientLPS.TransformPoint(Vec3{}),
+	)
+	assertVec3Near(t, canonicalStep, volume.Normal.Scale(volume.SliceSpacing), 1e-12)
+	if canonicalDescriptor.SpacingMM[2] != volume.SliceSpacing {
+		t.Fatalf("canonical slice spacing = %v, want %v", canonicalDescriptor.SpacingMM[2], volume.SliceSpacing)
+	}
+	sourceStep := sourceDescriptor.IndexToPatientLPS.TransformPoint(Vec3{Z: 1}).Sub(
+		sourceDescriptor.IndexToPatientLPS.TransformPoint(Vec3{}),
+	)
+	assertVec3Near(t, sourceStep, Vec3{Y: 0.01, Z: 1}, 1e-12)
+	if sourceDescriptor.SpacingMM[2] <= canonicalDescriptor.SpacingMM[2] {
+		t.Fatalf("source slice spacing = %v, want acquired affine length above canonical %v", sourceDescriptor.SpacingMM[2], canonicalDescriptor.SpacingMM[2])
+	}
+}
+
+func TestAcquireSourceSnapshotContextPrefersCancellationToGeometryValidation(t *testing.T) {
+	volume := &Volume{geometry: VolumeGeometry{SourceAffine: false}}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := volume.AcquireSourceSnapshotContext(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("AcquireSourceSnapshotContext() error = %v, want context.Canceled", err)
 	}
 }
 

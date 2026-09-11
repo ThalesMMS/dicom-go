@@ -72,8 +72,23 @@ func ResliceOblique(vol *Volume, plane Plane, outW, outH int, window WindowLevel
 // ResliceObliqueContext is the cancellable form of ResliceOblique. It stops
 // between output rows and returns the partially rendered image with ctx.Err().
 func ResliceObliqueContext(ctx context.Context, vol *Volume, plane Plane, outW, outH int, window WindowLevel) (image.Image, error) {
-	if vol == nil || outW <= 0 || outH <= 0 {
-		return blankImage(512, 512), nil
+	return ResliceObliqueWithLimitsContext(ctx, vol, plane, outW, outH, window, MPRLimits{})
+}
+
+// ResliceObliqueWithLimitsContext validates caller-supplied resource ceilings
+// before acquiring the volume or allocating the output image.
+func ResliceObliqueWithLimitsContext(ctx context.Context, vol *Volume, plane Plane, outW, outH int, window WindowLevel, limits MPRLimits) (image.Image, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return blankImage(1, 1), err
+	}
+	if _, err := validateMPRReslice(plane, outW, outH, 1, 1, limits); err != nil {
+		return blankImage(1, 1), err
+	}
+	if vol == nil {
+		return blankImage(outW, outH), nil
 	}
 	window = normalizeWindow(window, WindowLevel{Center: defaultWindowCenter, Width: defaultWindowWidth})
 	mapper := prepareWindow(window)
@@ -82,7 +97,7 @@ func ResliceObliqueContext(ctx context.Context, vol *Volume, plane Plane, outW, 
 		return blankImage(outW, outH), nil
 	}
 	defer sampler.Close()
-	return resliceObliqueWithSamplerContext(ctx, vol, sampler, plane, outW, outH, mapper)
+	return resliceObliqueWithSamplerLimitsContext(ctx, vol, sampler, plane, outW, outH, mapper, limits)
 }
 
 func resliceObliqueWithSampler(vol *Volume, sampler *volumeSampler, plane Plane, outW, outH int, mapper preparedVOI) image.Image {
@@ -91,6 +106,13 @@ func resliceObliqueWithSampler(vol *Volume, sampler *volumeSampler, plane Plane,
 }
 
 func resliceObliqueWithSamplerContext(ctx context.Context, vol *Volume, sampler *volumeSampler, plane Plane, outW, outH int, mapper preparedVOI) (image.Image, error) {
+	return resliceObliqueWithSamplerLimitsContext(ctx, vol, sampler, plane, outW, outH, mapper, MPRLimits{})
+}
+
+func resliceObliqueWithSamplerLimitsContext(ctx context.Context, vol *Volume, sampler *volumeSampler, plane Plane, outW, outH int, mapper preparedVOI, limits MPRLimits) (image.Image, error) {
+	if _, err := validateMPRReslice(plane, outW, outH, 1, 1, limits); err != nil {
+		return blankImage(1, 1), err
+	}
 	img := image.NewGray(image.Rect(0, 0, outW, outH))
 
 	denomW := float64(outW - 1)
@@ -200,11 +222,33 @@ func ResliceObliqueSlab(vol *Volume, plane Plane, outW, outH, thickness int, mod
 
 // ResliceObliqueSlabContext is the cancellable form of ResliceObliqueSlab.
 func ResliceObliqueSlabContext(ctx context.Context, vol *Volume, plane Plane, outW, outH, thickness int, mode SlabMode, window WindowLevel) (image.Image, error) {
-	if vol == nil || outW <= 0 || outH <= 0 {
-		return blankImage(512, 512), nil
+	return ResliceObliqueSlabWithLimitsContext(ctx, vol, plane, outW, outH, thickness, mode, window, MPRLimits{})
+}
+
+// ResliceObliqueSlabWithLimitsContext is the bounded, cancellable thick-slab
+// form. The combined output and slab work is checked before allocation.
+func ResliceObliqueSlabWithLimitsContext(ctx context.Context, vol *Volume, plane Plane, outW, outH, thickness int, mode SlabMode, window WindowLevel, limits MPRLimits) (image.Image, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return blankImage(1, 1), err
+	}
+	if mode < SlabNone || mode > SlabAverage {
+		return blankImage(1, 1), invalidMPRField("SlabMode")
+	}
+	slabSamples := 1
+	if thickness > 1 && mode != SlabNone {
+		slabSamples = thickness
+	}
+	if _, err := validateMPRReslice(plane, outW, outH, slabSamples, 1, limits); err != nil {
+		return blankImage(1, 1), err
+	}
+	if vol == nil {
+		return blankImage(outW, outH), nil
 	}
 	if thickness <= 1 || mode == SlabNone {
-		return ResliceObliqueContext(ctx, vol, plane, outW, outH, window)
+		return ResliceObliqueWithLimitsContext(ctx, vol, plane, outW, outH, window, limits)
 	}
 	window = normalizeWindow(window, WindowLevel{Center: defaultWindowCenter, Width: defaultWindowWidth})
 	mapper := prepareWindow(window)
@@ -215,7 +259,7 @@ func ResliceObliqueSlabContext(ctx context.Context, vol *Volume, plane Plane, ou
 	defer sampler.Close()
 	half := float64(thickness-1) / 2
 	slabAxis := plane.U.Cross(plane.V)
-	return resliceObliqueSlabRangeWithSamplerContext(ctx, vol, sampler, plane, slabAxis, outW, outH, -half, thickness, vol.SliceSpacing, mode, mapper)
+	return resliceObliqueSlabRangeWithSamplerLimitsContext(ctx, vol, sampler, plane, slabAxis, outW, outH, -half, thickness, vol.SliceSpacing, mode, mapper, limits)
 }
 
 func resliceObliqueSlabRangeWithSampler(vol *Volume, sampler *volumeSampler, plane Plane, slabAxis Vec3, outW, outH int, firstOffset float64, sampleCount int, step float64, mode SlabMode, mapper preparedVOI) image.Image {
@@ -224,6 +268,13 @@ func resliceObliqueSlabRangeWithSampler(vol *Volume, sampler *volumeSampler, pla
 }
 
 func resliceObliqueSlabRangeWithSamplerContext(ctx context.Context, vol *Volume, sampler *volumeSampler, plane Plane, slabAxis Vec3, outW, outH int, firstOffset float64, sampleCount int, step float64, mode SlabMode, mapper preparedVOI) (image.Image, error) {
+	return resliceObliqueSlabRangeWithSamplerLimitsContext(ctx, vol, sampler, plane, slabAxis, outW, outH, firstOffset, sampleCount, step, mode, mapper, MPRLimits{})
+}
+
+func resliceObliqueSlabRangeWithSamplerLimitsContext(ctx context.Context, vol *Volume, sampler *volumeSampler, plane Plane, slabAxis Vec3, outW, outH int, firstOffset float64, sampleCount int, step float64, mode SlabMode, mapper preparedVOI, limits MPRLimits) (image.Image, error) {
+	if _, err := validateMPRReslice(plane, outW, outH, sampleCount, 1, limits); err != nil {
+		return blankImage(1, 1), err
+	}
 	normal := slabAxis.Normalize()
 	if step <= 0 || math.IsNaN(step) || math.IsInf(step, 0) {
 		step = 1

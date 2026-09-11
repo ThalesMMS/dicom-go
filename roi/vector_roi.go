@@ -165,18 +165,65 @@ func (r VectorROI) rasterizePolygonScanlines(mask *RasterMask) {
 	if maxY >= mask.Rows {
 		maxY = mask.Rows - 1
 	}
+	// Schedule each non-horizontal edge on its first intersecting scanline.
+	// Active edges retain the original intersection formula below, so this
+	// removes the H*P scan without changing even-odd or boundary rounding.
+	type scanlineEdge struct {
+		pointIndex int
+		endY       int
+		nextStart  int
+	}
+	edges := make([]scanlineEdge, 0, len(r.Points))
+	startHeads := make([]int, maxY-minY+1)
+	for index := range startHeads {
+		startHeads[index] = -1
+	}
+	for current := len(r.Points) - 1; current >= 0; current-- {
+		previous := current - 1
+		if previous < 0 {
+			previous = len(r.Points) - 1
+		}
+		currentPoint, previousPoint := r.Points[current], r.Points[previous]
+		if currentPoint.Y == previousPoint.Y {
+			continue
+		}
+		startY := min(currentPoint.Y, previousPoint.Y)
+		endY := max(currentPoint.Y, previousPoint.Y)
+		if endY <= minY || startY > maxY {
+			continue
+		}
+		startY = max(startY, minY)
+		endY = min(endY, maxY+1)
+		bucket := startY - minY
+		edges = append(edges, scanlineEdge{
+			pointIndex: current,
+			endY:       endY,
+			nextStart:  startHeads[bucket],
+		})
+		startHeads[bucket] = len(edges) - 1
+	}
+	active := make([]int, 0, len(edges))
 	intersections := make([]float64, 0, len(r.Points))
 	for y := minY; y <= maxY; y++ {
+		kept := active[:0]
+		for _, edgeIndex := range active {
+			if edges[edgeIndex].endY > y {
+				kept = append(kept, edgeIndex)
+			}
+		}
+		active = kept
+		for edgeIndex := startHeads[y-minY]; edgeIndex >= 0; edgeIndex = edges[edgeIndex].nextStart {
+			active = append(active, edgeIndex)
+		}
 		intersections = intersections[:0]
 		py := float64(y)
-		previous := len(r.Points) - 1
-		for current := 0; current < len(r.Points); current++ {
-			xi, yi := float64(r.Points[current].X), float64(r.Points[current].Y)
-			xj, yj := float64(r.Points[previous].X), float64(r.Points[previous].Y)
-			if (yi > py) != (yj > py) {
-				intersections = append(intersections, (xj-xi)*(py-yi)/(yj-yi)+xi)
-			}
-			previous = current
+		for _, edgeIndex := range active {
+			edge := edges[edgeIndex]
+			currentPoint := r.Points[edge.pointIndex]
+			previousPoint := r.Points[(edge.pointIndex+len(r.Points)-1)%len(r.Points)]
+			xi, yi := float64(currentPoint.X), float64(currentPoint.Y)
+			xj, yj := float64(previousPoint.X), float64(previousPoint.Y)
+			intersections = append(intersections, (xj-xi)*(py-yi)/(yj-yi)+xi)
 		}
 		sort.Float64s(intersections)
 		runs := make([]MaskRun, 0, len(intersections)/2)

@@ -375,8 +375,8 @@ func TestAssociationServerShutdownBeforeServeReturnsAndPreventsServe(t *testing.
 	if err := server.Shutdown(context.Background()); err != nil {
 		t.Fatalf("Shutdown() before Serve error = %v", err)
 	}
-	if err := server.Serve(context.Background()); err == nil {
-		t.Fatal("Serve() succeeded after pre-serve Shutdown")
+	if err := server.Serve(context.Background()); !errors.Is(err, ErrAssociationServerStopped) {
+		t.Fatalf("Serve() after pre-serve Shutdown error = %v, want ErrAssociationServerStopped", err)
 	}
 }
 

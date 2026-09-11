@@ -18,6 +18,8 @@ const (
 	AssociateRJReasonLocalLimitExceeded    = byte(2)
 )
 
+var ErrAssociationServerStopped = errors.New("dicom ul: association server is stopped")
+
 type SaturationPolicy uint8
 
 const (
@@ -176,7 +178,7 @@ func (s *AssociationServer) Serve(ctx context.Context) error {
 	}
 	if s.stopped {
 		s.serveMu.Unlock()
-		return fmt.Errorf("dicom ul: association server is stopped")
+		return ErrAssociationServerStopped
 	}
 	runtimeCtx, runtimeCancel := mergeServerContexts(ctx, s.options.Accept.Context)
 	s.cancel()

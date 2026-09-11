@@ -51,9 +51,23 @@ func SplitTextMultiplicity(vr VR, s string) []string {
 	if s == "" {
 		return nil
 	}
+	if !vr.UsesTextValueDelimiter() {
+		return []string{s}
+	}
 	parts := strings.Split(s, "\\")
 	for i := range parts {
 		parts[i] = TrimTextValue(vr, parts[i])
 	}
 	return parts
+}
+
+// UsesTextValueDelimiter reports whether a backslash separates values for the
+// VR. Single-valued text VRs preserve backslashes as text.
+func (vr VR) UsesTextValueDelimiter() bool {
+	switch vr {
+	case VRLT, VRST, VRUT, VRUR:
+		return false
+	default:
+		return true
+	}
 }

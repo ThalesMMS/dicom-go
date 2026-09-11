@@ -1,0 +1,29 @@
+{
+  "pydicom": "3.0.1",
+  "numpy": "2.1.3",
+  "charlsCommit": "36dd3307e070d8fbc765c3ba890b7e681046fa39",
+  "charlsBinarySHA256": "8730cc63328a3b0357ab79436d4d8260683ab8d584cd8a65ab940b26b9f6eb85",
+  "records": [
+    {
+      "id": "jpegls-near-lossless-8",
+      "file": "JPEGLSNearLossless_08.raw",
+      "sha256": "9eb46aa86c342094f826affc35703f71b425ba4ef229fe1711adcf1bb3ca458f",
+      "backend": "CharLS 2.4.2 (direct C API)",
+      "bytes": 450
+    },
+    {
+      "id": "jpegls-near-lossless-16",
+      "file": "JPEGLSNearLossless_16.raw",
+      "sha256": "f929318278115ce952d85c011f752634e266720680e807bd03bf97ded3f0d3e4",
+      "backend": "CharLS 2.4.2 (direct C API)",
+      "bytes": 1000
+    },
+    {
+      "id": "rle-rgb16-multiframe",
+      "file": "SC_rgb_rle_16bit_2frame.raw",
+      "sha256": "d7e2338dd240b58cd8ca13452ab8f21fa3e0779575eda0677568b5ce88247271",
+      "backend": "pydicom 3.0.1 pure Python RLE",
+      "bytes": 120000
+    }
+  ]
+}

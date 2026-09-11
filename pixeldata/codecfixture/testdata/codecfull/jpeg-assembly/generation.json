@@ -1,0 +1,25 @@
+{
+  "backend": "libjpeg-turbo",
+  "version": "3.1.4.1",
+  "wrapper": "Pillow 12.3.0",
+  "binarySha256": "7d3cb3479af9db68e1695eb9d3c2be47f7ad1cdf51ca4316b7971862bfea4b33",
+  "generator": "generate-jpeg-assembly-inputs.go + generate-jpeg-assembly-oracles.py v1",
+  "source": "existing project-authored synthetic JPEG Baseline/SOF1 two-pixel corpus; no PHI",
+  "license": "project fixtures MIT; libjpeg-turbo BSD-3-Clause/IJG; Pillow HPND",
+  "fixtures": [
+    {
+      "name": "jpeg-baseline-small",
+      "path": "jpeg-baseline-small.jpg",
+      "sha256": "74aea4da6a719a9e1dbf7de3a9194825461d2647b0c8a4f817be91355cc6604f",
+      "referencePath": "jpeg-baseline-small.raw",
+      "referenceSha256": "06eb7d6a69ee19e5fbdf749018d3d2abfa04bcbd1365db312eb86dc7169389b8"
+    },
+    {
+      "name": "jpeg-extended-small",
+      "path": "jpeg-extended-small.jpg",
+      "sha256": "3f151a0795d8d2cb941bd15b2fac7719f8fa75951909f86aef44649610e2cb03",
+      "referencePath": "jpeg-extended-small.raw",
+      "referenceSha256": "06eb7d6a69ee19e5fbdf749018d3d2abfa04bcbd1365db312eb86dc7169389b8"
+    }
+  ]
+}

@@ -2,10 +2,13 @@ package roi
 
 import (
 	"image"
+	"math"
 	"math/rand"
 	"reflect"
 	"testing"
 )
+
+var benchmarkRasterMask *RasterMask
 
 func TestPolygonRasterizeMatchesPointInPolygonReference(t *testing.T) {
 	cases := []struct {
@@ -48,6 +51,11 @@ func TestPolygonRasterizeMatchesReferenceForDeterministicRandomPolygons(t *testi
 	}
 }
 
+func TestPolygonRasterizeComplexFreehandMatchesReference(t *testing.T) {
+	region := VectorROI{Shape: ROIPolygon, Points: complexFreehandPoints(128, 1024, 7)}
+	assertRasterMasksEqual(t, region.Rasterize(128, 128), rasterizeContainsReference(region, 128, 128))
+}
+
 func rasterizeContainsReference(region VectorROI, columns, rows int) *RasterMask {
 	mask := NewRasterMask(columns, rows)
 	for y := 0; y < rows; y++ {
@@ -77,4 +85,59 @@ func assertRasterMasksEqual(t *testing.T, got, want *RasterMask) {
 			t.Fatalf("row %d runs = %v, want %v", y, got.Runs(y), want.Runs(y))
 		}
 	}
+}
+
+func BenchmarkPolygonRasterizeSimple512(b *testing.B) {
+	benchmarkPolygonRasterize(b, 512, []VectorROI{{
+		Shape:  ROIPolygon,
+		Points: []image.Point{{32, 32}, {480, 32}, {480, 480}, {32, 480}},
+	}})
+}
+
+func BenchmarkPolygonRasterizeMultiple16x512(b *testing.B) {
+	regions := make([]VectorROI, 16)
+	for index := range regions {
+		regions[index] = VectorROI{Shape: ROIPolygon, Points: complexFreehandPoints(512, 128, index)}
+	}
+	benchmarkPolygonRasterize(b, 512, regions)
+}
+
+func BenchmarkPolygonRasterizeComplex1024Vertices512(b *testing.B) {
+	benchmarkPolygonRasterize(b, 512, []VectorROI{{
+		Shape:  ROIPolygon,
+		Points: complexFreehandPoints(512, 1024, 0),
+	}})
+}
+
+func BenchmarkPolygonRasterizeComplex4096Vertices1024(b *testing.B) {
+	benchmarkPolygonRasterize(b, 1024, []VectorROI{{
+		Shape:  ROIPolygon,
+		Points: complexFreehandPoints(1024, 4096, 0),
+	}})
+}
+
+func benchmarkPolygonRasterize(b *testing.B, size int, regions []VectorROI) {
+	b.Helper()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for iteration := 0; iteration < b.N; iteration++ {
+		for index := range regions {
+			benchmarkRasterMask = regions[index].Rasterize(size, size)
+		}
+	}
+}
+
+func complexFreehandPoints(size, vertices, phase int) []image.Point {
+	points := make([]image.Point, vertices)
+	center := float64(size-1) / 2
+	baseRadius := float64(size) * 0.38
+	for index := range points {
+		angle := 2 * math.Pi * float64(index) / float64(vertices)
+		wave := 0.72 + 0.18*math.Sin(17*angle+float64(phase)) + 0.08*math.Sin(53*angle)
+		points[index] = image.Pt(
+			int(math.Round(center+baseRadius*wave*math.Cos(angle))),
+			int(math.Round(center+baseRadius*wave*math.Sin(angle))),
+		)
+	}
+	return points
 }

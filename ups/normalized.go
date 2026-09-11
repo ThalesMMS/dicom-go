@@ -69,17 +69,28 @@ func ParseChangeStateInformation(dataSet *object.Object) (ChangeStateInformation
 }
 
 func BuildSubscriptionInformation(receivingAETitle string, deletionLock bool, matchingKeys map[string][]string) (*object.Object, error) {
-	if !validAETitle(receivingAETitle) || len(matchingKeys) != 0 {
+	if !validAETitle(receivingAETitle) {
 		return nil, ErrInvalidDataSet
 	}
 	lock := "FALSE"
 	if deletionLock {
 		lock = "TRUE"
 	}
-	return NewDataSet(
+	elements := []core.Element{
 		StringElement(TagReceivingAE, core.VRAE, receivingAETitle),
 		StringElement(TagDeletionLock, core.VRLO, lock),
-	), nil
+	}
+	if len(matchingKeys) != 0 {
+		filter, err := compileSubscriptionFilter(matchingKeys)
+		if err != nil {
+			return nil, ErrInvalidDataSet
+		}
+		for _, key := range filter.Keys {
+			entry, _ := queryEntry(key.Tag)
+			elements = append(elements, StringElement(key.Tag, entry.VR, key.Values...))
+		}
+	}
+	return NewDataSet(elements...), nil
 }
 
 func BuildUnsubscriptionInformation(receivingAETitle string) (*object.Object, error) {
@@ -110,9 +121,24 @@ func parseSubscriptionInformation(dataSet *object.Object, requireLock bool) (rec
 		allowed[TagDeletionLock] = true
 	}
 	matchingKeys = make(map[string][]string)
+	seen := make(map[core.Tag]bool, len(allowed))
 	for _, element := range dataSet.Elements() {
 		if allowed[element.Tag()] {
+			if seen[element.Tag()] {
+				return "", false, nil, statusError("N-ACTION UPS Watch", StatusInvalidArgumentValue, ErrInvalidDataSet)
+			}
+			seen[element.Tag()] = true
 			continue
+		}
+		entry, supported := queryEntry(element.Tag())
+		if !supported {
+			return "", false, nil, statusError("N-ACTION UPS Watch", StatusNoSuchArgument, ErrInvalidDataSet)
+		}
+		if element.VR() != entry.VR {
+			return "", false, nil, statusError("N-ACTION UPS Watch", StatusInvalidArgumentValue, ErrInvalidDataSet)
+		}
+		if _, duplicate := matchingKeys[element.Tag().String()]; duplicate {
+			return "", false, nil, statusError("N-ACTION UPS Watch", StatusInvalidArgumentValue, ErrInvalidDataSet)
 		}
 		matchingKeys[element.Tag().String()] = element.StringValues()
 	}
@@ -239,6 +265,9 @@ func (service *Service) normalizedActionHandler(ctx context.Context, assoc *ul.A
 	if information != nil {
 		if err := validateDataSet(ctx, information.ToDataSet(), service.limits); err != nil {
 			status, operationErr = dimse.StatusProcessingFailure, err
+			if errors.Is(err, ErrResourceLimit) {
+				status = StatusResourceLimitation
+			}
 		}
 	}
 	if operationErr != nil {

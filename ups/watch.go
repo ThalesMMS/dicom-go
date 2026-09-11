@@ -30,6 +30,7 @@ type Subscription struct {
 	SOPInstanceUID   string
 	ReceivingAETitle string
 	State            SubscriptionState
+	Filter           *SubscriptionFilter
 	Version          uint64
 	UpdatedAt        time.Time
 }
@@ -63,7 +64,18 @@ type SubscriptionMutation struct {
 	SOPInstanceUID   string
 	ReceivingAETitle string
 	DeletionLock     bool
+	Filter           *SubscriptionFilter
+	FilterScanLimit  int
 	UpdatedAt        time.Time
+}
+
+// FilteredGlobalSubscriptionCommitter is the explicit capability required for
+// filtered global subscriptions. Implementations must atomically materialize
+// matching existing instances here, persist Filter for restart, and apply it
+// when CommitUPS later creates new UPS instances. Returning success opts the
+// store into that complete contract.
+type FilteredGlobalSubscriptionCommitter interface {
+	CommitFilteredGlobalSubscription(context.Context, SubscriptionMutation) (CommitResult, error)
 }
 
 type SubscribeRequest struct {
@@ -263,20 +275,23 @@ func normalizeDeliveryLimits(limits DeliveryLimits) (DeliveryLimits, error) {
 func (service *Service) Subscribe(ctx context.Context, request SubscribeRequest) (SubscribeResult, error) {
 	ctx = normalizeContext(ctx)
 	request.ReceivingAETitle = strings.TrimSpace(request.ReceivingAETitle)
+	var filter *SubscriptionFilter
 	if request.SOPInstanceUID == FilteredGlobalSubscriptionSOPInstanceUID {
-		return SubscribeResult{}, statusError("N-ACTION Subscribe", StatusUPSNotFound, ErrInvalidDataSet)
-	}
-	if len(request.MatchingKeys) != 0 {
-		status := StatusActionNotAppropriate
-		if request.SOPInstanceUID == GlobalSubscriptionSOPInstanceUID || request.SOPInstanceUID == FilteredGlobalSubscriptionSOPInstanceUID {
-			status = StatusUPSNotFound
+		compiled, err := compileSubscriptionFilter(request.MatchingKeys)
+		if err != nil {
+			return SubscribeResult{}, statusError("N-ACTION Subscribe", subscriptionFilterStatus(err), err)
 		}
-		return SubscribeResult{}, statusError("N-ACTION Subscribe", status, ErrInvalidDataSet)
+		filter = compiled
+		if _, supported := service.store.(FilteredGlobalSubscriptionCommitter); !supported {
+			return SubscribeResult{}, statusError("N-ACTION Subscribe", StatusUPSNotFound, ErrInvalidDataSet)
+		}
+	} else if len(request.MatchingKeys) != 0 {
+		return SubscribeResult{}, statusError("N-ACTION Subscribe", StatusActionNotAppropriate, ErrInvalidDataSet)
 	}
 	if err := service.validateSubscriber(ctx, request.ReceivingAETitle); err != nil {
 		return SubscribeResult{}, err
 	}
-	if request.SOPInstanceUID != GlobalSubscriptionSOPInstanceUID {
+	if !isGlobalSubscriptionUID(request.SOPInstanceUID) {
 		if _, err := service.store.GetStep(ctx, request.SOPInstanceUID); errors.Is(err, ErrNotFound) {
 			return SubscribeResult{}, statusError("N-ACTION Subscribe", StatusUPSNotFound, err)
 		} else if err != nil {
@@ -289,11 +304,22 @@ func (service *Service) Subscribe(ctx context.Context, request SubscribeRequest)
 		deletionLock = false
 		status = StatusDeletionLockNotGranted
 	}
-	result, err := service.store.CommitUPS(ctx, CommitRequest{Subscription: &SubscriptionMutation{
+	mutation := SubscriptionMutation{
 		Kind: SubscriptionMutationSubscribe, SOPInstanceUID: request.SOPInstanceUID,
-		ReceivingAETitle: request.ReceivingAETitle, DeletionLock: deletionLock, UpdatedAt: service.clock().UTC(),
-	}})
+		ReceivingAETitle: request.ReceivingAETitle, DeletionLock: deletionLock, Filter: filter,
+		FilterScanLimit: service.limits.MaxSubscriptionFilterScanned, UpdatedAt: service.clock().UTC(),
+	}
+	var result CommitResult
+	var err error
+	if filter != nil {
+		result, err = service.store.(FilteredGlobalSubscriptionCommitter).CommitFilteredGlobalSubscription(ctx, mutation)
+	} else {
+		result, err = service.store.CommitUPS(ctx, CommitRequest{Subscription: &mutation})
+	}
 	if err != nil {
+		if errors.Is(err, ErrResourceLimit) {
+			return SubscribeResult{}, statusError("N-ACTION Subscribe", StatusResourceLimitation, err)
+		}
 		return SubscribeResult{}, safeRepositoryError(err)
 	}
 	if result.Subscription == nil {
@@ -311,10 +337,7 @@ func (service *Service) Unsubscribe(ctx context.Context, request UnsubscribeRequ
 	if request.SOPInstanceUID == "" {
 		return statusError("N-ACTION Unsubscribe", StatusActionNotAppropriate, ErrInvalidDataSet)
 	}
-	if request.SOPInstanceUID == FilteredGlobalSubscriptionSOPInstanceUID {
-		return statusError("N-ACTION Unsubscribe", StatusUPSNotFound, ErrNotFound)
-	}
-	if request.SOPInstanceUID != GlobalSubscriptionSOPInstanceUID {
+	if request.SOPInstanceUID != GlobalSubscriptionSOPInstanceUID && request.SOPInstanceUID != FilteredGlobalSubscriptionSOPInstanceUID {
 		if _, err := service.store.GetStep(ctx, request.SOPInstanceUID); errors.Is(err, ErrNotFound) {
 			return statusError("N-ACTION Unsubscribe", StatusUPSNotFound, err)
 		} else if err != nil {

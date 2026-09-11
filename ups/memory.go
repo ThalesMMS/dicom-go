@@ -158,7 +158,7 @@ func (store *MemoryStore) GetSubscription(ctx context.Context, sopInstanceUID, r
 	if !ok || subscription.State == SubscriptionNone {
 		return Subscription{}, ErrNotFound
 	}
-	return subscription, nil
+	return cloneSubscription(subscription), nil
 }
 
 func (store *MemoryStore) ListSubscriptions(ctx context.Context, query SubscriptionQuery) ([]Subscription, error) {
@@ -180,7 +180,7 @@ func (store *MemoryStore) ListSubscriptions(ctx context.Context, query Subscript
 		if query.ActiveOnly && subscription.State == SubscriptionNone {
 			continue
 		}
-		result = append(result, subscription)
+		result = append(result, cloneSubscription(subscription))
 	}
 	store.mu.RUnlock()
 	sort.Slice(result, func(left, right int) bool {
@@ -395,10 +395,17 @@ func (store *MemoryStore) CommitUPS(ctx context.Context, request CommitRequest) 
 		}
 	}
 
-	// A newly created UPS inherits every active global subscription.
+	// A newly created UPS inherits every active unfiltered subscription and
+	// every filtered global subscription whose persisted predicate matches.
 	if request.Step != nil && !stepExists {
 		for _, subscription := range stagedSubscriptions {
-			if subscription.SOPInstanceUID != GlobalSubscriptionSOPInstanceUID || subscription.State == SubscriptionNone {
+			if err := contextError(ctx); err != nil {
+				return CommitResult{}, err
+			}
+			if !isGlobalSubscriptionUID(subscription.SOPInstanceUID) || subscription.State == SubscriptionNone {
+				continue
+			}
+			if subscription.SOPInstanceUID == FilteredGlobalSubscriptionSOPInstanceUID && !subscription.Filter.Matches(nextStep) {
 				continue
 			}
 			key := subscriptionKey(nextStep.SOPInstanceUID, subscription.ReceivingAETitle)
@@ -407,6 +414,7 @@ func (store *MemoryStore) CommitUPS(ctx context.Context, request CommitRequest) 
 			}
 			inherited := subscription
 			inherited.SOPInstanceUID = nextStep.SOPInstanceUID
+			inherited.Filter = nil
 			inherited.Version = 1
 			stagedSubscriptions[key] = inherited
 		}
@@ -419,21 +427,60 @@ func (store *MemoryStore) CommitUPS(ctx context.Context, request CommitRequest) 
 		}
 		switch mutation.Kind {
 		case SubscriptionMutationSubscribe:
+			if mutation.SOPInstanceUID == FilteredGlobalSubscriptionSOPInstanceUID && mutation.Filter == nil {
+				return CommitResult{}, ErrConflict
+			}
+			if mutation.SOPInstanceUID == FilteredGlobalSubscriptionSOPInstanceUID && mutation.FilterScanLimit <= 0 {
+				return CommitResult{}, ErrResourceLimit
+			}
+			if mutation.SOPInstanceUID != FilteredGlobalSubscriptionSOPInstanceUID && mutation.Filter != nil {
+				return CommitResult{}, ErrConflict
+			}
 			state := SubscriptionWithoutLock
 			if mutation.DeletionLock {
 				state = SubscriptionWithDeletionLock
 			}
 			key := subscriptionKey(mutation.SOPInstanceUID, mutation.ReceivingAETitle)
 			current := stagedSubscriptions[key]
-			next := Subscription{SOPInstanceUID: mutation.SOPInstanceUID, ReceivingAETitle: mutation.ReceivingAETitle, State: state, Version: current.Version + 1, UpdatedAt: mutation.UpdatedAt}
+			next := Subscription{
+				SOPInstanceUID: mutation.SOPInstanceUID, ReceivingAETitle: mutation.ReceivingAETitle,
+				State: state, Filter: cloneSubscriptionFilter(mutation.Filter), Version: current.Version + 1, UpdatedAt: mutation.UpdatedAt,
+			}
 			if next.Version == 0 {
 				next.Version = 1
 			}
 			stagedSubscriptions[key] = next
 			committedSubscription = &next
-			if mutation.SOPInstanceUID == GlobalSubscriptionSOPInstanceUID {
+			if isGlobalSubscriptionUID(mutation.SOPInstanceUID) {
 				fanOut := 0
+				steps := make([]Step, 0, len(store.steps))
+				scanned := 0
 				for _, step := range store.steps {
+					if err := contextError(ctx); err != nil {
+						return CommitResult{}, err
+					}
+					scanned++
+					if mutation.SOPInstanceUID == FilteredGlobalSubscriptionSOPInstanceUID && scanned > mutation.FilterScanLimit {
+						return CommitResult{}, ErrResourceLimit
+					}
+					if mutation.SOPInstanceUID == FilteredGlobalSubscriptionSOPInstanceUID && !next.Filter.Matches(step) {
+						continue
+					}
+					steps = append(steps, step)
+				}
+				sort.Slice(steps, func(left, right int) bool {
+					if steps[left].Sequence != steps[right].Sequence {
+						return steps[left].Sequence < steps[right].Sequence
+					}
+					return steps[left].SOPInstanceUID < steps[right].SOPInstanceUID
+				})
+				if err := contextError(ctx); err != nil {
+					return CommitResult{}, err
+				}
+				for _, step := range steps {
+					if err := contextError(ctx); err != nil {
+						return CommitResult{}, err
+					}
 					specificKey := subscriptionKey(step.SOPInstanceUID, mutation.ReceivingAETitle)
 					specific, exists := stagedSubscriptions[specificKey]
 					if exists && specific.State != SubscriptionNone {
@@ -478,6 +525,7 @@ func (store *MemoryStore) CommitUPS(ctx context.Context, request CommitRequest) 
 			}
 		case SubscriptionMutationSuspendGlobal:
 			delete(stagedSubscriptions, subscriptionKey(GlobalSubscriptionSOPInstanceUID, mutation.ReceivingAETitle))
+			delete(stagedSubscriptions, subscriptionKey(FilteredGlobalSubscriptionSOPInstanceUID, mutation.ReceivingAETitle))
 		default:
 			return CommitResult{}, ErrConflict
 		}
@@ -499,6 +547,9 @@ func (store *MemoryStore) CommitUPS(ctx context.Context, request CommitRequest) 
 	nextEventSequence := store.eventSequence
 	stagedEventIDs := make(map[string]struct{}, len(events))
 	for index := range events {
+		if err := contextError(ctx); err != nil {
+			return CommitResult{}, err
+		}
 		if events[index].SOPInstanceUID == "" && request.Step != nil {
 			events[index].SOPInstanceUID = nextStep.SOPInstanceUID
 		}
@@ -512,7 +563,7 @@ func (store *MemoryStore) CommitUPS(ctx context.Context, request CommitRequest) 
 			nextEventSequence++
 			events[index].ID = fmt.Sprintf("event-%020d", nextEventSequence)
 		}
-		cloned, cloneErr := cloneEvent(context.Background(), events[index])
+		cloned, cloneErr := cloneEvent(ctx, events[index])
 		if cloneErr != nil {
 			return CommitResult{}, cloneErr
 		}
@@ -539,6 +590,9 @@ func (store *MemoryStore) CommitUPS(ctx context.Context, request CommitRequest) 
 			return CommitResult{}, ErrResourceLimit
 		}
 		for _, receivingAE := range recipients {
+			if err := contextError(ctx); err != nil {
+				return CommitResult{}, err
+			}
 			id := deliveryKey(events[index].ID, receivingAE)
 			if _, exists := store.deliveries[id]; exists {
 				continue
@@ -552,6 +606,9 @@ func (store *MemoryStore) CommitUPS(ctx context.Context, request CommitRequest) 
 	}
 	if len(events) > store.maxEvents-len(store.events) || len(stagedDeliveries) > store.maxDeliveries-len(store.deliveries) {
 		return CommitResult{}, ErrResourceLimit
+	}
+	if err := contextError(ctx); err != nil {
+		return CommitResult{}, err
 	}
 
 	if request.Step != nil {
@@ -579,16 +636,25 @@ func (store *MemoryStore) CommitUPS(ctx context.Context, request CommitRequest) 
 		result.Step = &clone
 	}
 	if committedSubscription != nil {
-		clone := *committedSubscription
+		clone := cloneSubscription(*committedSubscription)
 		result.Subscription = &clone
 	}
 	return result, nil
 }
 
+// CommitFilteredGlobalSubscription opts MemoryStore into the filtered-global
+// persistence contract and delegates to the same atomic state/outbox commit.
+func (store *MemoryStore) CommitFilteredGlobalSubscription(ctx context.Context, mutation SubscriptionMutation) (CommitResult, error) {
+	if mutation.Kind != SubscriptionMutationSubscribe || mutation.SOPInstanceUID != FilteredGlobalSubscriptionSOPInstanceUID || mutation.Filter == nil {
+		return CommitResult{}, ErrConflict
+	}
+	return store.CommitUPS(ctx, CommitRequest{Subscription: &mutation})
+}
+
 func reclaimSubscriptionTombstones(subscriptions map[string]Subscription, steps map[string]Step, maximum int) {
 	activeGlobal := make(map[string]bool)
 	for _, subscription := range subscriptions {
-		if subscription.SOPInstanceUID == GlobalSubscriptionSOPInstanceUID && subscription.State != SubscriptionNone {
+		if isGlobalSubscriptionUID(subscription.SOPInstanceUID) && subscription.State != SubscriptionNone {
 			activeGlobal[subscription.ReceivingAETitle] = true
 		}
 	}
@@ -628,6 +694,11 @@ func cloneStep(ctx context.Context, step Step) (Step, error) {
 	return step, nil
 }
 
+func cloneSubscription(subscription Subscription) Subscription {
+	subscription.Filter = cloneSubscriptionFilter(subscription.Filter)
+	return subscription
+}
+
 func cloneEvent(ctx context.Context, event Event) (Event, error) {
 	limits, _ := normalizeLimits(Limits{})
 	information, err := cloneDataSet(ctx, event.Information, limits)
@@ -649,6 +720,10 @@ func cloneDelivery(ctx context.Context, delivery Delivery) (Delivery, error) {
 
 func subscriptionKey(sopInstanceUID, receivingAETitle string) string {
 	return receivingAETitle + "\x00" + sopInstanceUID
+}
+
+func isGlobalSubscriptionUID(sopInstanceUID string) bool {
+	return sopInstanceUID == GlobalSubscriptionSOPInstanceUID || sopInstanceUID == FilteredGlobalSubscriptionSOPInstanceUID
 }
 
 func deliveryKey(eventID, receivingAETitle string) string {

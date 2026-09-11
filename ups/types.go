@@ -41,6 +41,8 @@ const (
 	StatusInvalidAttributeValue         uint16 = 0x0106
 	StatusDuplicateSOPInstance          uint16 = 0x0111
 	StatusNoSuchSOPInstance             uint16 = 0x0112
+	StatusNoSuchArgument                uint16 = 0x0114
+	StatusInvalidArgumentValue          uint16 = 0x0115
 	StatusInvalidObjectInstance         uint16 = 0x0117
 	StatusMissingAttribute              uint16 = 0x0120
 	StatusMissingAttributeValue         uint16 = 0x0121
@@ -63,6 +65,7 @@ const (
 	StatusPerformerChoosesNotToCancel   uint16 = 0xC313
 	StatusActionNotAppropriate          uint16 = 0xC314
 	StatusEventReportsUnsupported       uint16 = 0xC315
+	StatusResourceLimitation            uint16 = 0x0213
 )
 
 var (
@@ -239,11 +242,12 @@ type MemoryStoreOptions struct {
 }
 
 type Limits struct {
-	MaxDataSetBytes     int64
-	MaxDataSetElements  int
-	MaxDataSetDepth     int
-	MaxCASAttempts      int
-	MaxStatusRecipients int
+	MaxDataSetBytes              int64
+	MaxDataSetElements           int
+	MaxDataSetDepth              int
+	MaxCASAttempts               int
+	MaxStatusRecipients          int
+	MaxSubscriptionFilterScanned int
 }
 
 type ServiceOptions struct {

@@ -126,6 +126,20 @@ func (client *Client) Subscribe(ctx context.Context, sopInstanceUID, receivingAE
 	return client.action(ctx, WatchSOPClassUID, sopInstanceUID, ActionSubscribe, information)
 }
 
+// SubscribeFiltered creates a filtered global subscription using the same
+// matching keys and semantics as UPS C-FIND. The filter applies to matching
+// current UPS instances and matching instances created in the future.
+func (client *Client) SubscribeFiltered(ctx context.Context, receivingAETitle string, deletionLock bool, matchingKeys map[string][]string) (OperationResult, error) {
+	if len(matchingKeys) == 0 {
+		return OperationResult{}, ErrInvalidDataSet
+	}
+	information, err := BuildSubscriptionInformation(receivingAETitle, deletionLock, matchingKeys)
+	if err != nil {
+		return OperationResult{}, err
+	}
+	return client.action(ctx, WatchSOPClassUID, FilteredGlobalSubscriptionSOPInstanceUID, ActionSubscribe, information)
+}
+
 func (client *Client) Unsubscribe(ctx context.Context, sopInstanceUID, receivingAETitle string) (OperationResult, error) {
 	information, err := BuildUnsubscriptionInformation(receivingAETitle)
 	if err != nil {

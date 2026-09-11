@@ -1177,30 +1177,7 @@ func validDefaultWorklistLabel(value string) bool {
 }
 
 func validUID(value string) bool {
-	value = core.NormalizeUID(value)
-	if value == "" || len(value) > 64 || strings.HasPrefix(value, ".") || strings.HasSuffix(value, ".") {
-		return false
-	}
-	components := strings.Split(value, ".")
-	if len(components) < 2 || components[0] != "0" && components[0] != "1" && components[0] != "2" {
-		return false
-	}
-	for _, component := range components {
-		if component == "" || len(component) > 1 && component[0] == '0' {
-			return false
-		}
-		for _, character := range component {
-			if character < '0' || character > '9' {
-				return false
-			}
-		}
-	}
-	if components[0] != "2" {
-		if len(components[1]) > 2 || len(components[1]) == 2 && components[1] > "39" {
-			return false
-		}
-	}
-	return true
+	return core.IsValidUID(core.NormalizeUID(value))
 }
 
 func normalizeContext(ctx context.Context) context.Context {

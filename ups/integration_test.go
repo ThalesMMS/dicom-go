@@ -68,6 +68,44 @@ func TestUPSClientPushPullWatchRoundTrip(t *testing.T) {
 	}
 }
 
+func TestUPSClientFilteredSubscribeRoundTrip(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	peer, local := pipeUPSAssociations(t, []ul.AcceptedContext{{
+		ID: 1, AbstractSyntaxUID: ups.WatchSOPClassUID, TransferSyntaxUID: transfer.ExplicitVRLittleEndian.UID,
+	}})
+	store, _ := ups.NewMemoryStore(ups.MemoryStoreOptions{})
+	service, _ := ups.NewService(store, ups.ServiceOptions{CallbackResolver: ups.CallbackResolverFunc(func(context.Context, ups.CallbackRequest) (ups.CallbackTarget, error) {
+		return ups.CallbackTarget{Address: "127.0.0.1:11112"}, nil
+	})})
+	matching := createScheduledWithWorklist(t, service, "1.2.826.0.1.3680043.10.543.837.81", "RADIOLOGY")
+	nonMatching := createScheduledWithWorklist(t, service, "1.2.826.0.1.3680043.10.543.837.82", "CARDIOLOGY")
+	serverOptions := service.NormalizedOptions(local)
+	serverDone := make(chan error, 1)
+	go func() {
+		command, err := dimse.ReceiveCommandSet(local, 1)
+		if err == nil {
+			err = dimse.ServeNormalizedCommand(ctx, local, 1, command, serverOptions)
+		}
+		if isHandledNormalizedTestError(err) {
+			err = nil
+		}
+		serverDone <- err
+	}()
+
+	result, err := ups.NewClient(peer).SubscribeFiltered(ctx, "WATCHER", true, map[string][]string{
+		ups.TagWorklistLabel.String(): {"RAD*"},
+	})
+	if err != nil || result.Status != ups.StatusSuccess {
+		t.Fatalf("SubscribeFiltered = %#v, %v", result, err)
+	}
+	if err := <-serverDone; err != nil {
+		t.Fatal(err)
+	}
+	assertSubscriptionState(t, service, matching, "WATCHER", ups.SubscriptionWithDeletionLock)
+	assertNoSubscription(t, service, nonMatching, "WATCHER")
+}
+
 func TestUPSQueryClientStreamsThroughAssociationRouter(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

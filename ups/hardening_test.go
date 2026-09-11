@@ -653,15 +653,14 @@ func TestReportSCPStatusChangeLimitsUniqueRecipientsAfterDeduplication(t *testin
 	}
 }
 
-func TestFilteredGlobalAndUnknownSpecificUnsubscribeReturnUPSNotFound(t *testing.T) {
+func TestFilteredGlobalRequiresMatchingKeysAndUnknownSpecificUnsubscribeReturnsUPSNotFound(t *testing.T) {
 	service, _ := testServiceAndStore(t, ServiceOptions{CallbackResolver: CallbackResolverFunc(func(context.Context, CallbackRequest) (CallbackTarget, error) {
 		return CallbackTarget{Address: "127.0.0.1:11112"}, nil
 	})})
 	_, err := service.Subscribe(context.Background(), SubscribeRequest{
 		SOPInstanceUID: FilteredGlobalSubscriptionSOPInstanceUID, ReceivingAETitle: "WATCHER",
-		MatchingKeys: map[string][]string{"00741000": {"SCHEDULED"}},
 	})
-	if !IsStatus(err, StatusUPSNotFound) {
+	if !IsStatus(err, StatusInvalidArgumentValue) {
 		t.Fatalf("filtered global subscribe error = %v", err)
 	}
 	err = service.Unsubscribe(context.Background(), UnsubscribeRequest{
@@ -923,7 +922,17 @@ func TestUIDValidationAndInternalCancellationUIDUniqueness(t *testing.T) {
 		}
 	}
 	service, _ := testServiceAndStore(t, ServiceOptions{})
+	if _, err := service.Create(context.Background(), CreateRequest{SOPInstanceUID: "3.1"}); !IsStatus(err, StatusInvalidObjectInstance) || !errors.Is(err, ErrInvalidDataSet) {
+		t.Fatalf("Create(malformed UID) error = %v, want status %04X and ErrInvalidDataSet", err, StatusInvalidObjectInstance)
+	}
 	first := createTestStep(t, service, "1.2.826.0.1.3680043.10.543.619.181")
+	if _, err := service.ChangeState(context.Background(), ChangeStateRequest{
+		SOPInstanceUID: first.SOPInstanceUID,
+		State:          StateInProgress,
+		TransactionUID: "1.40",
+	}); !IsStatus(err, StatusIncorrectTransactionUID) || !errors.Is(err, ErrInvalidDataSet) {
+		t.Fatalf("ChangeState(malformed UID) error = %v, want status %04X and ErrInvalidDataSet", err, StatusIncorrectTransactionUID)
+	}
 	second := createTestStep(t, service, "1.2.826.0.1.3680043.10.543.619.182")
 	first, err := service.RequestCancel(context.Background(), CancelRequest{SOPInstanceUID: first.SOPInstanceUID, RequestingAETitle: "REQUESTOR"})
 	if err != nil {

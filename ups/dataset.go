@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/ThalesMMS/dicom-go/core"
+	"github.com/ThalesMMS/dicom-go/dcmtime"
 	"github.com/ThalesMMS/dicom-go/dictionary/std"
 	"github.com/ThalesMMS/dicom-go/object"
 	"github.com/ThalesMMS/dicom-go/transfer"
@@ -122,6 +123,27 @@ func BuildPerformedProcedure(attributes PerformedProcedureAttributes) (*object.O
 	}), nil
 }
 
+// BuildDiscontinuationProgress constructs the N-SET progress macro required
+// before a performer changes an IN PROGRESS UPS to CANCELED. reason is a
+// caller-selected coded clinical reason; cancellationDateTime is a DICOM DT.
+func BuildDiscontinuationProgress(reason Code, cancellationDateTime string) (*object.Object, error) {
+	if err := validateCode(reason); err != nil {
+		return nil, err
+	}
+	cancellationDateTime = strings.TrimSpace(cancellationDateTime)
+	if _, err := dcmtime.ParseDatetime(cancellationDateTime); err != nil {
+		return nil, ErrInvalidDataSet
+	}
+	item := core.DataSet{Elements: []core.Element{
+		StringElement(TagProcedureStepCancellationDateTime, core.VRDT, cancellationDateTime),
+		codeSequence(TagProcedureStepDiscontinuationReasonCodeSequence, reason),
+	}}
+	return NewDataSet(core.Element{
+		Header: core.ElementHeader{Tag: TagProcedureStepProgressInformationSequence, VR: core.VRSQ},
+		Value:  core.SequenceValue{Items: []core.DataSet{item}},
+	}), nil
+}
+
 func validateCode(code Code) error {
 	if strings.TrimSpace(code.Value) == "" || strings.TrimSpace(code.Scheme) == "" || strings.TrimSpace(code.Meaning) == "" {
 		return ErrInvalidDataSet
@@ -141,7 +163,8 @@ func codeSequence(tag core.Tag, code Code) core.Element {
 }
 
 func normalizeLimits(limits Limits) (Limits, error) {
-	if limits.MaxDataSetBytes < 0 || limits.MaxDataSetElements < 0 || limits.MaxDataSetDepth < 0 || limits.MaxCASAttempts < 0 || limits.MaxStatusRecipients < 0 || limits.MaxStatusRecipients > maxUPSStatusRecipients {
+	if limits.MaxDataSetBytes < 0 || limits.MaxDataSetElements < 0 || limits.MaxDataSetDepth < 0 || limits.MaxCASAttempts < 0 || limits.MaxStatusRecipients < 0 || limits.MaxStatusRecipients > maxUPSStatusRecipients ||
+		limits.MaxSubscriptionFilterScanned < 0 || limits.MaxSubscriptionFilterScanned > maxQueryScannedSteps {
 		return Limits{}, ErrResourceLimit
 	}
 	if limits.MaxDataSetBytes == 0 {
@@ -158,6 +181,9 @@ func normalizeLimits(limits Limits) (Limits, error) {
 	}
 	if limits.MaxStatusRecipients == 0 {
 		limits.MaxStatusRecipients = 10_000
+	}
+	if limits.MaxSubscriptionFilterScanned == 0 {
+		limits.MaxSubscriptionFilterScanned = 100_000
 	}
 	return limits, nil
 }

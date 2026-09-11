@@ -1,6 +1,7 @@
 package roi
 
 import (
+	"context"
 	"math"
 
 	"github.com/ThalesMMS/dicom-go/render"
@@ -78,6 +79,10 @@ func ThresholdSegmentation(geometry render.VolumeGeometry, columns, rows int, lo
 // signed distance fields inside that common frame. That keeps translated or
 // resized painted masks moving between slices instead of copying one endpoint.
 func InterpolateMask(first, last *RasterMask, t float64) *RasterMask {
+	return interpolateMaskWithWorkspace(first, last, t, nil)
+}
+
+func interpolateMaskWithWorkspace(first, last *RasterMask, t float64, workspace *maskInterpolationWorkspace) *RasterMask {
 	if first == nil || last == nil {
 		return nil
 	}
@@ -107,11 +112,28 @@ func InterpolateMask(first, last *RasterMask, t float64) *RasterMask {
 	targetBounds := interpolateBounds(firstBounds, lastBounds, t)
 	firstAligned := remapMaskToBounds(first, firstBounds, targetBounds)
 	lastAligned := remapMaskToBounds(last, lastBounds, targetBounds)
-	firstField := signedDistanceField(firstAligned)
-	lastField := signedDistanceField(lastAligned)
-	for idx := range firstField {
-		if (1-t)*firstField[idx]+t*lastField[idx] >= 0 {
-			out.Set(idx%first.Columns, idx/first.Columns, true)
+	if workspace == nil || workspace.columns != first.Columns || workspace.rows != first.Rows {
+		workspace = newMaskInterpolationWorkspace(first.Columns, first.Rows)
+	}
+	signedDistanceFieldInto(workspace.firstField, firstAligned, workspace)
+	signedDistanceFieldInto(workspace.lastField, lastAligned, workspace)
+	for y := 0; y < first.Rows; y++ {
+		rowStart := y * first.Columns
+		for x := 0; x < first.Columns; {
+			idx := rowStart + x
+			if (1-t)*workspace.firstField[idx]+t*workspace.lastField[idx] < 0 {
+				x++
+				continue
+			}
+			start := x
+			for x < first.Columns {
+				idx = rowStart + x
+				if (1-t)*workspace.firstField[idx]+t*workspace.lastField[idx] < 0 {
+					break
+				}
+				x++
+			}
+			out.SetRun(y, start, x)
 		}
 	}
 	return out
@@ -122,37 +144,55 @@ func InterpolateMask(first, last *RasterMask, t float64) *RasterMask {
 // masks, while the endpoint masks are left untouched. It returns the number of
 // intermediate slice masks written.
 func InterpolateBetweenSlices(seg *Segmentation3D, firstSlice, lastSlice int) int {
+	written, _ := InterpolateBetweenSlicesContext(context.Background(), seg, firstSlice, lastSlice)
+	return written
+}
+
+// InterpolateBetweenSlicesContext is the cancellable form of
+// InterpolateBetweenSlices. If ctx is cancelled, it returns the number of
+// completed intermediate masks and leaves those masks installed.
+func InterpolateBetweenSlicesContext(ctx context.Context, seg *Segmentation3D, firstSlice, lastSlice int) (int, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	if seg == nil || firstSlice == lastSlice {
-		return 0
+		return 0, nil
 	}
 	if firstSlice > lastSlice {
 		firstSlice, lastSlice = lastSlice, firstSlice
 	}
 	if lastSlice-firstSlice < 2 {
-		return 0
+		return 0, nil
 	}
 	first, ok := seg.MaskAt(firstSlice)
 	if !ok || first == nil || first.Empty() {
-		return 0
+		return 0, nil
 	}
 	last, ok := seg.MaskAt(lastSlice)
 	if !ok || last == nil || last.Empty() {
-		return 0
+		return 0, nil
 	}
 	if first.Columns != last.Columns || first.Rows != last.Rows {
-		return 0
+		return 0, nil
 	}
 	written := 0
 	span := float64(lastSlice - firstSlice)
+	workspace := newMaskInterpolationWorkspace(first.Columns, first.Rows)
 	for slice := firstSlice + 1; slice < lastSlice; slice++ {
-		mask := InterpolateMask(first, last, float64(slice-firstSlice)/span)
+		if err := ctx.Err(); err != nil {
+			return written, err
+		}
+		mask := interpolateMaskWithWorkspace(first, last, float64(slice-firstSlice)/span, workspace)
 		if mask == nil || mask.Empty() {
 			continue
 		}
 		seg.SetMask(slice, mask)
 		written++
 	}
-	return written
+	return written, nil
 }
 
 type rasterMaskBounds struct {
@@ -224,42 +264,68 @@ func lerpFloat(a, b, t float64) float64 {
 	return a + (b-a)*t
 }
 
-func signedDistanceField(mask *RasterMask) []float64 {
-	total := mask.Columns * mask.Rows
-	insideFeatures := make([]bool, total)
-	outsideFeatures := make([]bool, total)
-	for y := 0; y < mask.Rows; y++ {
-		for x := 0; x < mask.Columns; x++ {
-			idx := y*mask.Columns + x
-			inside := mask.Get(x, y)
-			insideFeatures[idx] = inside
-			outsideFeatures[idx] = !inside
-		}
-	}
-	maxDistance := math.Hypot(float64(mask.Columns), float64(mask.Rows))
-	distanceToInside := euclideanDistanceToFeatures(insideFeatures, mask.Columns, mask.Rows, maxDistance)
-	distanceToOutside := euclideanDistanceToFeatures(outsideFeatures, mask.Columns, mask.Rows, maxDistance)
-	field := make([]float64, total)
-	for idx := range field {
-		if insideFeatures[idx] {
-			field[idx] = distanceToOutside[idx]
-		} else {
-			field[idx] = -distanceToInside[idx]
-		}
-	}
-	return field
+type maskInterpolationWorkspace struct {
+	columns         int
+	rows            int
+	features        []bool
+	tmp             []float64
+	distanceScratch []float64
+	firstField      []float64
+	lastField       []float64
+	lineValues      []float64
+	lineOutput      []float64
+	locations       []int
+	boundaries      []float64
 }
 
-func euclideanDistanceToFeatures(features []bool, columns, rows int, maxDistance float64) []float64 {
+func newMaskInterpolationWorkspace(columns, rows int) *maskInterpolationWorkspace {
 	total := columns * rows
-	out := make([]float64, total)
+	lineLength := max(columns, rows)
+	return &maskInterpolationWorkspace{
+		columns:         columns,
+		rows:            rows,
+		features:        make([]bool, total),
+		tmp:             make([]float64, total),
+		distanceScratch: make([]float64, total),
+		firstField:      make([]float64, total),
+		lastField:       make([]float64, total),
+		lineValues:      make([]float64, lineLength),
+		lineOutput:      make([]float64, lineLength),
+		locations:       make([]int, lineLength),
+		boundaries:      make([]float64, lineLength+1),
+	}
+}
+
+func signedDistanceFieldInto(field []float64, mask *RasterMask, workspace *maskInterpolationWorkspace) {
+	clear(workspace.features)
+	mask.ForEachRun(func(y int, run MaskRun) {
+		rowStart := y * mask.Columns
+		for x := run.Start; x < run.End; x++ {
+			workspace.features[rowStart+x] = true
+		}
+	})
+	maxDistance := math.Hypot(float64(mask.Columns), float64(mask.Rows))
+	euclideanDistanceToFeaturesInto(field, workspace.features, mask.Columns, mask.Rows, maxDistance, workspace)
+	for index := range workspace.features {
+		workspace.features[index] = !workspace.features[index]
+	}
+	euclideanDistanceToFeaturesInto(workspace.distanceScratch, workspace.features, mask.Columns, mask.Rows, maxDistance, workspace)
+	for index, outside := range workspace.features {
+		if outside {
+			field[index] = -field[index]
+		} else {
+			field[index] = workspace.distanceScratch[index]
+		}
+	}
+}
+
+func euclideanDistanceToFeaturesInto(out []float64, features []bool, columns, rows int, maxDistance float64, workspace *maskInterpolationWorkspace) {
 	if columns <= 0 || rows <= 0 {
-		return out
+		return
 	}
 	const largeDistance = 1e12
-	tmp := make([]float64, total)
 	for y := 0; y < rows; y++ {
-		row := make([]float64, columns)
+		row := workspace.lineValues[:columns]
 		for x := 0; x < columns; x++ {
 			if features[y*columns+x] {
 				row[x] = 0
@@ -267,15 +333,17 @@ func euclideanDistanceToFeatures(features []bool, columns, rows int, maxDistance
 				row[x] = largeDistance
 			}
 		}
-		transformed := distanceTransform1D(row)
-		copy(tmp[y*columns:(y+1)*columns], transformed)
+		transformed := workspace.lineOutput[:columns]
+		distanceTransform1DInto(transformed, row, workspace.locations[:columns], workspace.boundaries[:columns+1])
+		copy(workspace.tmp[y*columns:(y+1)*columns], transformed)
 	}
 	for x := 0; x < columns; x++ {
-		column := make([]float64, rows)
+		column := workspace.lineValues[:rows]
 		for y := 0; y < rows; y++ {
-			column[y] = tmp[y*columns+x]
+			column[y] = workspace.tmp[y*columns+x]
 		}
-		transformed := distanceTransform1D(column)
+		transformed := workspace.lineOutput[:rows]
+		distanceTransform1DInto(transformed, column, workspace.locations[:rows], workspace.boundaries[:rows+1])
 		for y := 0; y < rows; y++ {
 			distance := math.Sqrt(transformed[y])
 			if distance > maxDistance {
@@ -284,17 +352,13 @@ func euclideanDistanceToFeatures(features []bool, columns, rows int, maxDistance
 			out[y*columns+x] = distance
 		}
 	}
-	return out
 }
 
-func distanceTransform1D(values []float64) []float64 {
+func distanceTransform1DInto(out, values []float64, locations []int, boundaries []float64) {
 	n := len(values)
-	out := make([]float64, n)
 	if n == 0 {
-		return out
+		return
 	}
-	locations := make([]int, n)
-	boundaries := make([]float64, n+1)
 	k := 0
 	locations[0] = 0
 	boundaries[0] = math.Inf(-1)
@@ -318,7 +382,6 @@ func distanceTransform1D(values []float64) []float64 {
 		delta := float64(q - locations[k])
 		out[q] = delta*delta + values[locations[k]]
 	}
-	return out
 }
 
 func distanceParabolaIntersection(values []float64, q, p int) float64 {

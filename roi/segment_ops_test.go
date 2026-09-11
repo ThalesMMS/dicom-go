@@ -1,11 +1,16 @@
 package roi
 
 import (
+	"context"
 	"math"
+	"runtime"
+	"sync"
 	"testing"
 
 	"github.com/ThalesMMS/dicom-go/render"
 )
+
+var benchmarkInterpolatedSegmentation *Segmentation3D
 
 func Test_Brush_sets_and_erases_filled_disc(t *testing.T) {
 	// Given
@@ -218,6 +223,179 @@ func Test_InterpolateBetweenSlices_fills_missing_slices(t *testing.T) {
 	}
 }
 
+func Test_InterpolateMaskWorkspaceMatchesReferenceAtEveryGapFraction(t *testing.T) {
+	first := NewRasterMask(31, 23)
+	last := NewRasterMask(31, 23)
+	for y := 3; y < 15; y++ {
+		first.SetRun(y, 2+y/3, 13+y/4)
+	}
+	for y := 7; y < 21; y++ {
+		last.SetRun(y, 14-y/5, 27-y/6)
+	}
+	for step := 1; step < 100; step++ {
+		fraction := float64(step) / 100
+		got := InterpolateMask(first, last, fraction)
+		want := referenceInterpolateMask(first, last, fraction)
+		for y := 0; y < got.Rows; y++ {
+			if !maskRunsEqual(got.Runs(y), want.Runs(y)) {
+				t.Fatalf("t=%g row %d runs = %v, want %v", fraction, y, got.Runs(y), want.Runs(y))
+			}
+		}
+	}
+}
+
+func Test_InterpolateBetweenSlicesContextCancellationAndConcurrency(t *testing.T) {
+	geometry := render.VolumeGeometry{Slices: make([]render.SliceGeometry, 11)}
+	first := NewRasterMask(32, 24)
+	last := NewRasterMask(32, 24)
+	for y := 4; y < 16; y++ {
+		first.SetRun(y, 3, 15)
+		last.SetRun(y+3, 15, 27)
+	}
+
+	cancelledSeg := NewSegmentation3D(geometry, 32, 24)
+	cancelledSeg.SetMask(0, first)
+	cancelledSeg.SetMask(10, last)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if written, err := InterpolateBetweenSlicesContext(ctx, cancelledSeg, 0, 10); written != 0 || err != context.Canceled {
+		t.Fatalf("cancelled interpolation = %d, %v; want 0, context.Canceled", written, err)
+	}
+
+	type result struct {
+		written int
+		err     error
+	}
+	results := make(chan result, 8)
+	var wait sync.WaitGroup
+	for worker := 0; worker < cap(results); worker++ {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			seg := NewSegmentation3D(geometry, 32, 24)
+			seg.SetMask(0, first)
+			seg.SetMask(10, last)
+			written, err := InterpolateBetweenSlicesContext(context.Background(), seg, 0, 10)
+			results <- result{written: written, err: err}
+		}()
+	}
+	wait.Wait()
+	close(results)
+	for result := range results {
+		if result.written != 9 || result.err != nil {
+			t.Fatalf("concurrent interpolation = %d, %v; want 9, nil", result.written, result.err)
+		}
+	}
+}
+
+func referenceInterpolateMask(first, last *RasterMask, fraction float64) *RasterMask {
+	firstBounds, _ := maskBounds(first)
+	lastBounds, _ := maskBounds(last)
+	targetBounds := interpolateBounds(firstBounds, lastBounds, fraction)
+	firstField := referenceSignedDistanceField(remapMaskToBounds(first, firstBounds, targetBounds))
+	lastField := referenceSignedDistanceField(remapMaskToBounds(last, lastBounds, targetBounds))
+	out := NewRasterMask(first.Columns, first.Rows)
+	for index := range firstField {
+		if (1-fraction)*firstField[index]+fraction*lastField[index] >= 0 {
+			out.Set(index%first.Columns, index/first.Columns, true)
+		}
+	}
+	return out
+}
+
+func referenceSignedDistanceField(mask *RasterMask) []float64 {
+	total := mask.Columns * mask.Rows
+	inside := make([]bool, total)
+	outside := make([]bool, total)
+	for y := 0; y < mask.Rows; y++ {
+		for x := 0; x < mask.Columns; x++ {
+			index := y*mask.Columns + x
+			inside[index] = mask.Get(x, y)
+			outside[index] = !inside[index]
+		}
+	}
+	maximum := math.Hypot(float64(mask.Columns), float64(mask.Rows))
+	distanceToInside := referenceEuclideanDistanceToFeatures(inside, mask.Columns, mask.Rows, maximum)
+	distanceToOutside := referenceEuclideanDistanceToFeatures(outside, mask.Columns, mask.Rows, maximum)
+	field := make([]float64, total)
+	for index := range field {
+		if inside[index] {
+			field[index] = distanceToOutside[index]
+		} else {
+			field[index] = -distanceToInside[index]
+		}
+	}
+	return field
+}
+
+func referenceEuclideanDistanceToFeatures(features []bool, columns, rows int, maximum float64) []float64 {
+	const largeDistance = 1e12
+	out := make([]float64, columns*rows)
+	tmp := make([]float64, columns*rows)
+	for y := 0; y < rows; y++ {
+		line := make([]float64, columns)
+		for x := range line {
+			if !features[y*columns+x] {
+				line[x] = largeDistance
+			}
+		}
+		copy(tmp[y*columns:(y+1)*columns], referenceDistanceTransform1D(line))
+	}
+	for x := 0; x < columns; x++ {
+		line := make([]float64, rows)
+		for y := range line {
+			line[y] = tmp[y*columns+x]
+		}
+		transformed := referenceDistanceTransform1D(line)
+		for y := range line {
+			distance := math.Sqrt(transformed[y])
+			out[y*columns+x] = min(distance, maximum)
+		}
+	}
+	return out
+}
+
+func referenceDistanceTransform1D(values []float64) []float64 {
+	out := make([]float64, len(values))
+	locations := make([]int, len(values))
+	boundaries := make([]float64, len(values)+1)
+	k := 0
+	boundaries[0] = math.Inf(-1)
+	boundaries[1] = math.Inf(1)
+	for q := 1; q < len(values); q++ {
+		s := distanceParabolaIntersection(values, q, locations[k])
+		for s <= boundaries[k] {
+			k--
+			s = distanceParabolaIntersection(values, q, locations[k])
+		}
+		k++
+		locations[k] = q
+		boundaries[k] = s
+		boundaries[k+1] = math.Inf(1)
+	}
+	k = 0
+	for q := range values {
+		for boundaries[k+1] < float64(q) {
+			k++
+		}
+		delta := float64(q - locations[k])
+		out[q] = delta*delta + values[locations[k]]
+	}
+	return out
+}
+
+func maskRunsEqual(first, last []MaskRun) bool {
+	if len(first) != len(last) {
+		return false
+	}
+	for index := range first {
+		if first[index] != last[index] {
+			return false
+		}
+	}
+	return true
+}
+
 func Test_Dilate_and_Erode_use_four_connected_structuring_element(t *testing.T) {
 	// Given
 	mask := NewRasterMask(11, 11)
@@ -234,4 +412,51 @@ func Test_Dilate_and_Erode_use_four_connected_structuring_element(t *testing.T) 
 	if eroded.Count() != 1 || !eroded.Get(5, 5) {
 		t.Fatalf("erode of plus = %d set, want one center pixel", eroded.Count())
 	}
+}
+
+func BenchmarkInterpolateBetweenSlicesGap100_512(b *testing.B) {
+	benchmarkInterpolateBetweenSlices(b, 100)
+}
+
+func BenchmarkInterpolateBetweenSlicesGap300_512(b *testing.B) {
+	benchmarkInterpolateBetweenSlices(b, 300)
+}
+
+func benchmarkInterpolateBetweenSlices(b *testing.B, gap int) {
+	b.Helper()
+	const columns, rows = 512, 512
+	geometry := render.VolumeGeometry{Slices: make([]render.SliceGeometry, gap+1)}
+	first := NewRasterMask(columns, rows)
+	last := NewRasterMask(columns, rows)
+	for y := 96; y < 352; y++ {
+		first.SetRun(y, 64, 320)
+	}
+	for y := 144; y < 400; y++ {
+		last.SetRun(y, 192, 448)
+	}
+	b.ReportAllocs()
+	var peakHeapBytes uint64
+	b.ResetTimer()
+	for iteration := 0; iteration < b.N; iteration++ {
+		b.StopTimer()
+		runtime.GC()
+		var before runtime.MemStats
+		runtime.ReadMemStats(&before)
+		seg := NewSegmentation3D(geometry, columns, rows)
+		seg.SetMask(0, first)
+		seg.SetMask(gap, last)
+		b.StartTimer()
+		written := InterpolateBetweenSlices(seg, 0, gap)
+		b.StopTimer()
+		var after runtime.MemStats
+		runtime.ReadMemStats(&after)
+		if after.HeapAlloc > before.HeapAlloc {
+			peakHeapBytes = max(peakHeapBytes, after.HeapAlloc-before.HeapAlloc)
+		}
+		if written != gap-1 {
+			b.Fatalf("written = %d, want %d", written, gap-1)
+		}
+		benchmarkInterpolatedSegmentation = seg
+	}
+	b.ReportMetric(float64(peakHeapBytes), "observed_heap_B")
 }

@@ -9,8 +9,6 @@ import (
 )
 
 var (
-	// ErrCPRInput reports a render request missing its volume or path.
-	ErrCPRInput = errors.New("render: CPR render requires a volume and a path")
 	// ErrCPRSuperseded reports that a newer render generation began before this
 	// render finished, so its result is discarded before reaching UI state.
 	ErrCPRSuperseded = errors.New("render: CPR render superseded by a newer generation")
@@ -107,6 +105,15 @@ func RenderCPR(ctx context.Context, req CPRRequest) (image.Image, error) {
 	if req.Volume == nil || req.Path == nil {
 		return nil, ErrCPRInput
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := validateCPRRequest(req); err != nil {
+		return nil, err
+	}
 	switch req.Mode {
 	case CPRTransverse:
 		return renderTransverseCPR(ctx, req)
@@ -122,23 +129,110 @@ func RenderCPR(ctx context.Context, req CPRRequest) (image.Image, error) {
 	}
 }
 
+func validateCPRRequest(req CPRRequest) error {
+	if req.Width < 0 {
+		return &CPRInputError{Field: "width", Reason: "width cannot be negative"}
+	}
+	if req.width() > MaxCPROutputDimension {
+		return &CPRLimitError{Resource: "output_dimension", Value: uint64(req.width()), Limit: MaxCPROutputDimension}
+	}
+	for _, field := range []struct {
+		name  string
+		value float64
+	}{
+		{"arc_spacing", req.ArcSpacing},
+		{"cross_spacing", req.CrossSpacing},
+		{"thickness_mm", req.ThicknessMM},
+	} {
+		if field.value < 0 || math.IsNaN(field.value) || math.IsInf(field.value, 0) {
+			return &CPRInputError{Field: field.name, Reason: "value must be zero or positive and finite"}
+		}
+	}
+	for _, field := range []struct {
+		name  string
+		value float64
+	}{
+		{"arc_length", req.ArcLength},
+		{"rotation_degrees", req.RotationDegrees},
+		{"window_center", req.Window.Center},
+		{"window_width", req.Window.Width},
+	} {
+		if math.IsNaN(field.value) || math.IsInf(field.value, 0) {
+			return &CPRInputError{Field: field.name, Reason: "value is not finite"}
+		}
+	}
+	if req.StretchDir != (Vec3{}) && !finiteVec3(req.StretchDir) {
+		return &CPRInputError{Field: "stretch_direction", Reason: "coordinate is not finite"}
+	}
+	if req.Thickness < 0 {
+		return &CPRInputError{Field: "thickness", Reason: "sample count cannot be negative"}
+	}
+	if req.Thickness > MaxCPRSlabSamples {
+		return &CPRLimitError{Resource: "slab_samples", Value: uint64(req.Thickness), Limit: MaxCPRSlabSamples}
+	}
+	if req.SlabMode < SlabNone || req.SlabMode > SlabAverage {
+		return &CPRInputError{Field: "slab_mode", Reason: "mode is not supported"}
+	}
+	if req.Mode < CPRStraightened || req.Mode > CPRSlab {
+		return &CPRInputError{Field: "mode", Reason: "mode is not supported"}
+	}
+	return nil
+}
+
+func validateCPROutput(width, height, slabSamples int) error {
+	if width <= 0 || height <= 0 {
+		return &CPRInputError{Field: "output_dimensions", Reason: "dimensions must be positive"}
+	}
+	if width > MaxCPROutputDimension || height > MaxCPROutputDimension {
+		value := width
+		if height > value {
+			value = height
+		}
+		return &CPRLimitError{Resource: "output_dimension", Value: uint64(value), Limit: MaxCPROutputDimension}
+	}
+	pixels, err := checkedCPRProduct("output_pixels", MaxCPROutputPixels, uint64(width), uint64(height))
+	if err != nil {
+		return err
+	}
+	if slabSamples < 1 {
+		slabSamples = 1
+	}
+	_, err = checkedCPRProduct("sample_operations", MaxCPRSampleOperations, pixels, uint64(slabSamples))
+	return err
+}
+
 // renderLongitudinalCPR renders straightened (stretched=false) or stretched
 // (stretched=true) CPR: columns run along the centerline arc length, rows across
 // the cross-section. This orientation matches curved-MPR workstations where
 // transverse section markers are vertical lines on the longitudinal output.
 func renderLongitudinalCPR(ctx context.Context, req CPRRequest, stretched bool) (image.Image, error) {
 	vol := req.Volume
+	sampleCount, err := req.Path.SampleCountChecked(req.arcSpacing())
+	if err != nil {
+		return nil, err
+	}
+	width := req.width()
+	cross := req.crossSpacing()
+	slabSamples, err := cprSlabSampleCountChecked(req)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateCPROutput(sampleCount, width, slabSamples); err != nil {
+		return nil, err
+	}
+	samples, err := req.Path.ResampleChecked(req.arcSpacing())
+	if err != nil {
+		return nil, err
+	}
+	slabOffsets, err := cprSlabSampleOffsetsChecked(req, cross)
+	if err != nil {
+		return nil, err
+	}
 	sampler, ok := newVolumeSampler(vol)
 	if !ok {
 		return nil, ErrCPRInput
 	}
 	defer sampler.Close()
-	samples := req.Path.Resample(req.arcSpacing())
-	if len(samples) == 0 {
-		return blankImage(req.width(), 1), nil
-	}
-	width := req.width()
-	cross := req.crossSpacing()
 	half := float64(width-1) / 2
 	photometric := vol.Photometric()
 	window := normalizeWindow(req.Window, WindowLevel{Center: defaultWindowCenter, Width: defaultWindowWidth})
@@ -150,7 +244,7 @@ func renderLongitudinalCPR(ctx context.Context, req CPRRequest, stretched bool) 
 	}
 
 	img := image.NewGray(image.Rect(0, 0, len(samples), width))
-	err := parallelRowsContext(ctx, width, func(r int) {
+	err = parallelRowsContext(ctx, width, func(r int) {
 		rowOffset := img.PixOffset(0, r)
 		offset := (float64(r) - half) * cross
 		for c, s := range samples {
@@ -163,9 +257,9 @@ func renderLongitudinalCPR(ctx context.Context, req CPRRequest, stretched bool) 
 			}
 			crossDir, slabDir := rotateCPRBasis(crossDir, s.Tangent, req.RotationDegrees)
 			base := s.Position.Add(crossDir.Scale(offset))
-			if offsets := cprSlabSampleOffsets(req, cross); len(offsets) > 0 {
-				value, ph, ok := reduceSlab(req.SlabMode, 0, len(offsets)-1, func(k int) (float64, string, bool) {
-					p := base.Add(slabDir.Scale(offsets[k]))
+			if len(slabOffsets) > 0 {
+				value, ph, ok := reduceSlab(req.SlabMode, 0, len(slabOffsets)-1, func(k int) (float64, string, bool) {
+					p := base.Add(slabDir.Scale(slabOffsets[k]))
 					v, sampleOK := sampler.trilinearAt(sampler.vol.PatientToVoxel(p))
 					return v, photometric, sampleOK
 				})
@@ -197,30 +291,41 @@ func renderSlabCPR(ctx context.Context, req CPRRequest) (image.Image, error) {
 // centerline at req.ArcLength, spanned by the frame's normal and binormal.
 func renderTransverseCPR(ctx context.Context, req CPRRequest) (image.Image, error) {
 	vol := req.Volume
+	frame := req.Path.FrameAt(req.ArcLength)
+	normal, binormal := rotateCPRBasis(frame.Normal, frame.Tangent, req.RotationDegrees)
+	size := req.width()
+	cross := req.crossSpacing()
+	slabSamples, err := cprSlabSampleCountChecked(req)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateCPROutput(size, size, slabSamples); err != nil {
+		return nil, err
+	}
+	slabOffsets, err := cprSlabSampleOffsetsChecked(req, cross)
+	if err != nil {
+		return nil, err
+	}
 	sampler, ok := newVolumeSampler(vol)
 	if !ok {
 		return nil, ErrCPRInput
 	}
 	defer sampler.Close()
-	frame := req.Path.FrameAt(req.ArcLength)
-	normal, binormal := rotateCPRBasis(frame.Normal, frame.Tangent, req.RotationDegrees)
-	size := req.width()
-	cross := req.crossSpacing()
 	half := float64(size-1) / 2
 	photometric := vol.Photometric()
 	window := normalizeWindow(req.Window, WindowLevel{Center: defaultWindowCenter, Width: defaultWindowWidth})
 	mapper := prepareWindow(window)
 
 	img := image.NewGray(image.Rect(0, 0, size, size))
-	err := parallelRowsContext(ctx, size, func(j int) {
+	err = parallelRowsContext(ctx, size, func(j int) {
 		voff := (float64(j) - half) * cross
 		rowOffset := img.PixOffset(0, j)
 		for i := 0; i < size; i++ {
 			uoff := (float64(i) - half) * cross
 			base := frame.Position.Add(normal.Scale(uoff)).Add(binormal.Scale(voff))
-			if offsets := cprSlabSampleOffsets(req, cross); len(offsets) > 0 {
-				value, ph, ok := reduceSlab(req.SlabMode, 0, len(offsets)-1, func(k int) (float64, string, bool) {
-					p := base.Add(frame.Tangent.Scale(offsets[k]))
+			if len(slabOffsets) > 0 {
+				value, ph, ok := reduceSlab(req.SlabMode, 0, len(slabOffsets)-1, func(k int) (float64, string, bool) {
+					p := base.Add(frame.Tangent.Scale(slabOffsets[k]))
 					v, sampleOK := sampler.trilinearAt(sampler.vol.PatientToVoxel(p))
 					return v, photometric, sampleOK
 				})
@@ -246,38 +351,58 @@ func renderTransverseCPR(ctx context.Context, req CPRRequest) (image.Image, erro
 // retain the same field of view and slab extent. The legacy sample-count path
 // preserves the behavior of existing callers that only set Thickness.
 func cprSlabSampleOffsets(req CPRRequest, legacyStep float64) []float64 {
-	if req.SlabMode == SlabNone {
-		return nil
-	}
-	if thickness := req.ThicknessMM; positiveFinite(thickness) {
-		step := cprPhysicalSamplingStep(req.Volume)
-		count := int(math.Ceil(thickness/step)) + 1
-		if count < 2 {
-			count = 2
-		}
-		// Bound adversarial requests while still supporting slabs far larger than
-		// normal clinical use.
-		if count > 4097 {
-			count = 4097
-		}
-		offsets := make([]float64, count)
-		for i := range offsets {
-			offsets[i] = -thickness/2 + thickness*float64(i)/float64(count-1)
-		}
-		return offsets
-	}
-	if req.Thickness <= 1 {
-		return nil
+	offsets, _ := cprSlabSampleOffsetsChecked(req, legacyStep)
+	return offsets
+}
+
+func cprSlabSampleOffsetsChecked(req CPRRequest, legacyStep float64) ([]float64, error) {
+	count, err := cprSlabSampleCountChecked(req)
+	if err != nil || count == 0 {
+		return nil, err
 	}
 	if !positiveFinite(legacyStep) {
 		legacyStep = 1
 	}
-	offsets := make([]float64, req.Thickness)
-	half := float64(req.Thickness-1) / 2
+	offsets := make([]float64, count)
+	if thickness := req.ThicknessMM; positiveFinite(thickness) {
+		for i := range offsets {
+			offsets[i] = -thickness/2 + thickness*float64(i)/float64(count-1)
+		}
+		return offsets, nil
+	}
+	half := float64(count-1) / 2
 	for i := range offsets {
 		offsets[i] = (float64(i) - half) * legacyStep
 	}
-	return offsets
+	return offsets, nil
+}
+
+func cprSlabSampleCountChecked(req CPRRequest) (int, error) {
+	if req.SlabMode == SlabNone {
+		return 0, nil
+	}
+	if thickness := req.ThicknessMM; positiveFinite(thickness) {
+		step := cprPhysicalSamplingStep(req.Volume)
+		countFloat := math.Ceil(thickness/step) + 1
+		if !positiveFinite(countFloat) {
+			return 0, &CPRInputError{Field: "slab_samples", Reason: "sample count is not finite"}
+		}
+		if countFloat > MaxCPRSlabSamples {
+			return 0, &CPRLimitError{Resource: "slab_samples", Value: MaxCPRSlabSamples + 1, Limit: MaxCPRSlabSamples}
+		}
+		count := int(countFloat)
+		if count < 2 {
+			count = 2
+		}
+		return count, nil
+	}
+	if req.Thickness <= 1 {
+		return 0, nil
+	}
+	if req.Thickness > MaxCPRSlabSamples {
+		return 0, &CPRLimitError{Resource: "slab_samples", Value: uint64(req.Thickness), Limit: MaxCPRSlabSamples}
+	}
+	return req.Thickness, nil
 }
 
 func cprPhysicalSamplingStep(volume *Volume) float64 {

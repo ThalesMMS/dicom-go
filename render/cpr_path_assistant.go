@@ -24,12 +24,32 @@ var (
 // search uses an adaptively downsampled, volume-axis-aligned grid and therefore
 // stays bounded for large clinical series.
 type CPRPathAssistantOptions struct {
-	GridSpacingMM   float64
-	MarginMM        float64
-	OutputSpacingMM float64
-	IntensityWeight float64
-	MaxGridVoxels   int
+	GridSpacingMM    float64
+	MarginMM         float64
+	OutputSpacingMM  float64
+	IntensityWeight  float64
+	MaxGridVoxels    int
+	MaxExpandedNodes int
+	MaxQueueEntries  int
+	MaxOutputPoints  int
 }
+
+// CPRPathAssistantLimitError identifies which bounded search resource was
+// exhausted. It matches ErrCPRPathAssistantMemory through errors.Is.
+type CPRPathAssistantLimitError struct {
+	Resource string
+	Value    int
+	Limit    int
+}
+
+func (e *CPRPathAssistantLimitError) Error() string {
+	if e == nil {
+		return ""
+	}
+	return fmt.Sprintf("%v: %s=%d, limit=%d", ErrCPRPathAssistantMemory, e.Resource, e.Value, e.Limit)
+}
+
+func (e *CPRPathAssistantLimitError) Unwrap() error { return ErrCPRPathAssistantMemory }
 
 // CPRPathAssistantSegmentError identifies the waypoint pair that could not be
 // connected. From and To are one-based so callers can present A/B/C-style
@@ -60,6 +80,13 @@ const (
 	defaultCPRAssistantOutputSpacingMM = 3.0
 	defaultCPRAssistantIntensityWeight = 64.0
 	defaultCPRAssistantMaxGridVoxels   = 1_000_000
+	defaultCPRAssistantMaxQueueEntries = 2_000_000
+	defaultCPRAssistantMaxOutputPoints = 250_000
+
+	MaxCPRAssistantGridVoxels    = 4_000_000
+	MaxCPRAssistantExpandedNodes = 4_000_000
+	MaxCPRAssistantQueueEntries  = 4_000_000
+	MaxCPRAssistantOutputPoints  = MaxCPRPathSamples
 )
 
 // FindCPRAssistedPath finds an image-derived patient-space centerline through
@@ -83,14 +110,22 @@ func FindCPRAssistedPath(ctx context.Context, volume *Volume, waypoints []Vec3, 
 		}
 	}
 
-	options = normalizedCPRPathAssistantOptions(options)
+	var err error
+	options, err = normalizedCPRPathAssistantOptions(options)
+	if err != nil {
+		return nil, err
+	}
 	centerline := make([]Vec3, 0, len(waypoints)*16)
 	for i := 1; i < len(waypoints); i++ {
 		segment, err := findCPRAssistedSegment(ctx, volume, waypoints[i-1], waypoints[i], options)
 		if err != nil {
 			return nil, &CPRPathAssistantSegmentError{From: i, To: i + 1, Err: err}
 		}
-		segment = resampleCPRAssistedSegment(segment, options.OutputSpacingMM)
+		remaining := options.MaxOutputPoints - len(centerline)
+		segment, err = resampleCPRAssistedSegment(ctx, segment, options.OutputSpacingMM, remaining)
+		if err != nil {
+			return nil, &CPRPathAssistantSegmentError{From: i, To: i + 1, Err: err}
+		}
 		if len(segment) < 2 {
 			return nil, &CPRPathAssistantSegmentError{From: i, To: i + 1, Err: ErrCPRPathAssistantNotFound}
 		}
@@ -102,23 +137,71 @@ func FindCPRAssistedPath(ctx context.Context, volume *Volume, waypoints []Vec3, 
 	return centerline, nil
 }
 
-func normalizedCPRPathAssistantOptions(options CPRPathAssistantOptions) CPRPathAssistantOptions {
-	if !positiveFinite(options.GridSpacingMM) {
+func normalizedCPRPathAssistantOptions(options CPRPathAssistantOptions) (CPRPathAssistantOptions, error) {
+	for _, field := range []struct {
+		name  string
+		value float64
+	}{
+		{"grid_spacing_mm", options.GridSpacingMM},
+		{"margin_mm", options.MarginMM},
+		{"output_spacing_mm", options.OutputSpacingMM},
+		{"intensity_weight", options.IntensityWeight},
+	} {
+		if field.value < 0 || math.IsNaN(field.value) || math.IsInf(field.value, 0) {
+			return CPRPathAssistantOptions{}, fmt.Errorf("%w: %s must be zero or positive and finite", ErrCPRPathAssistantInput, field.name)
+		}
+	}
+	if options.GridSpacingMM == 0 {
 		options.GridSpacingMM = defaultCPRAssistantGridSpacingMM
 	}
-	if !positiveFinite(options.MarginMM) {
+	if options.MarginMM == 0 {
 		options.MarginMM = defaultCPRAssistantMarginMM
 	}
-	if !positiveFinite(options.OutputSpacingMM) {
+	if options.OutputSpacingMM == 0 {
 		options.OutputSpacingMM = defaultCPRAssistantOutputSpacingMM
 	}
-	if !positiveFinite(options.IntensityWeight) {
+	if options.IntensityWeight == 0 {
 		options.IntensityWeight = defaultCPRAssistantIntensityWeight
 	}
-	if options.MaxGridVoxels <= 0 {
+	for _, field := range []struct {
+		name  string
+		value int
+	}{
+		{"max_grid_voxels", options.MaxGridVoxels},
+		{"max_expanded_nodes", options.MaxExpandedNodes},
+		{"max_queue_entries", options.MaxQueueEntries},
+		{"max_output_points", options.MaxOutputPoints},
+	} {
+		if field.value < 0 {
+			return CPRPathAssistantOptions{}, fmt.Errorf("%w: %s cannot be negative", ErrCPRPathAssistantInput, field.name)
+		}
+	}
+	if options.MaxGridVoxels == 0 {
 		options.MaxGridVoxels = defaultCPRAssistantMaxGridVoxels
 	}
-	return options
+	if options.MaxExpandedNodes == 0 {
+		options.MaxExpandedNodes = options.MaxGridVoxels
+	}
+	if options.MaxQueueEntries == 0 {
+		options.MaxQueueEntries = defaultCPRAssistantMaxQueueEntries
+	}
+	if options.MaxOutputPoints == 0 {
+		options.MaxOutputPoints = defaultCPRAssistantMaxOutputPoints
+	}
+	for _, field := range []struct {
+		name       string
+		value, max int
+	}{
+		{"grid_voxels", options.MaxGridVoxels, MaxCPRAssistantGridVoxels},
+		{"expanded_nodes", options.MaxExpandedNodes, MaxCPRAssistantExpandedNodes},
+		{"queue_entries", options.MaxQueueEntries, MaxCPRAssistantQueueEntries},
+		{"output_points", options.MaxOutputPoints, MaxCPRAssistantOutputPoints},
+	} {
+		if field.value > field.max {
+			return CPRPathAssistantOptions{}, &CPRPathAssistantLimitError{Resource: field.name, Value: field.value, Limit: field.max}
+		}
+	}
+	return options, nil
 }
 
 type cprAssistantGrid struct {
@@ -144,6 +227,9 @@ func newCPRAssistantGrid(ctx context.Context, volume *Volume, start, end Vec3, o
 
 	gridSpacing := options.GridSpacingMM
 	for attempt := 0; attempt < 8; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		margin := Vec3{X: options.MarginMM / spacing.X, Y: options.MarginMM / spacing.Y, Z: options.MarginMM / spacing.Z}
 		minVoxel := Vec3{
 			X: math.Max(0, math.Min(startVoxel.X, endVoxel.X)-margin.X),
@@ -163,8 +249,8 @@ func newCPRAssistantGrid(ctx context.Context, volume *Volume, start, end Vec3, o
 		nx := int(math.Ceil((maxVoxel.X-minVoxel.X)/step.X)) + 1
 		ny := int(math.Ceil((maxVoxel.Y-minVoxel.Y)/step.Y)) + 1
 		nz := int(math.Ceil((maxVoxel.Z-minVoxel.Z)/step.Z)) + 1
-		count64 := int64(nx) * int64(ny) * int64(nz)
-		if nx > 0 && ny > 0 && nz > 0 && count64 > 0 && count64 <= int64(options.MaxGridVoxels) {
+		count64, countOK := boundedCPRAssistantProduct(nx, ny, nz, options.MaxGridVoxels)
+		if countOK {
 			grid := &cprAssistantGrid{
 				volume: volume, min: minVoxel, step: step,
 				nx: nx, ny: ny, nz: nz,
@@ -176,16 +262,34 @@ func newCPRAssistantGrid(ctx context.Context, volume *Volume, start, end Vec3, o
 			}
 			return grid, nil
 		}
-		if count64 <= 0 {
+		if nx <= 0 || ny <= 0 || nz <= 0 {
 			break
 		}
-		ratio := math.Cbrt(float64(count64) / float64(options.MaxGridVoxels))
+		countEstimate := float64(nx) * float64(ny) * float64(nz)
+		if math.IsInf(countEstimate, 0) || math.IsNaN(countEstimate) {
+			return nil, &CPRPathAssistantLimitError{Resource: "grid_voxels", Value: options.MaxGridVoxels + 1, Limit: options.MaxGridVoxels}
+		}
+		ratio := math.Cbrt(countEstimate / float64(options.MaxGridVoxels))
 		if ratio < 1.15 {
 			ratio = 1.15
 		}
 		gridSpacing *= ratio * 1.02
 	}
-	return nil, ErrCPRPathAssistantMemory
+	return nil, &CPRPathAssistantLimitError{Resource: "grid_voxels", Value: options.MaxGridVoxels + 1, Limit: options.MaxGridVoxels}
+}
+
+func boundedCPRAssistantProduct(nx, ny, nz, limit int) (int64, bool) {
+	if nx <= 0 || ny <= 0 || nz <= 0 || limit <= 0 {
+		return 0, false
+	}
+	product := int64(1)
+	for _, value := range []int{nx, ny, nz} {
+		if int64(value) > int64(limit)/product {
+			return 0, false
+		}
+		product *= int64(value)
+	}
+	return product, product <= int64(limit)
 }
 
 func (g *cprAssistantGrid) sampleValues(ctx context.Context) error {
@@ -273,6 +377,8 @@ func findCPRAssistedSegment(ctx context.Context, volume *Volume, start, end Vec3
 	distances[startIndex] = 0
 	queue := cprAssistantPriorityQueue{{index: startIndex, cost: 0}}
 	heap.Init(&queue)
+	pushes := 1
+	expanded := 0
 
 	for pops := 0; queue.Len() > 0; pops++ {
 		if pops&1023 == 0 {
@@ -283,6 +389,10 @@ func findCPRAssistedSegment(ctx context.Context, volume *Volume, start, end Vec3
 		current := heap.Pop(&queue).(cprAssistantQueueItem)
 		if visited[current.index] || current.cost != distances[current.index] {
 			continue
+		}
+		expanded++
+		if expanded > options.MaxExpandedNodes {
+			return nil, &CPRPathAssistantLimitError{Resource: "expanded_nodes", Value: expanded, Limit: options.MaxExpandedNodes}
 		}
 		visited[current.index] = true
 		if current.index == endIndex {
@@ -310,6 +420,10 @@ func findCPRAssistedSegment(ctx context.Context, volume *Volume, start, end Vec3
 					if candidate < distances[nextIndex] {
 						distances[nextIndex] = candidate
 						previous[nextIndex] = int32(current.index)
+						pushes++
+						if pushes > options.MaxQueueEntries {
+							return nil, &CPRPathAssistantLimitError{Resource: "queue_entries", Value: pushes, Limit: options.MaxQueueEntries}
+						}
 						heap.Push(&queue, cprAssistantQueueItem{index: nextIndex, cost: candidate})
 					}
 				}
@@ -339,14 +453,26 @@ func findCPRAssistedSegment(ctx context.Context, volume *Volume, start, end Vec3
 	return path, nil
 }
 
-func resampleCPRAssistedSegment(points []Vec3, spacing float64) []Vec3 {
-	path := NewCPRPath(points)
-	if path == nil {
-		return nil
+func resampleCPRAssistedSegment(ctx context.Context, points []Vec3, spacing float64, limit int) ([]Vec3, error) {
+	path, err := NewCPRPathChecked(points)
+	if err != nil {
+		return nil, err
+	}
+	countFloat := math.Floor(path.Length()/spacing) + 2
+	if !positiveFinite(countFloat) {
+		return nil, fmt.Errorf("%w: output sample count is not finite", ErrCPRPathAssistantInput)
+	}
+	if limit < 2 || countFloat > float64(limit) {
+		return nil, &CPRPathAssistantLimitError{Resource: "output_points", Value: limit + 1, Limit: max(0, limit)}
 	}
 	count := int(math.Floor(path.Length() / spacing))
 	result := make([]Vec3, 0, count+2)
 	for i := 0; i <= count; i++ {
+		if i&1023 == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+		}
 		result = append(result, path.PointAt(float64(i)*spacing))
 	}
 	end := path.PointAt(path.Length())
@@ -355,7 +481,7 @@ func resampleCPRAssistedSegment(points []Vec3, spacing float64) []Vec3 {
 	} else {
 		result[len(result)-1] = end
 	}
-	return result
+	return result, nil
 }
 
 type cprAssistantQueueItem struct {

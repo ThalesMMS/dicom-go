@@ -1,6 +1,9 @@
 package render
 
-import "math"
+import (
+	"fmt"
+	"math"
+)
 
 // CPRPathSample is one arc-length sample along a CPR centerline together with a
 // stable local frame. The frame is rotation-minimizing (parallel transport),
@@ -23,25 +26,48 @@ type CPRPath struct {
 	length float64
 }
 
-// NewCPRPath builds a path from patient-space control points. Consecutive
-// duplicate points are collapsed; it returns nil when fewer than two distinct
-// points remain.
+// NewCPRPath builds a bounded path from patient-space control points. It is the
+// compatibility form of NewCPRPathChecked and returns nil for invalid or
+// excessive input.
 func NewCPRPath(controlPoints []Vec3) *CPRPath {
+	path, _ := NewCPRPathChecked(controlPoints)
+	return path
+}
+
+// NewCPRPathChecked validates coordinates, point count, degeneracy and total
+// length before allocating path-owned buffers.
+func NewCPRPathChecked(controlPoints []Vec3) (*CPRPath, error) {
+	if len(controlPoints) > MaxCPRControlPoints {
+		return nil, &CPRLimitError{Resource: "control_points", Value: uint64(len(controlPoints)), Limit: MaxCPRControlPoints}
+	}
 	pts := make([]Vec3, 0, len(controlPoints))
-	for _, p := range controlPoints {
-		if len(pts) > 0 && p.Sub(pts[len(pts)-1]).Length() == 0 {
+	for index, p := range controlPoints {
+		if !finiteVec3(p) {
+			return nil, &CPRInputError{Field: fmt.Sprintf("control_points[%d]", index), Reason: "coordinate is not finite"}
+		}
+		if len(pts) > 0 && p == pts[len(pts)-1] {
 			continue
 		}
 		pts = append(pts, p)
 	}
 	if len(pts) < 2 {
-		return nil
+		return nil, &CPRInputError{Field: "control_points", Reason: "at least two distinct points are required"}
 	}
 	cum := make([]float64, len(pts))
 	for i := 1; i < len(pts); i++ {
-		cum[i] = cum[i-1] + pts[i].Sub(pts[i-1]).Length()
+		segment := pts[i].Sub(pts[i-1]).Length()
+		if !positiveFinite(segment) {
+			return nil, &CPRInputError{Field: fmt.Sprintf("segment[%d]", i-1), Reason: "length is zero or not finite"}
+		}
+		cum[i] = cum[i-1] + segment
+		if !positiveFinite(cum[i]) {
+			return nil, &CPRInputError{Field: "path_length", Reason: "length is not finite"}
+		}
+		if cum[i] > MaxCPRPathLengthMM {
+			return nil, &CPRLimitError{Resource: "path_length_mm", Value: uint64(math.Ceil(cum[i])), Limit: MaxCPRPathLengthMM}
+		}
 	}
-	return &CPRPath{points: pts, cum: cum, length: cum[len(cum)-1]}
+	return &CPRPath{points: pts, cum: cum, length: cum[len(cum)-1]}, nil
 }
 
 // Length is the total arc length (mm) of the centerline.
@@ -106,21 +132,25 @@ func (p *CPRPath) locate(s float64) (int, float64) {
 // from the previous frame. It returns nil for a non-positive or non-finite
 // spacing.
 func (p *CPRPath) Resample(spacing float64) []CPRPathSample {
-	if p == nil || spacing <= 0 || math.IsNaN(spacing) || math.IsInf(spacing, 0) {
-		return nil
+	samples, _ := p.ResampleChecked(spacing)
+	return samples
+}
+
+// ResampleChecked is Resample with typed validation and sample-count errors.
+func (p *CPRPath) ResampleChecked(spacing float64) ([]CPRPathSample, error) {
+	sampleCount, err := p.SampleCountChecked(spacing)
+	if err != nil {
+		return nil, err
 	}
-	count := int(math.Floor(p.length/spacing)) + 1
+	regularCount := int(math.Floor(p.length/spacing)) + 1
 
 	t0 := p.TangentAt(0)
 	prevTangent := t0
 	prevNormal := initialNormal(t0)
 
-	samples := make([]CPRPathSample, 0, count+1)
-	for k := 0; k <= count; k++ {
+	samples := make([]CPRPathSample, 0, sampleCount)
+	for k := 0; k < regularCount; k++ {
 		s := float64(k) * spacing
-		if s > p.length {
-			break
-		}
 		tangent := p.TangentAt(s)
 		normal := parallelTransport(prevNormal, prevTangent, tangent)
 		// Re-orthonormalize against the tangent so the frame stays exactly
@@ -150,7 +180,34 @@ func (p *CPRPath) Resample(spacing float64) []CPRPathSample {
 			Binormal:  binormal,
 		})
 	}
-	return samples
+	return samples, nil
+}
+
+// SampleCountChecked returns the exact number of frames ResampleChecked will
+// produce, including a shorter endpoint interval, without allocating them.
+func (p *CPRPath) SampleCountChecked(spacing float64) (int, error) {
+	if p == nil {
+		return 0, &CPRInputError{Field: "path", Reason: "path is nil"}
+	}
+	if !positiveFinite(spacing) {
+		return 0, &CPRInputError{Field: "spacing", Reason: "spacing must be positive and finite"}
+	}
+	regularCount := math.Floor(p.length/spacing) + 1
+	if !positiveFinite(regularCount) {
+		return 0, &CPRInputError{Field: "sample_count", Reason: "sample count is not finite"}
+	}
+	count := regularCount
+	last := (regularCount - 1) * spacing
+	if p.length-last > 1e-9 {
+		count++
+	}
+	if count > MaxCPRPathSamples {
+		return 0, &CPRLimitError{Resource: "path_samples", Value: MaxCPRPathSamples + 1, Limit: MaxCPRPathSamples}
+	}
+	if count < 1 {
+		return 0, &CPRInputError{Field: "sample_count", Reason: "sample count is less than one"}
+	}
+	return int(count), nil
 }
 
 // FrameAt returns the rotation-minimizing frame at arc length s, transporting

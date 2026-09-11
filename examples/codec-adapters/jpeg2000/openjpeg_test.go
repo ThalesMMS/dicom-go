@@ -4,6 +4,7 @@ package jpeg2000
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"image"
 	"os"
@@ -19,6 +20,11 @@ import (
 )
 
 func TestValidateOpenJPEGVersionOutput(t *testing.T) {
+	for _, version := range []string{"2.5.40", "2.5.4.1"} {
+		if err := validateOpenJPEGVersionOutput("compiled against openjp2 library v" + version + "."); !errors.Is(err, ErrOpenJPEGUnavailable) {
+			t.Errorf("unqualified version prefix %s accepted", version)
+		}
+	}
 	if err := validateOpenJPEGVersionOutput("compiled against openjp2 library v2.5.4."); err != nil {
 		t.Fatal(err)
 	}
@@ -112,8 +118,14 @@ func TestOpenJPEGDecoderTimesOutExternalProcess(t *testing.T) {
 	obj, pixel := jpeg2000Object(t, jpeg2000MetadataOptions{}, []byte{0xff, 0x4f})
 
 	_, err := NewOpenJPEGCodec(OpenJPEGExecutable(path), OpenJPEGTimeout(50*time.Millisecond)).Decode(pixel, obj)
-	if !errors.Is(err, ErrMalformedCodestream) {
-		t.Fatalf("Decode() error = %v, want ErrMalformedCodestream timeout", err)
+	if errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("codec timeout wrapped context.DeadlineExceeded: %v", err)
+	}
+	if !errors.Is(err, ErrDecoderTimeout) {
+		t.Fatalf("Decode() error = %v, want ErrDecoderTimeout", err)
+	}
+	if errors.Is(err, ErrMalformedCodestream) {
+		t.Fatalf("timeout presented as malformed codestream: %v", err)
 	}
 	if !strings.Contains(err.Error(), "timed out") {
 		t.Fatalf("Decode() error = %q, want timeout detail", err)

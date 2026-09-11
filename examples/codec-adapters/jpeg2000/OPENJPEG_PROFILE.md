@@ -116,7 +116,7 @@ OpenJPEG binaries or their transitive runtime libraries.
 
 ## Verification
 
-From the `dicom-go-dev` root:
+From the `dicom-go` root:
 
 ```sh
 make codec-jpeg2000-openjpeg-check

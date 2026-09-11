@@ -24,6 +24,16 @@ const (
 )
 
 func (decoder openJPHDecoder) DecodeFrame(payload []byte, metadata pixeldata.Metadata) ([]byte, error) {
+	return decoder.DecodeFrameContext(context.Background(), payload, metadata)
+}
+
+func (decoder openJPHDecoder) DecodeFrameContext(ctx context.Context, payload []byte, metadata pixeldata.Metadata) ([]byte, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if metadata.PixelRepresentation != 0 {
 		return nil, fmt.Errorf(
 			"%w: signed HTJ2K output is not qualified for the OpenJPH PNM backend",
@@ -41,31 +51,40 @@ func (decoder openJPHDecoder) DecodeFrame(payload []byte, metadata pixeldata.Met
 	if err != nil {
 		return nil, err
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	dir, err := os.MkdirTemp("", "dicom-go-openjph-*")
 	if err != nil {
 		return nil, fmt.Errorf("%w: create temp directory: %w", ErrOpenJPHUnavailable, err)
 	}
 	defer os.RemoveAll(dir)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	input := filepath.Join(dir, "frame.j2c")
 	output := filepath.Join(dir, "frame"+openJPHOutputExtension(metadata))
 	if err := os.WriteFile(input, payload, 0o600); err != nil {
 		return nil, fmt.Errorf("%w: write input codestream: %w", ErrOpenJPHUnavailable, err)
 	}
-
-	ctx := context.Background()
-	var cancel context.CancelFunc
-	if decoder.timeout > 0 {
-		ctx, cancel = context.WithTimeout(ctx, decoder.timeout)
-		defer cancel()
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
-	command := exec.CommandContext(ctx, executable, "-i", input, "-o", output)
+
+	runCtx, cancel := boundDecoderContext(ctx, decoder.timeout)
+	defer cancel()
+	command := exec.CommandContext(runCtx, executable, "-i", input, "-o", output)
+	configureExternalDecoderCommand(command)
 	var processOutput openJPHLimitedOutput
 	command.Stdout = &processOutput
 	command.Stderr = &processOutput
 	if err := command.Run(); err != nil {
-		if ctx.Err() == context.DeadlineExceeded {
-			return nil, fmt.Errorf("%w: ojph_expand timed out after %s", ErrMalformedCodestream, decoder.timeout)
+		if mapped := mapBoundDecoderError(ctx, runCtx); mapped != nil {
+			if errors.Is(mapped, ErrDecoderTimeout) {
+				return nil, fmt.Errorf("%w: ojph_expand timed out after %s", ErrDecoderTimeout, decoder.timeout)
+			}
+			return nil, mapped
 		}
 		detail := processOutput.String()
 		if detail == "" {
@@ -77,6 +96,9 @@ func (decoder openJPHDecoder) DecodeFrame(payload []byte, metadata pixeldata.Met
 			return nil, fmt.Errorf("%w: ojph_expand: %s", ErrOpenJPHUnavailable, detail)
 		}
 		return nil, fmt.Errorf("%w: ojph_expand: %s", ErrMalformedCodestream, detail)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 
 	info, err := os.Stat(output)
@@ -90,6 +112,9 @@ func (decoder openJPHDecoder) DecodeFrame(payload []byte, metadata pixeldata.Met
 	data, err := os.ReadFile(output)
 	if err != nil {
 		return nil, fmt.Errorf("%w: read ojph_expand output: %w", ErrMalformedCodestream, err)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	return openJPHPNMToFrame(data, metadata)
 }

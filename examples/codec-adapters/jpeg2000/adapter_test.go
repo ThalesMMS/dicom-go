@@ -59,6 +59,24 @@ func TestDecodeRejectsUninitializedDecoder(t *testing.T) {
 	}
 }
 
+func TestDecodeBorrowsOneFragmentPerFrameWithoutRetainingInput(t *testing.T) {
+	obj, pixel := jpeg2000Object(t, jpeg2000MetadataOptions{numberOfFrames: 2}, []byte("frame-1"), []byte("frame-2"))
+	decoder := &borrowedPayloadDecoder{source: pixel.Sequence.Fragments, allViews: true}
+
+	frames, err := NewWithDecoder(decoder).Decode(pixel, obj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !decoder.allViews || len(frames.Data) != 2 {
+		t.Fatalf("Decode() allViews=%v frames=%d, want borrowed inputs and two owned outputs", decoder.allViews, len(frames.Data))
+	}
+	before := append([]byte(nil), pixel.Sequence.Fragments[0]...)
+	frames.Data[0][0] ^= 0xff
+	if !bytes.Equal(pixel.Sequence.Fragments[0], before) {
+		t.Fatal("decoded JPEG 2000 output retained the borrowed compressed payload")
+	}
+}
+
 func TestOpenJPEGDecoderReportsDependencyUnavailable(t *testing.T) {
 	encoded := encodeGrayJ2K(t, false, []byte{0, 255})
 	obj, pixel := jpeg2000Object(t, jpeg2000MetadataOptions{}, encoded)
@@ -669,6 +687,20 @@ type jpeg2000MetadataOptions struct {
 	photometric         string
 	numberOfFrames      int
 	planarConfiguration *uint16
+}
+
+type borrowedPayloadDecoder struct {
+	source   [][]byte
+	next     int
+	allViews bool
+}
+
+func (d *borrowedPayloadDecoder) DecodeFrame(payload []byte, metadata pixeldata.Metadata) ([]byte, error) {
+	if d.next >= len(d.source) || len(payload) == 0 || len(d.source[d.next]) == 0 || &payload[0] != &d.source[d.next][0] {
+		d.allViews = false
+	}
+	d.next++
+	return make([]byte, metadata.FrameSize()), nil
 }
 
 func jpeg2000Object(t testing.TB, opts jpeg2000MetadataOptions, fragments ...[]byte) (*object.Object, pixeldata.PixelData) {

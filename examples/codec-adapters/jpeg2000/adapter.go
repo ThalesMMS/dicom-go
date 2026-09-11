@@ -8,6 +8,7 @@ package jpeg2000
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -28,12 +29,22 @@ var (
 	ErrImageSizeMismatch         = errors.New("jpeg2000adapter: decoded image size does not match metadata")
 	ErrMalformedCodestream       = errors.New("jpeg2000adapter: malformed JPEG 2000 / HTJ2K codestream")
 	ErrDecoderUnavailable        = errors.New("jpeg2000adapter: decoder unavailable")
+	ErrDecoderTimeout            = errors.New("jpeg2000adapter: decoder timed out")
 )
 
 // Decoder decodes one JPEG 2000 / HTJ2K codestream payload into native frame
 // bytes matching the supplied DICOM pixel metadata.
 type Decoder interface {
+	// DecodeFrame receives a borrowed, read-only compressed payload. It must not
+	// retain or mutate payload after returning, and its result must own its
+	// storage rather than alias payload.
 	DecodeFrame(payload []byte, metadata pixeldata.Metadata) ([]byte, error)
+}
+
+// ContextDecoder is an optional Decoder extension that honors caller
+// cancellation while decoding one frame.
+type ContextDecoder interface {
+	DecodeFrameContext(ctx context.Context, payload []byte, metadata pixeldata.Metadata) ([]byte, error)
 }
 
 // Codec decodes JPEG 2000 / HTJ2K encapsulated still-image pixel data.
@@ -81,6 +92,20 @@ func RegisterDefault() error {
 
 // Decode decodes supported JPEG 2000 / HTJ2K encapsulated still-image frames.
 func (c *Codec) Decode(pixel pixeldata.PixelData, obj *object.Object) (pixeldata.Frames, error) {
+	return c.DecodeContext(context.Background(), pixel, obj)
+}
+
+// DecodeContext decodes JPEG 2000 / HTJ2K frames while honoring ctx. Cancelation
+// or a deadline is returned as the context error and is not classified as a
+// malformed codestream. Frames are published only after the full decode
+// completes with a still-active context.
+func (c *Codec) DecodeContext(ctx context.Context, pixel pixeldata.PixelData, obj *object.Object) (pixeldata.Frames, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return pixeldata.Frames{}, err
+	}
 	if c == nil || c.decoder == nil {
 		return pixeldata.Frames{}, ErrDecoderUnavailable
 	}
@@ -103,18 +128,57 @@ func (c *Codec) Decode(pixel pixeldata.PixelData, obj *object.Object) (pixeldata
 
 	frames := make([][]byte, len(payloads))
 	for i, payload := range payloads {
-		frame, err := c.decoder.DecodeFrame(payload, metadata)
+		if err := ctx.Err(); err != nil {
+			return pixeldata.Frames{}, err
+		}
+		frame, err := c.decodeFrame(ctx, payload, metadata)
 		if err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return pixeldata.Frames{}, err
+			}
 			return pixeldata.Frames{}, fmt.Errorf("decode JPEG 2000 frame %d: %w", i, err)
 		}
-		frames[i] = frame
+		if err := ctx.Err(); err != nil {
+			return pixeldata.Frames{}, err
+		}
+		frames[i] = append([]byte(nil), frame...)
 	}
 
+	if err := ctx.Err(); err != nil {
+		return pixeldata.Frames{}, err
+	}
 	return pixeldata.Frames{
 		Rows:    int(metadata.Rows),
 		Columns: int(metadata.Columns),
 		Data:    frames,
 	}, nil
+}
+
+func (c *Codec) decodeFrame(ctx context.Context, payload []byte, metadata pixeldata.Metadata) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if ctxDec, ok := c.decoder.(ContextDecoder); ok {
+		return ctxDec.DecodeFrameContext(ctx, payload, metadata)
+	}
+	return c.decoder.DecodeFrame(payload, metadata)
+}
+
+func (d pureGoDecoder) DecodeFrameContext(ctx context.Context, payload []byte, metadata pixeldata.Metadata) ([]byte, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	frame, err := d.DecodeFrame(payload, metadata)
+	if err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return frame, nil
 }
 
 func (pureGoDecoder) DecodeFrame(payload []byte, metadata pixeldata.Metadata) ([]byte, error) {
@@ -272,11 +336,7 @@ func framePayloads(pixel pixeldata.PixelData, numberOfFrames int) ([][]byte, err
 		return nil, fmt.Errorf("%w: no JPEG 2000 frame fragments", ErrUnsupportedFragmentLayout)
 	}
 	if len(fragments) == numberOfFrames {
-		payloads := make([][]byte, len(fragments))
-		for i := range fragments {
-			payloads[i] = append([]byte(nil), fragments[i]...)
-		}
-		return payloads, nil
+		return fragments, nil
 	}
 	if numberOfFrames == 1 {
 		return [][]byte{bytes.Join(fragments, nil)}, nil

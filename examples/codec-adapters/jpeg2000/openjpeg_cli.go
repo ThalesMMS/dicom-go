@@ -32,8 +32,22 @@ type pnmImage struct {
 }
 
 func (decoder openJPEGDecoder) DecodeFrame(payload []byte, metadata pixeldata.Metadata) ([]byte, error) {
+	return decoder.DecodeFrameContext(context.Background(), payload, metadata)
+}
+
+func (decoder openJPEGDecoder) DecodeFrameContext(ctx context.Context, payload []byte, metadata pixeldata.Metadata) ([]byte, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	executable, err := decoder.resolveExecutable()
 	if err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 
@@ -42,27 +56,33 @@ func (decoder openJPEGDecoder) DecodeFrame(payload []byte, metadata pixeldata.Me
 		return nil, fmt.Errorf("%w: create temp directory: %w", ErrOpenJPEGUnavailable, err)
 	}
 	defer os.RemoveAll(dir)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	inputPath := filepath.Join(dir, "frame.j2k")
 	outputPath := filepath.Join(dir, "frame"+openJPEGOutputExtension(metadata))
 	if err := os.WriteFile(inputPath, payload, 0o600); err != nil {
 		return nil, fmt.Errorf("%w: write input codestream: %w", ErrOpenJPEGUnavailable, err)
 	}
-
-	ctx := context.Background()
-	var cancel context.CancelFunc
-	if decoder.timeout > 0 {
-		ctx, cancel = context.WithTimeout(ctx, decoder.timeout)
-		defer cancel()
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
-	cmd := exec.CommandContext(ctx, executable, "-quiet", "-i", inputPath, "-o", outputPath)
+
+	runCtx, cancel := boundDecoderContext(ctx, decoder.timeout)
+	defer cancel()
+	cmd := exec.CommandContext(runCtx, executable, "-quiet", "-i", inputPath, "-o", outputPath)
+	configureExternalDecoderCommand(cmd)
 	var processOutput limitedProcessOutput
 	cmd.Stdout = &processOutput
 	cmd.Stderr = &processOutput
 	err = cmd.Run()
 	if err != nil {
-		if ctx.Err() == context.DeadlineExceeded {
-			return nil, fmt.Errorf("%w: opj_decompress timed out after %s", ErrMalformedCodestream, decoder.timeout)
+		if mapped := mapBoundDecoderError(ctx, runCtx); mapped != nil {
+			if errors.Is(mapped, ErrDecoderTimeout) {
+				return nil, fmt.Errorf("%w: opj_decompress timed out after %s", ErrDecoderTimeout, decoder.timeout)
+			}
+			return nil, mapped
 		}
 		detail := processOutput.String()
 		if detail == "" {
@@ -72,6 +92,9 @@ func (decoder openJPEGDecoder) DecodeFrame(payload []byte, metadata pixeldata.Me
 			return nil, fmt.Errorf("%w: opj_decompress: %s", ErrOpenJPEGUnavailable, detail)
 		}
 		return nil, fmt.Errorf("%w: opj_decompress: %s", ErrMalformedCodestream, detail)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 
 	sizeLimit, err := openJPEGOutputSizeLimit(metadata)
@@ -90,10 +113,16 @@ func (decoder openJPEGDecoder) DecodeFrame(payload []byte, metadata pixeldata.Me
 			sizeLimit,
 		)
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	pnmBytes, err := os.ReadFile(outputPath)
 	if err != nil {
 		return nil, fmt.Errorf("%w: read OpenJPEG output: %w", ErrMalformedCodestream, err)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	return pnmToFrameBytes(pnmBytes, metadata)
 }
@@ -129,8 +158,15 @@ func ValidateOpenJPEGRuntime() error {
 }
 
 func validateOpenJPEGVersionOutput(output string) error {
-	expected := "openjp2 library v" + QualifiedOpenJPEGVersion
-	if !strings.Contains(output, expected) {
+	qualified := false
+	fields := strings.Fields(output)
+	for i := 0; i+2 < len(fields); i++ {
+		if fields[i] == "openjp2" && fields[i+1] == "library" && strings.TrimSuffix(fields[i+2], ".") == "v"+QualifiedOpenJPEGVersion {
+			qualified = true
+			break
+		}
+	}
+	if !qualified {
 		return fmt.Errorf(
 			"%w: version probe did not report qualified OpenJPEG %s",
 			ErrOpenJPEGUnavailable,

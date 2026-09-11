@@ -108,7 +108,7 @@ go test ./...
 go test -bench BenchmarkDecodeJPEG2000Profile -benchmem ./...
 ```
 
-From the `dicom-go-dev` root:
+From the `dicom-go` root:
 
 ```sh
 make codec-jpeg2000-profile-check

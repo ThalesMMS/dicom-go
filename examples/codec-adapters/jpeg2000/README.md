@@ -9,7 +9,11 @@ CGO, native library, or adapter-specific build tag is required by this module.
 Applications may still place registration behind their own build tag when they
 want default builds to avoid the optional dependency path.
 
-Supported boundaries:
+The explicit OpenJPEG `.90` encoder and its independent qualification are
+documented in [ENCODER_PROFILE.md](ENCODER_PROFILE.md). Decoder registration
+does not register an encoder or require `opj_compress`.
+
+Supported decoder boundaries:
 
 - registers JPEG 2000, JPEG 2000 Part 2, and HTJ2K still-image transfer syntax
   UIDs explicitly;
@@ -20,7 +24,14 @@ Supported boundaries:
 - returns interleaved native frame bytes for supported 8-bit and 16-bit unsigned
   monochrome/RGB data;
 - returns typed errors for unsupported metadata, unsupported fragment layouts,
-  size mismatches, and malformed codestreams.
+  size mismatches, and malformed codestreams;
+- implements `pixeldata.ContextCodec`. Cancelation and deadlines are returned
+  as `context.Canceled` / `context.DeadlineExceeded` rather than image
+  corruption. External `opj_decompress` and `ojph_expand` processes honor the
+  tighter of the caller deadline and the codec timeout, kill their process group
+  on Unix, wait for collection, and delete temporary files. The pure-Go
+  `j2k.Decode` backend checks the context before and after decode; an in-flight
+  native frame is not guaranteed to abort mid-codestream.
 
 The profile decision and current benchmark evidence are documented in
 [PRODUCTION_PROFILE.md](./PRODUCTION_PROFILE.md). In short, this module is the

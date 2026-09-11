@@ -1,4 +1,6 @@
-github.com/mrjoshuak/go-jpeg2000 v1.2.1 h1:6k+J+YkJx676Pofom8rCx35J69Hc3PvzUZ3cytkIfzo=
-github.com/mrjoshuak/go-jpeg2000 v1.2.1/go.mod h1:Zvb2bdmP52/rpmJOuzMo1HQR75zex//CvqEvopdTweo=
+github.com/mrjoshuak/go-jpeg2000 v1.3.0 h1:4W2kaC+hHsKF07CrENMA0Db1thKq9eNmkGnRLVp+e+w=
+github.com/mrjoshuak/go-jpeg2000 v1.3.0/go.mod h1:Zvb2bdmP52/rpmJOuzMo1HQR75zex//CvqEvopdTweo=
+golang.org/x/sys v0.30.0 h1:QjkSwP/36a20jFYWkSue1YwXzLmsV5Gfq7Eiy72C1uc=
+golang.org/x/sys v0.30.0/go.mod h1:/VUhepiaJMQUp4+oa/7Zr1D23ma6VTLIYjOOTFZPUcA=
 golang.org/x/text v0.3.8 h1:nAL+RVCQ9uMn3vJZbV+MRnydTJFPf8qqY42YiA6MrqY=
 golang.org/x/text v0.3.8/go.mod h1:E6s5w1FMmriuDzIBO73fBruAKo1PCIq6d2Q6DHfQ8WQ=

@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"errors"
 	"image"
+	"math"
+	"strings"
 	"testing"
 
 	"github.com/ThalesMMS/dicom-go/core"
@@ -89,6 +91,24 @@ func Test_FromVectorROIs_rejects_missing_geometry(t *testing.T) {
 	}
 }
 
+func Test_FromVectorROIs_rejects_collinear_and_out_of_grid_contours(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		points []image.Point
+	}{
+		{"collinear", []image.Point{{X: 0, Y: 0}, {X: 1, Y: 1}, {X: 2, Y: 2}}},
+		{"out of grid", []image.Point{{X: 0, Y: 0}, {X: 5, Y: 0}, {X: 0, Y: 2}}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			opts := testVectorOptions()
+			opts.ROIs[0].Contours[0].ROI = dicomroi.VectorROI{Shape: dicomroi.ROIPolygon, Points: test.points}
+			if _, err := FromVectorROIs(opts); !errors.Is(err, ErrGeometryMismatch) {
+				t.Fatalf("FromVectorROIs error = %v", err)
+			}
+		})
+	}
+}
+
 func Test_FromVectorROIs_output_is_deterministic(t *testing.T) {
 	first := writeVectorOptions(t, testVectorOptions())
 	second := writeVectorOptions(t, testVectorOptions())
@@ -103,6 +123,70 @@ func Test_FromVectorROIs_rejects_duplicate_roi_numbers(t *testing.T) {
 	_, err := FromVectorROIs(opts)
 	if !errors.Is(err, ErrInvalidObject) {
 		t.Fatalf("FromVectorROIs duplicate ROI error = %v, want ErrInvalidObject", err)
+	}
+}
+
+func Test_FromVectorROIs_validates_names_labels_and_coordinates_before_write(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*FromVectorROIsOptions)
+		want   error
+	}{
+		{"empty ROI name", func(opts *FromVectorROIsOptions) { opts.ROIs[0].Name = "  " }, ErrInvalidObject},
+		{"long ROI name", func(opts *FromVectorROIsOptions) { opts.ROIs[0].Name = strings.Repeat("x", 65) }, ErrInvalidObject},
+		{"multi-value ROI name", func(opts *FromVectorROIsOptions) { opts.ROIs[0].Name = `one\two` }, ErrInvalidObject},
+		{"long label", func(opts *FromVectorROIsOptions) { opts.Label = strings.Repeat("x", 17) }, ErrInvalidObject},
+		{"non-finite coordinate", func(opts *FromVectorROIsOptions) { opts.ROIs[0].Contours[0].Geometry.Origin.X = math.NaN() }, ErrGeometryMismatch},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			opts := testVectorOptions()
+			test.mutate(&opts)
+			_, err := FromVectorROIs(opts)
+			if !errors.Is(err, test.want) {
+				t.Fatalf("FromVectorROIs error = %v, want %v", err, test.want)
+			}
+		})
+	}
+}
+
+func Test_Write_declares_utf8_and_round_trips_unicode_roi_name(t *testing.T) {
+	opts := testVectorOptions()
+	opts.ROIs[0].Name = "Coração"
+	set, err := FromVectorROIs(opts)
+	if err != nil {
+		t.Fatalf("FromVectorROIs: %v", err)
+	}
+	file, err := Write(set)
+	if err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	charset, ok := file.Dataset.GetString(tagSpecificCharacterSet)
+	if !ok || charset != "ISO_IR 192" {
+		t.Fatalf("SpecificCharacterSet = %q, %v; want ISO_IR 192", charset, ok)
+	}
+	roundTrip, err := Read(file.Dataset)
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if roundTrip.ROIs[1].Name != "Coração" {
+		t.Fatalf("round-trip ROI name = %q", roundTrip.ROIs[1].Name)
+	}
+}
+
+func Test_Write_rejects_zero_area_and_non_coplanar_closed_contours(t *testing.T) {
+	for _, points := range [][]Point3D{
+		{{X: 0}, {X: 1}, {X: 2}},
+		{{X: 0, Y: 0, Z: 0}, {X: 2, Y: 0, Z: 0}, {X: 2, Y: 2, Z: 0}, {X: 0, Y: 2, Z: 1}},
+	} {
+		set, err := FromVectorROIs(testVectorOptions())
+		if err != nil {
+			t.Fatal(err)
+		}
+		set.ROIs[0].Contours[0].Points = points
+		if _, err := Write(set); !errors.Is(err, ErrGeometryMismatch) {
+			t.Fatalf("Write error = %v, want ErrGeometryMismatch", err)
+		}
 	}
 }
 

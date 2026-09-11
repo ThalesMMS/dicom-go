@@ -6,6 +6,9 @@ import (
 	"image"
 	"math"
 	"sort"
+	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/ThalesMMS/dicom-go/core"
 	"github.com/ThalesMMS/dicom-go/internal/derivedio"
@@ -35,6 +38,7 @@ var (
 
 var (
 	tagStructureSetLabel             = core.NewTag(0x3006, 0x0002)
+	tagSpecificCharacterSet          = core.NewTag(0x0008, 0x0005)
 	tagReferencedFrameOfReferenceSeq = core.NewTag(0x3006, 0x0010)
 	tagRTReferencedStudySequence     = core.NewTag(0x3006, 0x0012)
 	tagRTReferencedSeriesSequence    = core.NewTag(0x3006, 0x0014)
@@ -142,6 +146,7 @@ func Write(set *StructureSet) (*object.File, error) {
 		label = "TWIN_RTSTRUCT"
 	}
 	dataset := derivedio.Object(
+		derivedio.CS(tagSpecificCharacterSet, "ISO_IR 192"),
 		derivedio.UI(derivedio.TagSOPClassUID, sopClassUID),
 		derivedio.UI(derivedio.TagSOPInstanceUID, set.SOPInstanceUID),
 		derivedio.CS(derivedio.TagModality, "RTSTRUCT"),
@@ -213,11 +218,14 @@ func FromVectorROIs(opts FromVectorROIsOptions) (*StructureSet, error) {
 			ColorRGB: item.ColorRGB,
 		}
 		for _, contour := range item.Contours {
+			if err := validateSliceGeometry(contour.Geometry); err != nil {
+				return nil, err
+			}
 			points, err := vectorContourPoints(contour.ROI)
 			if err != nil {
 				return nil, err
 			}
-			if err := validateSliceGeometry(contour.Geometry); err != nil {
+			if err := validateImagePointBounds(points, contour.Geometry); err != nil {
 				return nil, err
 			}
 			if err := validateReferencedImages(contour.ReferencedImages, true); err != nil {
@@ -301,6 +309,9 @@ func vectorContourPoints(item dicomroi.VectorROI) ([]image.Point, error) {
 		if len(item.Points) < 3 {
 			return nil, fmt.Errorf("%w: polygon contour needs at least 3 points", ErrGeometryMismatch)
 		}
+		if !nonZeroImagePolygonArea(item.Points) {
+			return nil, fmt.Errorf("%w: polygon contour has zero area", ErrGeometryMismatch)
+		}
 		return append([]image.Point(nil), item.Points...), nil
 	default:
 		return rectangleContourPoints(item.Points)
@@ -364,10 +375,29 @@ func imagePointsToPatient(points []image.Point, geometry render.SliceGeometry) [
 
 func validateSliceGeometry(geometry render.SliceGeometry) error {
 	if !finitePositive(geometry.RowSpacing) || !finitePositive(geometry.ColSpacing) ||
-		!finiteVector(geometry.RowDir) || !finiteVector(geometry.ColDir) || !finiteVector(geometry.Normal) {
+		!finiteVecComponents(geometry.Origin) || !finiteVector(geometry.RowDir) || !finiteVector(geometry.ColDir) || !finiteVector(geometry.Normal) ||
+		geometry.Rows <= 0 || geometry.Columns <= 0 {
 		return fmt.Errorf("%w: missing slice geometry", ErrGeometryMismatch)
 	}
 	return nil
+}
+
+func validateImagePointBounds(points []image.Point, geometry render.SliceGeometry) error {
+	for _, point := range points {
+		if point.X < 0 || point.Y < 0 || point.X >= geometry.Columns || point.Y >= geometry.Rows {
+			return fmt.Errorf("%w: contour point lies outside the source image", ErrGeometryMismatch)
+		}
+	}
+	return nil
+}
+
+func nonZeroImagePolygonArea(points []image.Point) bool {
+	var twiceArea float64
+	for i := range points {
+		next := points[(i+1)%len(points)]
+		twiceArea += float64(points[i].X)*float64(next.Y) - float64(next.X)*float64(points[i].Y)
+	}
+	return twiceArea != 0
 }
 
 func finitePositive(value float64) bool {
@@ -376,10 +406,14 @@ func finitePositive(value float64) bool {
 
 func finiteVector(value render.Vec3) bool {
 	length := value.Length()
+	return finiteVecComponents(value) &&
+		!math.IsNaN(length) && !math.IsInf(length, 0) && length > 0
+}
+
+func finiteVecComponents(value render.Vec3) bool {
 	return !math.IsNaN(value.X) && !math.IsInf(value.X, 0) &&
 		!math.IsNaN(value.Y) && !math.IsInf(value.Y, 0) &&
-		!math.IsNaN(value.Z) && !math.IsInf(value.Z, 0) &&
-		!math.IsNaN(length) && !math.IsInf(length, 0) && length > 0
+		!math.IsNaN(value.Z) && !math.IsInf(value.Z, 0)
 }
 
 func validateReferencedImages(refs []ReferencedImage, requireHierarchy bool) error {
@@ -408,6 +442,9 @@ func validateStructureSet(set *StructureSet) error {
 	if len(set.ROIs) > 0 && set.FrameOfReferenceUID == "" {
 		return fmt.Errorf("%w: missing frame of reference UID", ErrMissingReference)
 	}
+	if err := validateDICOMText("structure set label", set.Label, 16, false); err != nil {
+		return err
+	}
 	seen := map[int]bool{}
 	for _, roiItem := range set.ROIs {
 		if roiItem.Number == 0 {
@@ -421,6 +458,14 @@ func validateStructureSet(set *StructureSet) error {
 			if err := validateContourPointCount(contour); err != nil {
 				return err
 			}
+			for _, point := range contour.Points {
+				if !finiteCoordinate(point.X) || !finiteCoordinate(point.Y) || !finiteCoordinate(point.Z) {
+					return fmt.Errorf("%w: contour contains a non-finite coordinate", ErrGeometryMismatch)
+				}
+			}
+			if err := validateClosedPlanarGeometry(contour); err != nil {
+				return err
+			}
 			if len(contour.ReferencedImages) > 0 {
 				for _, ref := range contour.ReferencedImages {
 					if ref.SOPClassUID == "" || ref.SOPInstanceUID == "" {
@@ -429,8 +474,79 @@ func validateStructureSet(set *StructureSet) error {
 				}
 			}
 		}
+		if err := validateDICOMText("ROI name", roiItem.Name, 64, true); err != nil {
+			return err
+		}
 	}
 	return nil
+}
+
+func validateClosedPlanarGeometry(contour Contour) error {
+	if contour.GeometricType != "" && contour.GeometricType != ContourClosedPlanar && contour.GeometricType != ContourClosedPlanarXOR {
+		return nil
+	}
+	if len(contour.Points) < 3 {
+		return nil
+	}
+	base := contour.Points[0]
+	var normal Point3D
+	foundPlane := false
+	for i := 1; i < len(contour.Points)-1 && !foundPlane; i++ {
+		for j := i + 1; j < len(contour.Points); j++ {
+			a := subtractPoint(contour.Points[i], base)
+			b := subtractPoint(contour.Points[j], base)
+			normal = crossPoint(a, b)
+			if pointLength(normal) > 1e-12 {
+				foundPlane = true
+				break
+			}
+		}
+	}
+	if !foundPlane {
+		return fmt.Errorf("%w: closed planar contour has zero area", ErrGeometryMismatch)
+	}
+	length := pointLength(normal)
+	if !finitePositive(length) {
+		return fmt.Errorf("%w: closed planar contour area overflow", ErrGeometryMismatch)
+	}
+	const planeToleranceMM = 1e-4
+	for _, point := range contour.Points {
+		distance := math.Abs(dotPoint(subtractPoint(point, base), normal)) / length
+		if math.IsNaN(distance) || math.IsInf(distance, 0) || distance > planeToleranceMM {
+			return fmt.Errorf("%w: closed planar contour points are not coplanar", ErrGeometryMismatch)
+		}
+	}
+	return nil
+}
+
+func subtractPoint(a, b Point3D) Point3D { return Point3D{X: a.X - b.X, Y: a.Y - b.Y, Z: a.Z - b.Z} }
+func crossPoint(a, b Point3D) Point3D {
+	return Point3D{X: a.Y*b.Z - a.Z*b.Y, Y: a.Z*b.X - a.X*b.Z, Z: a.X*b.Y - a.Y*b.X}
+}
+func dotPoint(a, b Point3D) float64     { return a.X*b.X + a.Y*b.Y + a.Z*b.Z }
+func pointLength(point Point3D) float64 { return math.Sqrt(dotPoint(point, point)) }
+
+func validateDICOMText(field, value string, maxBytes int, required bool) error {
+	trimmed := strings.TrimSpace(value)
+	if required && trimmed == "" {
+		return fmt.Errorf("%w: %s is required", ErrInvalidObject, field)
+	}
+	if len(value) > maxBytes {
+		return fmt.Errorf("%w: %s exceeds %d bytes", ErrInvalidObject, field, maxBytes)
+	}
+	if !utf8.ValidString(value) || strings.ContainsRune(value, '\\') {
+		return fmt.Errorf("%w: %s contains an invalid DICOM text value", ErrInvalidObject, field)
+	}
+	for _, r := range value {
+		if unicode.IsControl(r) {
+			return fmt.Errorf("%w: %s contains a control character", ErrInvalidObject, field)
+		}
+	}
+	return nil
+}
+
+func finiteCoordinate(value float64) bool {
+	return !math.IsNaN(value) && !math.IsInf(value, 0)
 }
 
 func validateContourPointCount(contour Contour) error {

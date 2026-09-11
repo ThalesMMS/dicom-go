@@ -120,7 +120,7 @@ func TestBinarySegmentationRoundTripsRoiMasks(t *testing.T) {
 
 func TestPerFrameSequenceOmitsEmptyReferencedSOPInstanceUID(t *testing.T) {
 	doc := &Document{Frames: []Frame{{SegmentNumber: 1}}}
-	obj := object.FromElements([]core.Element{perFrameSequence(doc)}, nil)
+	obj := object.FromElements([]core.Element{perFrameSequence(doc, make([]ReferencedImage, len(doc.Frames)))}, nil)
 	items, ok := obj.GetSequence(tagPerFrameFunctionalGroups)
 	if !ok || len(items) != 1 {
 		t.Fatalf("PerFrameFunctionalGroupsSequence = len %d, ok %v; want one item", len(items), ok)
@@ -833,6 +833,12 @@ func TestLabelMapSegmentationPreservesPerFrameMetadata(t *testing.T) {
 		Rows:                2,
 		Columns:             2,
 		Segments:            []Segment{{Number: 7, Label: "Target", AlgorithmType: AlgorithmManual}},
+		ReferencedImages: []ReferencedImage{{
+			SeriesInstanceUID: "1.2.826.0.1.3680043.9.7433.3.15",
+			SOPClassUID:       "1.2.840.10008.5.1.4.1.1.2.1",
+			SOPInstanceUID:    "1.2.826.0.1.3680043.9.7433.3.14",
+			Frames:            []int{3},
+		}},
 		Frames: []Frame{{
 			SegmentNumber:            7,
 			SliceIndex:               4,

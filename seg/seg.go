@@ -10,6 +10,7 @@ import (
 
 	"github.com/ThalesMMS/dicom-go/core"
 	"github.com/ThalesMMS/dicom-go/internal/derivedio"
+	"github.com/ThalesMMS/dicom-go/internal/objectview"
 	"github.com/ThalesMMS/dicom-go/object"
 	"github.com/ThalesMMS/dicom-go/render"
 	"github.com/ThalesMMS/dicom-go/roi"
@@ -461,7 +462,7 @@ func ToROI(doc *Document, segmentNumber int) (*roi.Segmentation3D, error) {
 	return out, nil
 }
 
-// Write serializes a Document into a DICOM segmentation file. If the Document's SOP class UID is not set, it defaults to SegmentationStorage (binary masks). It returns an error if the Document is nil or the SOP class UID is unsupported.
+// Write serializes a Document into a DICOM segmentation file. If the Document's SOP class UID is not set, it defaults to SegmentationStorage (binary masks). It returns an error if the Document is nil, the SOP class UID is unsupported, or source-image references are incomplete, conflicting, or unresolved.
 func Write(doc *Document) (*object.File, error) {
 	if doc == nil {
 		return nil, fmt.Errorf("%w: document is nil", ErrInvalidObject)
@@ -476,7 +477,12 @@ func Write(doc *Document) (*object.File, error) {
 	if err := validateRepresentableSegmentationType(sopClassUID, doc.SegmentationType); err != nil {
 		return nil, err
 	}
-	if err := validateReferencedSeries(doc.ReferencedImages); err != nil {
+	sourceReferences, err := newSourceReferenceIndex(doc.ReferencedImages)
+	if err != nil {
+		return nil, err
+	}
+	resolvedSourceReferences, err := sourceReferences.resolveFrames(doc.Frames)
+	if err != nil {
 		return nil, err
 	}
 	if err := validateFramePayloads(doc, sopClassUID); err != nil {
@@ -508,7 +514,7 @@ func Write(doc *Document) (*object.File, error) {
 	if shared, ok := sharedFunctionalGroupsSequence(doc); ok {
 		elements = append(elements, shared)
 	}
-	elements = append(elements, perFrameSequence(doc))
+	elements = append(elements, perFrameSequence(doc, resolvedSourceReferences))
 	switch sopClassUID {
 	case LabelMapSegmentationStorage:
 		elements = append(elements,
@@ -569,6 +575,13 @@ func Read(obj *object.Object) (*Document, error) {
 	}
 	doc.Geometry = geometry
 	doc.Frames = readFrames(obj, doc)
+	sourceReferences, err := newSourceReferenceIndex(doc.ReferencedImages)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := sourceReferences.resolveFrames(doc.Frames); err != nil {
+		return nil, err
+	}
 	return doc, nil
 }
 
@@ -851,15 +864,6 @@ func referencedSeriesSequence(refs []ReferencedImage) core.Element {
 	return derivedio.Seq(tagReferencedSeriesSequence, items...)
 }
 
-func validateReferencedSeries(refs []ReferencedImage) error {
-	for _, ref := range refs {
-		if ref.SOPInstanceUID != "" && ref.SeriesInstanceUID == "" {
-			return fmt.Errorf("%w: referenced image %s missing series UID", ErrMissingReference, ref.SOPInstanceUID)
-		}
-	}
-	return nil
-}
-
 func validateFramePayloads(doc *Document, sopClassUID string) error {
 	for i, frame := range doc.Frames {
 		if frame.Mask != nil && (frame.Mask.Rows != doc.Rows || frame.Mask.Columns != doc.Columns) {
@@ -982,9 +986,9 @@ func tagPointerElement(tag core.Tag, value core.Tag) core.Element {
 }
 
 // perFrameSequence constructs the per-frame functional groups DICOM sequence, containing segment identification, dimension indices, and reference information for each frame.
-func perFrameSequence(doc *Document) core.Element {
+func perFrameSequence(doc *Document, sourceReferences []ReferencedImage) core.Element {
 	items := make([]core.DataSet, 0, len(doc.Frames))
-	for _, frame := range doc.Frames {
+	for frameIndex, frame := range doc.Frames {
 		elements := []core.Element{
 			derivedio.Seq(tagSegmentIdentificationSequence, derivedio.DataSet(derivedio.US(tagReferencedSegmentNumber(), uint16(frame.SegmentNumber)))),
 			dimensionIndexValuesElement(frame),
@@ -1001,7 +1005,7 @@ func perFrameSequence(doc *Document) core.Element {
 			)))
 		}
 		if frame.ReferencedSOPInstanceUID != "" {
-			elements = append(elements, derivationImageSequence(doc, frame))
+			elements = append(elements, derivationImageSequence(sourceReferences[frameIndex], frame))
 		}
 		items = append(items, derivedio.DataSet(elements...))
 	}
@@ -1030,8 +1034,7 @@ func validSliceGeometry(geometry render.SliceGeometry) bool {
 		geometry.ColDir.Length() > 0
 }
 
-func derivationImageSequence(doc *Document, frame Frame) core.Element {
-	ref := sourceReferenceForFrame(doc, frame)
+func derivationImageSequence(ref ReferencedImage, frame Frame) core.Element {
 	source := []core.Element{}
 	if ref.SOPClassUID != "" {
 		source = append(source, derivedio.UI(derivedio.TagRefSOPClassUID, ref.SOPClassUID))
@@ -1045,28 +1048,167 @@ func derivationImageSequence(doc *Document, frame Frame) core.Element {
 	))
 }
 
-func sourceReferenceForFrame(doc *Document, frame Frame) ReferencedImage {
-	if doc == nil {
-		return ReferencedImage{}
-	}
-	for _, ref := range doc.ReferencedImages {
-		if ref.SOPInstanceUID != frame.ReferencedSOPInstanceUID {
-			continue
-		}
-		if frame.ReferencedFrameNumber == 0 || containsFrame(ref.Frames, frame.ReferencedFrameNumber) || len(ref.Frames) == 0 {
-			return ref
-		}
-	}
-	return ReferencedImage{SOPInstanceUID: frame.ReferencedSOPInstanceUID}
+type sourceReferenceIndex struct {
+	bySOPInstanceUID map[string]int
+	entries          []sourceReferenceEntry
+	byFrame          map[sourceReferenceFrameKey]indexedSourceReference
 }
 
-func containsFrame(frames []int, want int) bool {
-	for _, frame := range frames {
-		if frame == want {
-			return true
+type sourceReferenceEntry struct {
+	first              ReferencedImage
+	firstIndex         int
+	firstSelectorIndex int
+	wildcard           indexedSourceReference
+	hasWildcard        bool
+}
+
+type sourceReferenceFrameKey struct {
+	sopInstanceUID string
+	frameNumber    int
+}
+
+type indexedSourceReference struct {
+	reference ReferencedImage
+	index     int
+}
+
+// newSourceReferenceIndex validates source-reference selectors and indexes
+// them without changing the order used by Referenced Series Sequence. Empty
+// frame lists are wildcards; explicit lists for the same SOP instance may be
+// split across entries only when they are disjoint and metadata agrees.
+func newSourceReferenceIndex(refs []ReferencedImage) (*sourceReferenceIndex, error) {
+	frameCount := 0
+	for _, ref := range refs {
+		frameCount += len(ref.Frames)
+	}
+	index := &sourceReferenceIndex{
+		bySOPInstanceUID: make(map[string]int, len(refs)),
+		entries:          make([]sourceReferenceEntry, 0, len(refs)),
+		byFrame:          make(map[sourceReferenceFrameKey]indexedSourceReference, frameCount),
+	}
+	for refIndex, ref := range refs {
+		if ref.SeriesInstanceUID == "" {
+			return nil, fmt.Errorf("%w: referenced image %d missing Series Instance UID", ErrMissingReference, refIndex)
+		}
+		if ref.SOPClassUID == "" {
+			return nil, fmt.Errorf("%w: referenced image %d missing SOP Class UID", ErrMissingReference, refIndex)
+		}
+		if ref.SOPInstanceUID == "" {
+			return nil, fmt.Errorf("%w: referenced image %d missing SOP Instance UID", ErrMissingReference, refIndex)
+		}
+		entryIndex, exists := index.bySOPInstanceUID[ref.SOPInstanceUID]
+		if !exists {
+			entryIndex = len(index.entries)
+			index.bySOPInstanceUID[ref.SOPInstanceUID] = entryIndex
+			index.entries = append(index.entries, sourceReferenceEntry{
+				first: ref, firstIndex: refIndex, firstSelectorIndex: -1,
+			})
+		}
+		entry := &index.entries[entryIndex]
+		if exists && (entry.first.SeriesInstanceUID != ref.SeriesInstanceUID || entry.first.SOPClassUID != ref.SOPClassUID) {
+			return nil, fmt.Errorf(
+				"%w: referenced images %d and %d conflict for SOP Instance UID %s",
+				ErrInvalidObject, entry.firstIndex, refIndex, ref.SOPInstanceUID,
+			)
+		}
+
+		if len(ref.Frames) == 0 {
+			if entry.hasWildcard {
+				return nil, duplicateSourceReferenceError(ref.SOPInstanceUID, 0, entry.wildcard.index, refIndex)
+			}
+			if entry.firstSelectorIndex >= 0 {
+				return nil, overlappingSourceReferenceError(ref.SOPInstanceUID, entry.firstSelectorIndex, refIndex)
+			}
+			entry.wildcard = indexedSourceReference{reference: ref, index: refIndex}
+			entry.hasWildcard = true
+			entry.firstSelectorIndex = refIndex
+			continue
+		}
+		if entry.hasWildcard {
+			return nil, overlappingSourceReferenceError(ref.SOPInstanceUID, entry.wildcard.index, refIndex)
+		}
+		for _, frameNumber := range ref.Frames {
+			if frameNumber <= 0 {
+				return nil, fmt.Errorf(
+					"%w: referenced image %d has non-positive frame number %d",
+					ErrInvalidObject, refIndex, frameNumber,
+				)
+			}
+			key := sourceReferenceFrameKey{sopInstanceUID: ref.SOPInstanceUID, frameNumber: frameNumber}
+			if previous, exists := index.byFrame[key]; exists {
+				return nil, duplicateSourceReferenceError(ref.SOPInstanceUID, frameNumber, previous.index, refIndex)
+			}
+			index.byFrame[key] = indexedSourceReference{reference: ref, index: refIndex}
+			if entry.firstSelectorIndex < 0 {
+				entry.firstSelectorIndex = refIndex
+			}
 		}
 	}
-	return false
+	return index, nil
+}
+
+func duplicateSourceReferenceError(sopInstanceUID string, frameNumber, firstIndex, secondIndex int) error {
+	selector := "all frames"
+	if frameNumber > 0 {
+		selector = fmt.Sprintf("frame %d", frameNumber)
+	}
+	return fmt.Errorf(
+		"%w: referenced images %d and %d duplicate SOP Instance UID %s %s",
+		ErrInvalidObject, firstIndex, secondIndex, sopInstanceUID, selector,
+	)
+}
+
+func overlappingSourceReferenceError(sopInstanceUID string, firstIndex, secondIndex int) error {
+	return fmt.Errorf(
+		"%w: referenced images %d and %d overlap wildcard and explicit frames for SOP Instance UID %s",
+		ErrInvalidObject, firstIndex, secondIndex, sopInstanceUID,
+	)
+}
+
+func (index *sourceReferenceIndex) resolveFrames(frames []Frame) ([]ReferencedImage, error) {
+	resolved := make([]ReferencedImage, len(frames))
+	for frameIndex, frame := range frames {
+		if frame.ReferencedSOPInstanceUID == "" {
+			if frame.ReferencedFrameNumber != 0 {
+				return nil, fmt.Errorf(
+					"%w: frame %d has referenced frame number %d without a source SOP Instance UID",
+					ErrMissingReference, frameIndex, frame.ReferencedFrameNumber,
+				)
+			}
+			continue
+		}
+		ref, ok := index.lookup(frame)
+		if !ok {
+			return nil, fmt.Errorf(
+				"%w: frame %d references unlisted source SOP Instance UID %s frame %d",
+				ErrMissingReference, frameIndex, frame.ReferencedSOPInstanceUID, frame.ReferencedFrameNumber,
+			)
+		}
+		resolved[frameIndex] = ref
+	}
+	return resolved, nil
+}
+
+func (index *sourceReferenceIndex) lookup(frame Frame) (ReferencedImage, bool) {
+	if index != nil {
+		if entryIndex, ok := index.bySOPInstanceUID[frame.ReferencedSOPInstanceUID]; ok {
+			entry := &index.entries[entryIndex]
+			if frame.ReferencedFrameNumber == 0 {
+				return entry.first, true
+			}
+			key := sourceReferenceFrameKey{
+				sopInstanceUID: frame.ReferencedSOPInstanceUID,
+				frameNumber:    frame.ReferencedFrameNumber,
+			}
+			if ref, ok := index.byFrame[key]; ok {
+				return ref.reference, true
+			}
+			if entry.hasWildcard {
+				return entry.wildcard.reference, true
+			}
+		}
+	}
+	return ReferencedImage{}, false
 }
 
 // tagReferencedSegmentNumber returns the DICOM tag (0062,000B) for the referenced segment number.
@@ -1236,14 +1378,23 @@ func readFrames(obj *object.Object, doc *Document) []Frame {
 
 // readBinaryFrames reads binary DICOM pixel data and creates Frame objects with raster masks for each frame.
 func readBinaryFrames(obj *object.Object, doc *Document, frameItems []*object.Object) []Frame {
-	data, _ := obj.GetRaw(derivedio.TagPixelData)
+	var frames []Frame
+	if objectview.VisitRaw(obj, derivedio.TagPixelData, func(data objectview.Raw) {
+		frames = readBinaryFramesFromPixelData(data, obj, doc, frameItems)
+	}) {
+		return frames
+	}
+	return readBinaryFramesFromPixelData(objectview.Raw{}, obj, doc, frameItems)
+}
+
+func readBinaryFramesFromPixelData(data objectview.Raw, obj *object.Object, doc *Document, frameItems []*object.Object) []Frame {
 	bitsPerFrame := doc.Rows * doc.Columns
 	if bitsPerFrame <= 0 {
 		return nil
 	}
 	spatialDimensionIndex := spatialDimensionValueIndex(obj)
 	frames := make([]Frame, 0, len(frameItems))
-	frameBitStride := binaryFrameBitStride(bitsPerFrame, len(frameItems), len(data))
+	frameBitStride := binaryFrameBitStride(bitsPerFrame, len(frameItems), data.Len())
 	for i, item := range frameItems {
 		frame := readFrameItem(item, i, spatialDimensionIndex, doc.Geometry)
 		if frame.SegmentNumber == 0 && len(doc.Segments) == 1 {
@@ -1256,12 +1407,12 @@ func readBinaryFrames(obj *object.Object, doc *Document, frameItems []*object.Ob
 	return frames
 }
 
-func readPackedBinaryMask(data []byte, baseBit, columns, rows int) *roi.RasterMask {
+func readPackedBinaryMask(data objectview.Raw, baseBit, columns, rows int) *roi.RasterMask {
 	mask := roi.NewRasterMask(columns, rows)
-	if len(data) == 0 || columns <= 0 || rows <= 0 {
+	if data.Len() == 0 || columns <= 0 || rows <= 0 {
 		return mask
 	}
-	dataBits := len(data) * 8
+	dataBits := data.Len() * 8
 	for y := 0; y < rows; y++ {
 		rowStart := baseBit + y*columns
 		if rowStart >= dataBits {
@@ -1275,7 +1426,7 @@ func readPackedBinaryMask(data []byte, baseBit, columns, rows int) *roi.RasterMa
 		for position := rowStart; position < rowEnd; {
 			offset := position & 7
 			count := minInt(8-offset, rowEnd-position)
-			value := (data[position>>3] >> uint(offset)) & lowBitMask(count)
+			value := (data.Byte(position>>3) >> uint(offset)) & lowBitMask(count)
 			consumed := 0
 			for consumed < count {
 				zeros := bits.TrailingZeros8(value >> uint(consumed))
@@ -1319,8 +1470,17 @@ func binaryFrameBitStride(bitsPerFrame, frameCount, dataBytes int) int {
 }
 
 func readLabelMapFrames(obj *object.Object, doc *Document, frameItems []*object.Object) []Frame {
-	data, _ := obj.GetRaw(derivedio.TagPixelData)
-	values := derivedio.Uint16s(data)
+	var frames []Frame
+	if objectview.VisitRaw(obj, derivedio.TagPixelData, func(data objectview.Raw) {
+		frames = readLabelMapFramesFromPixelData(data, obj, doc, frameItems)
+	}) {
+		return frames
+	}
+	return readLabelMapFramesFromPixelData(objectview.Raw{}, obj, doc, frameItems)
+}
+
+func readLabelMapFramesFromPixelData(data objectview.Raw, obj *object.Object, doc *Document, frameItems []*object.Object) []Frame {
+	valueCount := data.Len() / 2
 	valuesPerFrame := doc.Rows * doc.Columns
 	spatialDimensionIndex := spatialDimensionValueIndex(obj)
 	frames := make([]Frame, 0, len(frameItems))
@@ -1328,11 +1488,14 @@ func readLabelMapFrames(obj *object.Object, doc *Document, frameItems []*object.
 		frame := readFrameItem(item, i, spatialDimensionIndex, doc.Geometry)
 		start := i * valuesPerFrame
 		end := start + valuesPerFrame
-		if start < len(values) {
-			if end > len(values) {
-				end = len(values)
+		if start < valueCount {
+			if end > valueCount {
+				end = valueCount
 			}
-			frame.LabelMap = append([]uint16(nil), values[start:end]...)
+			frame.LabelMap = make([]uint16, end-start)
+			for valueIndex := start; valueIndex < end; valueIndex++ {
+				frame.LabelMap[valueIndex-start] = data.Uint16LE(valueIndex)
+			}
 		}
 		if frame.SegmentNumber == 0 && len(doc.Segments) > 0 {
 			frame.SegmentNumber = doc.Segments[0].Number

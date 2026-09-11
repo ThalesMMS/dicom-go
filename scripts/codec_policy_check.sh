@@ -88,10 +88,11 @@ base_forbidden=(
 	"github.com/gen2brain/jpegxl"
 )
 
-for pattern in "${base_forbidden[@]}"; do
-	for manifest in "$root/go.mod" "$root/go.sum"; do
-		[ -f "$manifest" ] || continue
-		if manifest_module_paths "$manifest" | grep -Fqi "$pattern"; then
+for manifest in "$root/go.mod" "$root/go.sum"; do
+	[ -f "$manifest" ] || continue
+	module_paths="$(manifest_module_paths "$manifest")" || fail "cannot read manifest: ${manifest#$root/}"
+	for pattern in "${base_forbidden[@]}"; do
+		if grep -Fi "$pattern" <<< "$module_paths" >/dev/null; then
 			fail "base module manifest must not depend on optional/native codec pattern '$pattern'"
 		fi
 	done
@@ -107,12 +108,41 @@ require_grep "module github.com/ThalesMMS/dicom-go/examples/codecfull" "$root/ex
 require_grep "replace github.com/ThalesMMS/dicom-go => ../.." "$root/examples/codecfull/go.mod"
 
 copyleft_forbidden=( "agpl" "lgpl" "gpl" "grok" )
-while IFS= read -r manifest; do
+# Recurse with Bash 3.2-compatible globs. Do not resolve `find` through PATH:
+# Windows Git Bash may select the unrelated native FIND.EXE. Include hidden
+# directories and fail on directory symlinks rather than following cycles or
+# silently omitting part of the policy surface.
+shopt -s nullglob dotglob
+check_codec_manifest() {
+	local manifest="$1"
+	local pattern module_paths
+	# Read errors must fail, and grep must consume the full input: grep -q in a
+	# pipefail pipeline can turn an early match into an ignored SIGPIPE failure.
+	module_paths="$(manifest_module_paths "$manifest")" || fail "cannot read manifest: ${manifest#$root/}"
 	for pattern in "${copyleft_forbidden[@]}"; do
-		if manifest_module_paths "$manifest" | grep -Fqi "$pattern"; then
+		if grep -Fi "$pattern" <<< "$module_paths" >/dev/null; then
 			fail "optional manifest ${manifest#$root/} contains forbidden/copyleft pattern '$pattern'"
 		fi
 	done
-done < <(find "$root/examples/codec-adapters" "$root/examples/codecfull" -type f \( -name go.mod -o -name go.sum \))
+}
+
+scan_codec_manifests() {
+	local directory="$1"
+	local entry
+	[ -r "$directory" ] && [ -x "$directory" ] || fail "cannot inspect directory: ${directory#$root/}"
+	for entry in "$directory"/*; do
+		if [ -d "$entry" ]; then
+			[ ! -L "$entry" ] || fail "symlink directory in codec policy tree: ${entry#$root/}"
+			scan_codec_manifests "$entry"
+		else
+			case "${entry##*/}" in
+				go.mod|go.sum) check_codec_manifest "$entry" ;;
+			esac
+		fi
+	done
+}
+
+scan_codec_manifests "$root/examples/codec-adapters"
+scan_codec_manifests "$root/examples/codecfull"
 
 echo "codec-policy-check: OK"

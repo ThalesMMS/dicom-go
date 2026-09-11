@@ -1,0 +1,107 @@
+{
+  "module": "dicom-go",
+  "include": [
+    "README.md",
+    "AGENTS.md",
+    "CHANGELOG.md",
+    "CONTRIBUTING.md",
+    "docs",
+    "examples",
+    "internal/standard/README.md",
+    "pixeldata/codecfixture/testdata/codecs/README.md"
+  ],
+  "exemptions": [
+    {
+      "pattern": "CHANGELOG.md",
+      "rules": ["issues"],
+      "reason": "The changelog is a chronological release record, so historical issue references remain valid provenance."
+    },
+    {
+      "pattern": "docs/JPEGXL_DECODER_STRATEGY.md",
+      "rules": ["issues"],
+      "reason": "This decision record intentionally preserves the issue references that motivated the selected decoder strategy."
+    },
+    {
+      "pattern": "docs/CODEC_FRAME_COST.md",
+      "rules": ["issues"],
+      "reason": "The codec cost decision record cites the measurement issue and related codec work as provenance."
+    },
+    {
+      "pattern": "docs/benchmarks/2026-09-09-codec-frame-cost/**",
+      "rules": ["issues"],
+      "reason": "Campaign notes retain issue provenance next to measured JSON."
+    }
+  ],
+  "current_sections": [
+    {
+      "path": "README.md",
+      "heading": "",
+      "allowed_issues": []
+    },
+    {
+      "path": "docs/CAPABILITIES.md",
+      "heading": "",
+      "allowed_issues": []
+    },
+    {
+      "path": "docs/ROADMAP.md",
+      "heading": "",
+      "allowed_issues": [899]
+    },
+    {
+      "path": "docs/CODEC_CAPABILITY_MATRIX.md",
+      "heading": "",
+      "allowed_issues": []
+    }
+  ],
+  "path_references": [
+    {
+      "document": "README.md",
+      "text": "cmd/dcmdump",
+      "target": "dicom-go/cmd/dcmdump"
+    },
+    {
+      "document": "docs/ARCHITECTURE.md",
+      "text": "pixeldata/",
+      "target": "dicom-go/pixeldata"
+    }
+  ],
+  "help_commands": [
+    {
+      "document": "README.md",
+      "argv": ["go", "run", "./cmd/dcmdump", "-h"],
+      "contains": "usage",
+      "timeout_seconds": 10
+    },
+    {
+      "document": "README.md",
+      "argv": ["go", "run", "./cmd/dicomweb", "-h"],
+      "contains": "usage",
+      "timeout_seconds": 10
+    },
+    {
+      "document": "README.md",
+      "argv": ["go", "run", "./cmd/echoscu", "-h"],
+      "contains": "usage",
+      "timeout_seconds": 10
+    },
+    {
+      "document": "README.md",
+      "argv": ["go", "run", "./cmd/storescu", "-h"],
+      "contains": "usage",
+      "timeout_seconds": 10
+    },
+    {
+      "document": "README.md",
+      "argv": ["go", "run", "./cmd/findscu", "-h"],
+      "contains": "usage",
+      "timeout_seconds": 10
+    },
+    {
+      "document": "README.md",
+      "argv": ["go", "run", "./cmd/dicom-go-retrieve", "-h"],
+      "contains": "usage",
+      "timeout_seconds": 10
+    }
+  ]
+}

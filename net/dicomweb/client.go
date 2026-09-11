@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"mime"
 	"mime/multipart"
 	"net"
 	"net/http"
@@ -19,12 +18,16 @@ import (
 )
 
 const (
-	acceptDICOMJSON = "application/dicom+json, application/json;q=0.9"
-	acceptDICOM     = `application/dicom, multipart/related; type="application/dicom"`
+	acceptDICOMJSON         = "application/dicom+json, application/json;q=0.9"
+	acceptDICOM             = `application/dicom, multipart/related; type="application/dicom"`
+	defaultMaxMetadataParts = 10_000
 )
 
 // Verify performs a light QIDO-RS study request to verify endpoint reachability.
 func (c Client) Verify(ctx context.Context) (VerifyResult, error) {
+	if err := c.validateMetadataResponseOptions(); err != nil {
+		return VerifyResult{}, err
+	}
 	params := url.Values{}
 	params.Set("limit", "1")
 	u, err := c.Endpoint.StudySearchURL(params)
@@ -32,7 +35,7 @@ func (c Client) Verify(ctx context.Context) (VerifyResult, error) {
 		return VerifyResult{}, err
 	}
 	started := time.Now()
-	resp, err := c.doGET(ctx, u, acceptDICOMJSON)
+	resp, err := c.doGET(ctx, u, c.metadataAcceptHeader())
 	result := VerifyResult{Response: resp, Duration: time.Since(started), StartedAt: started.UTC()}
 	if err != nil {
 		return result, err
@@ -46,20 +49,23 @@ func (c Client) Verify(ctx context.Context) (VerifyResult, error) {
 	if len(strings.TrimSpace(string(resp.Body))) == 0 {
 		return result, nil
 	}
-	var payload []Dataset
-	if err := decodeJSON(resp.Body, &payload); err != nil {
-		return result, &Error{Kind: ErrorKindDecodeResponse, URL: resp.URL, Err: err}
+	if _, err := c.datasetsFromMetadataResponse(ctx, resp, false); err != nil {
+		return result, newDICOMwebError(ErrorKindDecodeResponse, resp.URL, resp.StatusCode, err)
 	}
 	return result, nil
 }
 
-// SearchStudies performs a QIDO-RS study search and returns raw DICOM JSON datasets.
+// SearchStudies performs a QIDO-RS study search and returns metadata in the
+// package's Dataset shape, decoding either negotiated DICOM JSON or DICOM XML.
 func (c Client) SearchStudies(ctx context.Context, params url.Values) ([]Dataset, error) {
+	if err := c.validateMetadataResponseOptions(); err != nil {
+		return nil, err
+	}
 	u, err := c.Endpoint.StudySearchURL(params)
 	if err != nil {
 		return nil, err
 	}
-	resp, err := c.doGET(ctx, u, acceptDICOMJSON)
+	resp, err := c.doGET(ctx, u, c.metadataAcceptHeader())
 	if err != nil {
 		return nil, err
 	}
@@ -69,20 +75,24 @@ func (c Client) SearchStudies(ctx context.Context, params url.Values) ([]Dataset
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, statusError(resp)
 	}
-	datasets, err := datasetsFromDICOMJSON(resp.Body)
+	datasets, err := c.datasetsFromMetadataResponse(ctx, resp, false)
 	if err != nil {
-		return nil, &Error{Kind: ErrorKindDecodeResponse, URL: resp.URL, StatusCode: resp.StatusCode, Status: resp.Status, Err: err}
+		return nil, newDICOMwebError(ErrorKindDecodeResponse, resp.URL, resp.StatusCode, err)
 	}
 	return datasets, nil
 }
 
-// SearchSeries performs a QIDO-RS series search for one study and returns raw DICOM JSON datasets.
+// SearchSeries performs a QIDO-RS series search for one study and returns
+// metadata in the package's Dataset shape.
 func (c Client) SearchSeries(ctx context.Context, studyInstanceUID string, params url.Values) ([]Dataset, error) {
+	if err := c.validateMetadataResponseOptions(); err != nil {
+		return nil, err
+	}
 	u, err := c.Endpoint.SeriesSearchURL(studyInstanceUID, params)
 	if err != nil {
 		return nil, err
 	}
-	resp, err := c.doGET(ctx, u, acceptDICOMJSON)
+	resp, err := c.doGET(ctx, u, c.metadataAcceptHeader())
 	if err != nil {
 		return nil, err
 	}
@@ -92,20 +102,24 @@ func (c Client) SearchSeries(ctx context.Context, studyInstanceUID string, param
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, statusError(resp)
 	}
-	datasets, err := datasetsFromDICOMJSON(resp.Body)
+	datasets, err := c.datasetsFromMetadataResponse(ctx, resp, false)
 	if err != nil {
-		return nil, &Error{Kind: ErrorKindDecodeResponse, URL: resp.URL, StatusCode: resp.StatusCode, Status: resp.Status, Err: err}
+		return nil, newDICOMwebError(ErrorKindDecodeResponse, resp.URL, resp.StatusCode, err)
 	}
 	return datasets, nil
 }
 
-// SearchInstances performs a QIDO-RS instance search for one series and returns raw DICOM JSON datasets.
+// SearchInstances performs a QIDO-RS instance search for one series and
+// returns metadata in the package's Dataset shape.
 func (c Client) SearchInstances(ctx context.Context, studyInstanceUID, seriesInstanceUID string, params url.Values) ([]Dataset, error) {
+	if err := c.validateMetadataResponseOptions(); err != nil {
+		return nil, err
+	}
 	u, err := c.Endpoint.InstanceSearchURL(studyInstanceUID, seriesInstanceUID, params)
 	if err != nil {
 		return nil, err
 	}
-	resp, err := c.doGET(ctx, u, acceptDICOMJSON)
+	resp, err := c.doGET(ctx, u, c.metadataAcceptHeader())
 	if err != nil {
 		return nil, err
 	}
@@ -115,9 +129,9 @@ func (c Client) SearchInstances(ctx context.Context, studyInstanceUID, seriesIns
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, statusError(resp)
 	}
-	datasets, err := datasetsFromDICOMJSON(resp.Body)
+	datasets, err := c.datasetsFromMetadataResponse(ctx, resp, false)
 	if err != nil {
-		return nil, &Error{Kind: ErrorKindDecodeResponse, URL: resp.URL, StatusCode: resp.StatusCode, Status: resp.Status, Err: err}
+		return nil, newDICOMwebError(ErrorKindDecodeResponse, resp.URL, resp.StatusCode, err)
 	}
 	return datasets, nil
 }
@@ -130,7 +144,7 @@ func (c Client) StudyMetadata(ctx context.Context, studyInstanceUID string) ([]I
 	}
 	refs, err := instanceRefsFromDatasets(datasets, studyInstanceUID, "")
 	if err != nil {
-		return nil, &Error{Kind: ErrorKindDecodeResponse, URL: response.URL, StatusCode: response.StatusCode, Status: response.Status, Err: err}
+		return nil, newDICOMwebError(ErrorKindDecodeResponse, response.URL, response.StatusCode, err)
 	}
 	return refs, nil
 }
@@ -142,20 +156,23 @@ func (c Client) StudyMetadataDatasets(ctx context.Context, studyInstanceUID stri
 }
 
 func (c Client) studyMetadataDatasets(ctx context.Context, studyInstanceUID string) ([]Dataset, Response, error) {
+	if err := c.validateMetadataResponseOptions(); err != nil {
+		return nil, Response{}, err
+	}
 	u, err := c.Endpoint.StudyMetadataURL(studyInstanceUID)
 	if err != nil {
 		return nil, Response{}, err
 	}
-	resp, err := c.doGET(ctx, u, acceptDICOMJSON)
+	resp, err := c.doGET(ctx, u, c.metadataAcceptHeader())
 	if err != nil {
 		return nil, resp, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, resp, statusError(resp)
 	}
-	datasets, err := datasetsFromDICOMJSON(resp.Body)
+	datasets, err := c.datasetsFromMetadataResponse(ctx, resp, true)
 	if err != nil {
-		return nil, resp, &Error{Kind: ErrorKindDecodeResponse, URL: resp.URL, StatusCode: resp.StatusCode, Status: resp.Status, Err: err}
+		return nil, resp, newDICOMwebError(ErrorKindDecodeResponse, resp.URL, resp.StatusCode, err)
 	}
 	return datasets, resp, nil
 }
@@ -168,7 +185,7 @@ func (c Client) SeriesMetadata(ctx context.Context, studyInstanceUID, seriesInst
 	}
 	refs, err := instanceRefsFromDatasets(datasets, studyInstanceUID, seriesInstanceUID)
 	if err != nil {
-		return nil, &Error{Kind: ErrorKindDecodeResponse, URL: response.URL, StatusCode: response.StatusCode, Status: response.Status, Err: err}
+		return nil, newDICOMwebError(ErrorKindDecodeResponse, response.URL, response.StatusCode, err)
 	}
 	return refs, nil
 }
@@ -180,40 +197,46 @@ func (c Client) SeriesMetadataDatasets(ctx context.Context, studyInstanceUID, se
 }
 
 func (c Client) seriesMetadataDatasets(ctx context.Context, studyInstanceUID, seriesInstanceUID string) ([]Dataset, Response, error) {
+	if err := c.validateMetadataResponseOptions(); err != nil {
+		return nil, Response{}, err
+	}
 	u, err := c.Endpoint.SeriesMetadataURL(studyInstanceUID, seriesInstanceUID)
 	if err != nil {
 		return nil, Response{}, err
 	}
-	resp, err := c.doGET(ctx, u, acceptDICOMJSON)
+	resp, err := c.doGET(ctx, u, c.metadataAcceptHeader())
 	if err != nil {
 		return nil, resp, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, resp, statusError(resp)
 	}
-	datasets, err := datasetsFromDICOMJSON(resp.Body)
+	datasets, err := c.datasetsFromMetadataResponse(ctx, resp, true)
 	if err != nil {
-		return nil, resp, &Error{Kind: ErrorKindDecodeResponse, URL: resp.URL, StatusCode: resp.StatusCode, Status: resp.Status, Err: err}
+		return nil, resp, newDICOMwebError(ErrorKindDecodeResponse, resp.URL, resp.StatusCode, err)
 	}
 	return datasets, resp, nil
 }
 
 // InstanceMetadata retrieves raw WADO-RS metadata for one instance.
 func (c Client) InstanceMetadata(ctx context.Context, ref InstanceRef) ([]Dataset, error) {
+	if err := c.validateMetadataResponseOptions(); err != nil {
+		return nil, err
+	}
 	u, err := c.Endpoint.InstanceMetadataURL(ref)
 	if err != nil {
 		return nil, err
 	}
-	resp, err := c.doGET(ctx, u, acceptDICOMJSON)
+	resp, err := c.doGET(ctx, u, c.metadataAcceptHeader())
 	if err != nil {
 		return nil, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, statusError(resp)
 	}
-	datasets, err := datasetsFromDICOMJSON(resp.Body)
+	datasets, err := c.datasetsFromMetadataResponse(ctx, resp, true)
 	if err != nil {
-		return nil, &Error{Kind: ErrorKindDecodeResponse, URL: resp.URL, StatusCode: resp.StatusCode, Status: resp.Status, Err: err}
+		return nil, newDICOMwebError(ErrorKindDecodeResponse, resp.URL, resp.StatusCode, err)
 	}
 	return datasets, nil
 }
@@ -226,6 +249,9 @@ func (c Client) RetrieveInstance(ctx context.Context, ref InstanceRef) ([]Object
 // RetrieveInstanceWithOptions retrieves a WADO-RS DICOM object with explicit
 // media/transfer-syntax preferences.
 func (c Client) RetrieveInstanceWithOptions(ctx context.Context, ref InstanceRef, opts RetrieveOptions) ([]ObjectPart, error) {
+	if _, err := responseLimits(c.Options); err != nil {
+		return nil, newDICOMwebError(ErrorKindRequestFailure, "", 0, err)
+	}
 	u, err := c.Endpoint.InstanceURL(ref)
 	if err != nil {
 		return nil, err
@@ -237,9 +263,9 @@ func (c Client) RetrieveInstanceWithOptions(ctx context.Context, ref InstanceRef
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, statusError(resp)
 	}
-	parts, err := objectPartsFromResponse(resp)
+	parts, err := objectPartsFromResponseWithPolicy(resp, c.Options, dicomObjectResponsePolicy)
 	if err != nil {
-		return nil, &Error{Kind: ErrorKindDecodeResponse, URL: resp.URL, StatusCode: resp.StatusCode, Status: resp.Status, Err: err}
+		return nil, newDICOMwebError(ErrorKindDecodeResponse, resp.URL, resp.StatusCode, err)
 	}
 	return parts, nil
 }
@@ -253,7 +279,7 @@ func (c Client) RetrieveInstanceStreamWithOptions(ctx context.Context, ref Insta
 	if err != nil {
 		return err
 	}
-	return c.retrieveStreamAt(ctx, u, opts, func(part LocatedObjectPartStream) error { return handle(part.Part) })
+	return c.retrieveStreamAt(ctx, u, opts, false, func(part LocatedObjectPartStream) error { return handle(part.Part) })
 }
 
 // RetrieveStudyStreamWithOptions streams every Part 10 object in a WADO-RS study response.
@@ -262,7 +288,7 @@ func (c Client) RetrieveStudyStreamWithOptions(ctx context.Context, studyInstanc
 	if err != nil {
 		return err
 	}
-	return c.retrieveStreamAt(ctx, u, opts, handle)
+	return c.retrieveStreamAt(ctx, u, opts, true, handle)
 }
 
 // RetrieveSeriesStreamWithOptions streams every Part 10 object in a WADO-RS series response.
@@ -271,113 +297,222 @@ func (c Client) RetrieveSeriesStreamWithOptions(ctx context.Context, studyInstan
 	if err != nil {
 		return err
 	}
-	return c.retrieveStreamAt(ctx, u, opts, handle)
+	return c.retrieveStreamAt(ctx, u, opts, true, handle)
 }
 
-func (c Client) retrieveStreamAt(ctx context.Context, u *url.URL, opts RetrieveOptions, handle func(LocatedObjectPartStream) error) error {
+func (c Client) retrieveStreamAt(ctx context.Context, u *url.URL, opts RetrieveOptions, requireMultipart bool, handle func(LocatedObjectPartStream) error) error {
 	if handle == nil {
 		return fmt.Errorf("WADO-RS stream handler is required")
+	}
+	if _, err := responseLimits(c.Options); err != nil {
+		return newDICOMwebError(ErrorKindRequestFailure, "", 0, err)
 	}
 	httpResp, cancel, err := c.doHTTP(ctx, http.MethodGet, u, nil, "", retrieveAcceptHeader(opts))
 	if err != nil {
 		return err
 	}
 	defer func() {
-		_ = httpResp.Body.Close()
 		if cancel != nil {
 			cancel()
 		}
+		_ = httpResp.Body.Close()
 	}()
 
 	resp := responseFromHTTP(u.String(), httpResp)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return statusError(resp)
 	}
-	return c.streamObjectParts(resp, httpResp.Body, handle)
+	policy := dicomObjectResponsePolicy
+	policy.requireMultipart = requireMultipart
+	return c.streamObjectParts(resp, httpResp.Body, policy, handle)
 }
 
 // RetrieveFrames fetches selected one-based frames with WADO-RS. The response
 // remains frame-scoped; callers never need to retrieve or decode the complete
 // multi-frame instance.
 func (c Client) RetrieveFrames(ctx context.Context, ref InstanceRef, frames []int, opts RetrieveOptions) ([]FramePart, error) {
-	u, err := c.Endpoint.FramesURL(ref, frames)
+	parts := make([]FramePart, 0, len(frames))
+	err := c.RetrieveFramesStreamWithOptions(ctx, ref, frames, opts, func(part FramePartStream) error {
+		data, err := io.ReadAll(part.Reader)
+		if err != nil {
+			return err
+		}
+		parts = append(parts, FramePart{
+			FrameNumber:       part.FrameNumber,
+			ContentType:       part.ContentType,
+			TransferSyntaxUID: part.TransferSyntaxUID,
+			Data:              data,
+		})
+		return nil
+	})
 	if err != nil {
 		return nil, err
 	}
-	resp, err := c.doGET(ctx, u, retrieveFramesAcceptHeader(opts))
-	if err != nil {
-		return nil, err
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, statusError(resp)
-	}
-	parts, err := objectPartsFromResponse(resp)
-	if err != nil {
-		return nil, &Error{Kind: ErrorKindDecodeResponse, URL: resp.URL, StatusCode: resp.StatusCode, Status: resp.Status, Err: err}
-	}
-	if len(parts) != len(frames) {
-		return nil, &Error{
-			Kind: ErrorKindDecodeResponse, URL: resp.URL,
-			StatusCode: resp.StatusCode, Status: resp.Status,
-			Err: fmt.Errorf("RetrieveFrames returned %d parts for %d frames", len(parts), len(frames)),
-		}
-	}
-	out := make([]FramePart, len(parts))
-	for index, part := range parts {
-		out[index] = FramePart{
-			FrameNumber: frames[index], ContentType: part.ContentType,
-			TransferSyntaxUID: part.TransferSyntaxUID, Data: part.Data,
-		}
-	}
-	return out, nil
+	return parts, nil
 }
 
-func (c Client) streamObjectParts(resp Response, body io.Reader, handle func(LocatedObjectPartStream) error) error {
-	contentType := strings.TrimSpace(resp.Header.Get("Content-Type"))
-	mediaType, params, err := mime.ParseMediaType(contentType)
+// RetrieveFramesStreamWithOptions retrieves selected one-based frames and
+// invokes handle synchronously for each response part in request order. The
+// part Reader is valid only until handle returns. Unread bytes are drained;
+// returning an error stops retrieval and closes the HTTP response.
+func (c Client) RetrieveFramesStreamWithOptions(ctx context.Context, ref InstanceRef, frames []int, opts RetrieveOptions, handle func(FramePartStream) error) error {
+	if handle == nil {
+		return fmt.Errorf("WADO-RS frame stream handler is required")
+	}
+	if _, err := responseLimits(c.Options); err != nil {
+		return newDICOMwebError(ErrorKindRequestFailure, "", 0, err)
+	}
+	u, err := c.Endpoint.FramesURL(ref, frames)
 	if err != nil {
-		mediaType = contentType
+		return err
+	}
+	httpResp, cancel, err := c.doHTTP(ctx, http.MethodGet, u, nil, "", retrieveFramesAcceptHeader(opts))
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if cancel != nil {
+			cancel()
+		}
+		_ = httpResp.Body.Close()
+	}()
+
+	resp := responseFromHTTP(u.String(), httpResp)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return statusError(resp)
+	}
+	partCount := 0
+	err = c.streamObjectParts(resp, httpResp.Body, frameResponsePolicy, func(part LocatedObjectPartStream) error {
+		if partCount >= len(frames) {
+			return &ResponseDecodeError{
+				Kind: ResponseDecodePartLimit, Limit: int64(len(frames)), Value: int64(partCount + 1),
+			}
+		}
+		frame := FramePartStream{
+			FrameNumber:       frames[partCount],
+			ContentType:       part.Part.ContentType,
+			TransferSyntaxUID: part.Part.TransferSyntaxUID,
+			Reader:            part.Part.Reader,
+			Size:              -1,
+		}
+		partCount++
+		return handle(frame)
+	})
+	if err != nil {
+		return err
+	}
+	if partCount != len(frames) {
+		return newDICOMwebError(ErrorKindDecodeResponse, resp.URL, resp.StatusCode,
+			fmt.Errorf("RetrieveFrames returned %d parts for %d frames", partCount, len(frames)))
+	}
+	return nil
+}
+
+func (c Client) streamObjectParts(resp Response, body io.Reader, policy responseMediaPolicy, handle func(LocatedObjectPartStream) error) error {
+	limits, err := responseLimits(c.Options)
+	if err != nil {
+		return newDICOMwebError(ErrorKindRequestFailure, "", 0, err)
+	}
+	contentType, err := responseContentType(resp.Header.Values("Content-Type"))
+	if err != nil {
+		return newDICOMwebError(ErrorKindDecodeResponse, resp.URL, resp.StatusCode, err)
+	}
+	mediaType, params, err := validateOuterResponseMediaType(contentType, policy, limits)
+	if err != nil {
+		return newDICOMwebError(ErrorKindDecodeResponse, resp.URL, resp.StatusCode, err)
 	}
 	maxBodyBytes := c.Options.MaxBodyBytes
 	if maxBodyBytes <= 0 {
 		maxBodyBytes = DefaultMaxBodyBytes
 	}
 	body = &responseBodyLimitReader{reader: body, remaining: maxBodyBytes, limit: maxBodyBytes, resp: resp}
-	if strings.HasPrefix(strings.ToLower(mediaType), "multipart/") {
+	if mediaType == "multipart/related" {
 		boundary := params["boundary"]
-		if boundary == "" {
-			return fmt.Errorf("%s returned multipart response without boundary", resp.URL)
-		}
-		reader := multipart.NewReader(body, boundary)
+		headerLimitedBody := newMultipartHeaderLimitReader(body, boundary, limits.maxHeaderBytes)
+		reader := multipart.NewReader(headerLimitedBody, boundary)
+		partCount := 0
 		for {
-			part, err := reader.NextPart()
+			part, err := reader.NextRawPart()
 			if errors.Is(err, io.EOF) {
+				if partCount == 0 {
+					return newDICOMwebError(ErrorKindDecodeResponse, resp.URL, resp.StatusCode,
+						&ResponseDecodeError{Kind: ResponseDecodeMalformedMultipart})
+				}
 				return nil
 			}
 			if err != nil {
-				return err
+				if headerLimitedBody.Err() != nil {
+					return newDICOMwebError(ErrorKindDecodeResponse, resp.URL, resp.StatusCode, headerLimitedBody.Err())
+				}
+				var clientErr *Error
+				if errors.As(err, &clientErr) {
+					return err
+				}
+				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+					return err
+				}
+				return newDICOMwebError(ErrorKindDecodeResponse, resp.URL, resp.StatusCode,
+					multipartDecodeError(err))
+			}
+			partCount++
+			if partCount > limits.maxParts {
+				return newDICOMwebError(ErrorKindDecodeResponse, resp.URL, resp.StatusCode,
+					&ResponseDecodeError{Kind: ResponseDecodePartLimit, Limit: int64(limits.maxParts), Value: int64(partCount)})
+			}
+			if err := validatePartHeader(part.Header, limits); err != nil {
+				return newDICOMwebError(ErrorKindDecodeResponse, resp.URL, resp.StatusCode, err)
 			}
 			partContentType := part.Header.Get("Content-Type")
+			if _, _, err := validatePartMediaType(partContentType, policy, limits); err != nil {
+				return newDICOMwebError(ErrorKindDecodeResponse, resp.URL, resp.StatusCode, err)
+			}
+			limited := newResponsePartLimitReader(part, limits.maxPartBytes)
 			if err := handle(LocatedObjectPartStream{
 				Part: ObjectPartStream{
 					ContentType:       partContentType,
 					TransferSyntaxUID: transferSyntaxFromContentType(partContentType),
-					Reader:            part,
+					Reader:            limited,
 				},
 				ContentLocation: part.Header.Get("Content-Location"),
 			}); err != nil {
+				if responseDecodeFailure(err) {
+					return newDICOMwebError(ErrorKindDecodeResponse, resp.URL, resp.StatusCode, err)
+				}
 				return err
 			}
+			if _, err := io.Copy(io.Discard, limited); err != nil {
+				err = responsePartReadError(err)
+				if responseDecodeFailure(err) {
+					return newDICOMwebError(ErrorKindDecodeResponse, resp.URL, resp.StatusCode, err)
+				}
+				return err
+			}
+			_ = part.Close()
 		}
 	}
-	return handle(LocatedObjectPartStream{
+	limited := newResponsePartLimitReader(body, limits.maxPartBytes)
+	err = handle(LocatedObjectPartStream{
 		Part: ObjectPartStream{
 			ContentType:       contentType,
 			TransferSyntaxUID: transferSyntaxFromContentType(contentType),
-			Reader:            body,
+			Reader:            limited,
 		},
 		ContentLocation: resp.Header.Get("Content-Location"),
 	})
+	if err != nil {
+		if responseDecodeFailure(err) {
+			return newDICOMwebError(ErrorKindDecodeResponse, resp.URL, resp.StatusCode, err)
+		}
+		return err
+	}
+	if _, err := io.Copy(io.Discard, limited); err != nil {
+		err = responsePartReadError(err)
+		if responseDecodeFailure(err) {
+			return newDICOMwebError(ErrorKindDecodeResponse, resp.URL, resp.StatusCode, err)
+		}
+		return err
+	}
+	return nil
 }
 
 func retrieveAcceptHeader(opts RetrieveOptions) string {
@@ -473,7 +608,7 @@ func (c Client) StoreInstancesToStudy(ctx context.Context, studyInstanceUID stri
 func (c Client) storeInstancesAt(ctx context.Context, u *url.URL, instances []StoreInstance) (StoreResult, error) {
 	body, contentType, err := stowMultipartReader(instances)
 	if err != nil {
-		return StoreResult{Response: Response{URL: u.String()}}, err
+		return StoreResult{Response: Response{URL: SafeURL(u.String())}}, err
 	}
 	defer body.Close()
 	resp, err := c.doPOST(ctx, u, body, contentType)
@@ -486,7 +621,7 @@ func (c Client) storeInstancesAt(ctx context.Context, u *url.URL, instances []St
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 			return result, statusError(resp)
 		}
-		return result, &Error{Kind: ErrorKindDecodeResponse, URL: resp.URL, StatusCode: resp.StatusCode, Status: resp.Status, Err: parseErr}
+		return result, newDICOMwebError(ErrorKindDecodeResponse, resp.URL, resp.StatusCode, parseErr)
 	}
 	parsed.Response = resp
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
@@ -496,6 +631,9 @@ func (c Client) storeInstancesAt(ctx context.Context, u *url.URL, instances []St
 }
 
 func (c Client) doGET(ctx context.Context, u *url.URL, accept string) (Response, error) {
+	if _, err := responseLimits(c.Options); err != nil {
+		return Response{}, newDICOMwebError(ErrorKindRequestFailure, "", 0, err)
+	}
 	return c.doRequest(ctx, http.MethodGet, u, nil, "", accept)
 }
 
@@ -522,16 +660,11 @@ func (c Client) doRequest(ctx context.Context, method string, u *url.URL, body i
 	response := responseFromHTTP(u.String(), httpResp)
 	data, err := io.ReadAll(io.LimitReader(httpResp.Body, maxBodyBytes+1))
 	if err != nil {
-		return response, &Error{Kind: ErrorKindRequestFailure, URL: response.URL, StatusCode: response.StatusCode, Status: response.Status, Err: err}
+		return response, newDICOMwebError(ErrorKindRequestFailure, response.URL, response.StatusCode, err)
 	}
 	if int64(len(data)) > maxBodyBytes {
-		return response, &Error{
-			Kind:       ErrorKindRequestFailure,
-			URL:        response.URL,
-			StatusCode: response.StatusCode,
-			Status:     response.Status,
-			Err:        fmt.Errorf("response body exceeds %d bytes", maxBodyBytes),
-		}
+		return response, newDICOMwebError(ErrorKindRequestFailure, response.URL, response.StatusCode,
+			fmt.Errorf("response body exceeds %d bytes", maxBodyBytes))
 	}
 	response.Body = data
 	return response, nil
@@ -549,6 +682,14 @@ func (c Client) doHTTP(ctx context.Context, method string, u *url.URL, body io.R
 		reqCtx, cancel = context.WithTimeout(ctx, DefaultTimeout)
 	}
 
+	httpClient, err := c.httpClientForRequest(u)
+	if err != nil {
+		if cancel != nil {
+			cancel()
+		}
+		return nil, nil, &Error{Kind: ErrorKindInvalidEndpoint, Err: err}
+	}
+
 	req, token, sourceAuth, err := c.newHTTPRequest(reqCtx, method, u, body, contentType, accept)
 	if err != nil {
 		if cancel != nil {
@@ -557,10 +698,6 @@ func (c Client) doHTTP(ctx context.Context, method string, u *url.URL, body io.R
 		return nil, nil, err
 	}
 
-	httpClient := c.Options.HTTPClient
-	if httpClient == nil {
-		httpClient = http.DefaultClient
-	}
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		if cancel != nil {
@@ -585,7 +722,7 @@ func (c Client) doHTTP(ctx context.Context, method string, u *url.URL, body io.R
 					if cancel != nil {
 						cancel()
 					}
-					return nil, nil, &Error{Kind: ErrorKindRequestFailure, URL: u.String(), Err: bodyErr}
+					return nil, nil, newDICOMwebError(ErrorKindRequestFailure, u.String(), 0, bodyErr)
 				}
 			}
 			retry, _, _, requestErr := c.newHTTPRequest(reqCtx, method, u, retryBody, contentType, accept)
@@ -623,7 +760,7 @@ func (c Client) newHTTPRequest(
 	req, err := http.NewRequestWithContext(ctx, method, u.String(), body)
 	if err != nil {
 		return nil, AccessToken{}, false,
-			&Error{Kind: ErrorKindRequestFailure, URL: u.String(), Err: err}
+			newDICOMwebError(ErrorKindRequestFailure, u.String(), 0, err)
 	}
 	req.Header.Set("Accept", accept)
 	if contentType != "" {
@@ -655,9 +792,9 @@ func discardAndCloseResponse(resp *http.Response) {
 
 func responseFromHTTP(rawURL string, httpResp *http.Response) Response {
 	return Response{
-		URL:        rawURL,
+		URL:        SafeURL(rawURL),
 		StatusCode: httpResp.StatusCode,
-		Status:     httpResp.Status,
+		Status:     safeHTTPStatus(httpResp.StatusCode),
 		Header:     httpResp.Header.Clone(),
 	}
 }
@@ -677,13 +814,8 @@ func (r *responseBodyLimitReader) Read(p []byte) (int, error) {
 		var extra [1]byte
 		n, err := r.reader.Read(extra[:])
 		if n > 0 {
-			return 0, &Error{
-				Kind:       ErrorKindRequestFailure,
-				URL:        r.resp.URL,
-				StatusCode: r.resp.StatusCode,
-				Status:     r.resp.Status,
-				Err:        fmt.Errorf("response body exceeds %d bytes", r.limit),
-			}
+			return 0, newDICOMwebError(ErrorKindRequestFailure, r.resp.URL, r.resp.StatusCode,
+				fmt.Errorf("response body exceeds %d bytes", r.limit))
 		}
 		return 0, err
 	}
@@ -697,9 +829,9 @@ func (r *responseBodyLimitReader) Read(p []byte) (int, error) {
 
 func requestError(rawURL string, err error) error {
 	if isTimeout(err) {
-		return &Error{Kind: ErrorKindTimeout, URL: rawURL, Err: err}
+		return newDICOMwebError(ErrorKindTimeout, rawURL, 0, err)
 	}
-	return &Error{Kind: ErrorKindRequestFailure, URL: rawURL, Err: err}
+	return newDICOMwebError(ErrorKindRequestFailure, rawURL, 0, err)
 }
 
 func statusError(resp Response) error {
@@ -707,11 +839,7 @@ func statusError(resp Response) error {
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
 		kind = ErrorKindAuthStatus
 	}
-	status := resp.Status
-	if status == "" {
-		status = fmt.Sprintf("HTTP %d", resp.StatusCode)
-	}
-	return &Error{Kind: kind, URL: resp.URL, StatusCode: resp.StatusCode, Status: status}
+	return newDICOMwebError(kind, resp.URL, resp.StatusCode, nil)
 }
 
 func isTimeout(err error) bool {

@@ -70,38 +70,73 @@ func instanceRefsFromDatasets(datasets []Dataset, fallbackStudyUID, fallbackSeri
 }
 
 func objectPartsFromResponse(resp Response) ([]ObjectPart, error) {
-	contentType := strings.TrimSpace(resp.Header.Get("Content-Type"))
-	mediaType, params, err := mime.ParseMediaType(contentType)
+	parts, err := objectPartsFromResponseWithPolicy(resp, Options{}, dicomObjectResponsePolicy)
 	if err != nil {
-		mediaType = contentType
+		return nil, fmt.Errorf("%s returned an invalid DICOMweb response: %w", SafeURL(resp.URL), err)
 	}
-	if strings.HasPrefix(strings.ToLower(mediaType), "multipart/") {
+	return parts, nil
+}
+
+func objectPartsFromResponseWithPolicy(resp Response, options Options, policy responseMediaPolicy) ([]ObjectPart, error) {
+	limits, err := responseLimits(options)
+	if err != nil {
+		return nil, err
+	}
+	contentType, err := responseContentType(resp.Header.Values("Content-Type"))
+	if err != nil {
+		return nil, err
+	}
+	mediaType, params, err := validateOuterResponseMediaType(contentType, policy, limits)
+	if err != nil {
+		return nil, err
+	}
+	if mediaType == "multipart/related" {
 		boundary := params["boundary"]
-		if boundary == "" {
-			return nil, fmt.Errorf("%s returned multipart response without boundary", resp.URL)
-		}
-		reader := multipart.NewReader(bytes.NewReader(resp.Body), boundary)
+		body := newMultipartHeaderLimitReader(bytes.NewReader(resp.Body), boundary, limits.maxHeaderBytes)
+		reader := multipart.NewReader(body, boundary)
 		var parts []ObjectPart
 		for {
-			part, err := reader.NextPart()
+			part, err := reader.NextRawPart()
 			if errors.Is(err, io.EOF) {
 				break
 			}
 			if err != nil {
-				return nil, err
+				if body.Err() != nil {
+					return nil, body.Err()
+				}
+				return nil, multipartDecodeError(err)
 			}
-			data, err := io.ReadAll(part)
-			if err != nil {
+			if len(parts) >= limits.maxParts {
+				_ = part.Close()
+				return nil, &ResponseDecodeError{Kind: ResponseDecodePartLimit, Limit: int64(limits.maxParts), Value: int64(len(parts) + 1)}
+			}
+			if err := validatePartHeader(part.Header, limits); err != nil {
+				_ = part.Close()
 				return nil, err
 			}
 			partContentType := part.Header.Get("Content-Type")
+			if _, _, err := validatePartMediaType(partContentType, policy, limits); err != nil {
+				_ = part.Close()
+				return nil, err
+			}
+			data, err := readResponsePart(part, limits)
+			_ = part.Close()
+			if err != nil {
+				return nil, responsePartReadError(err)
+			}
 			parts = append(parts, ObjectPart{
 				ContentType:       partContentType,
 				TransferSyntaxUID: transferSyntaxFromContentType(partContentType),
 				Data:              data,
 			})
 		}
+		if len(parts) == 0 {
+			return nil, &ResponseDecodeError{Kind: ResponseDecodeMalformedMultipart}
+		}
 		return parts, nil
+	}
+	if int64(len(resp.Body)) > limits.maxPartBytes {
+		return nil, &ResponseDecodeError{Kind: ResponseDecodePartBytes, Limit: limits.maxPartBytes, Value: int64(len(resp.Body))}
 	}
 	return []ObjectPart{{
 		ContentType:       contentType,

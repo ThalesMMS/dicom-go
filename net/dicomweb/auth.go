@@ -296,11 +296,7 @@ func constantTimeTokenEqual(left, right string) bool {
 }
 
 func bearerTokenError(rawURL string, err error) error {
-	return &Error{
-		Kind: ErrorKindAuthToken,
-		URL:  rawURL,
-		Err:  sanitizedTokenError(err),
-	}
+	return newDICOMwebError(ErrorKindAuthToken, rawURL, 0, sanitizedTokenError(err))
 }
 
 func accessTokenFromSource(

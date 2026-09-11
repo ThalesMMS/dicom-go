@@ -175,9 +175,25 @@ func TestEndpointAllowsBlankServicePaths(t *testing.T) {
 	}
 }
 
+func TestEndpointRejectsURLUserinfoWithoutExposingIt(t *testing.T) {
+	const password = "must-not-appear"
+	endpoint := Endpoint{BaseURL: "http://embedded-user:" + password + "@pacs.example.test/dicom-web"}
+	_, err := endpoint.StudySearchURL(nil)
+	if err == nil {
+		t.Fatal("StudySearchURL() error = nil, want URL userinfo rejection")
+	}
+	var webErr *Error
+	if !errors.As(err, &webErr) || webErr.Kind != ErrorKindInvalidEndpoint {
+		t.Fatalf("StudySearchURL() error = %#v, want invalid endpoint", err)
+	}
+	if strings.Contains(err.Error(), password) || strings.Contains(err.Error(), "embedded-user") {
+		t.Fatalf("userinfo rejection exposed credentials: %v", err)
+	}
+}
+
 func TestSearchStudiesSendsDICOMJSONAcceptBasicAuthAndReturnsRawDatasets(t *testing.T) {
 	var sawAccept, sawAuth bool
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if got, want := r.URL.Path, "/dicom-web/qido/studies"; got != want {
 			t.Fatalf("path = %q, want %q", got, want)
 		}
@@ -229,7 +245,7 @@ func TestSearchStudiesSendsDICOMJSONAcceptBasicAuthAndReturnsRawDatasets(t *test
 
 func TestSearchSeriesSendsDICOMJSONAcceptBasicAuthAndReturnsRawDatasets(t *testing.T) {
 	var sawAccept, sawAuth bool
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if got, want := r.URL.Path, "/dicom-web/qido/studies/1.2.3/series"; got != want {
 			t.Fatalf("path = %q, want %q", got, want)
 		}
@@ -277,7 +293,7 @@ func TestSearchSeriesSendsDICOMJSONAcceptBasicAuthAndReturnsRawDatasets(t *testi
 
 func TestSearchInstancesSendsDICOMJSONAcceptBasicAuthAndReturnsRawDatasets(t *testing.T) {
 	var sawAccept, sawAuth bool
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if got, want := r.URL.Path, "/dicom-web/qido/studies/1.2.3/series/1.2.3.4/instances"; got != want {
 			t.Fatalf("path = %q, want %q", got, want)
 		}
@@ -981,6 +997,7 @@ func TestWADOHonorsMaxBodyBytes(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			client := verifyClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/dicom")
 				_, _ = w.Write([]byte("response-body-too-large"))
 			}), Endpoint{WADOPath: "wado"}, Options{MaxBodyBytes: 4})
 

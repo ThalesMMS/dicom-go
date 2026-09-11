@@ -9,9 +9,11 @@
 // authorization policy, jobs, archive import/export, and user-facing state.
 //
 // Server is deny-by-default: callers must provide an Authorizer or explicitly
-// set AllowUnauthenticated. It supplies bounded routing, DICOM JSON response
-// validation, multipart streaming, complete-request STOW staging, graceful
-// shutdown, and PHI-free audit events. Storage identity and duplicate policy
-// are atomic backend responsibilities. See docs/DICOMWEB_SERVER.md for the
-// implemented PS3.18 profile and intentional limitations.
+// set AllowUnauthenticated. It supplies bounded routing, DICOM JSON/XML response
+// validation, multipart streaming, injected rendered/thumbnail resources,
+// complete-request Part 10 or metadata-plus-bulk STOW staging, graceful
+// shutdown, and PHI-free audit events.
+// Storage identity, duplicate policy, and rendered resource lookup are backend
+// responsibilities. See docs/DICOMWEB_SERVER.md for the implemented PS3.18
+// profile and intentional limitations.
 package dicomweb

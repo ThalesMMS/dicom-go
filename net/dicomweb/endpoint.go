@@ -153,13 +153,22 @@ func (e Endpoint) serviceURL(servicePath string, parts []string, params url.Valu
 	}
 	u, err := url.Parse(rawBase)
 	if err != nil {
-		return nil, &Error{Kind: ErrorKindInvalidEndpoint, Err: err}
+		return nil, &Error{Kind: ErrorKindInvalidEndpoint, Err: fmt.Errorf("base URL is malformed")}
 	}
 	if u.Scheme != "http" && u.Scheme != "https" {
 		return nil, &Error{Kind: ErrorKindInvalidEndpoint, Err: fmt.Errorf("base URL must use http or https")}
 	}
 	if u.Host == "" {
 		return nil, &Error{Kind: ErrorKindInvalidEndpoint, Err: fmt.Errorf("base URL must include a host")}
+	}
+	if u.User != nil {
+		return nil, &Error{Kind: ErrorKindInvalidEndpoint, Err: fmt.Errorf("base URL must not include user information")}
+	}
+	if u.RawQuery != "" || u.ForceQuery {
+		return nil, &Error{Kind: ErrorKindInvalidEndpoint, Err: fmt.Errorf("base URL must not include a query")}
+	}
+	if u.Fragment != "" || u.RawFragment != "" {
+		return nil, &Error{Kind: ErrorKindInvalidEndpoint, Err: fmt.Errorf("base URL must not include a fragment")}
 	}
 	u.Path = joinURLPath(u.Path, servicePath, escapedResource(parts...))
 	u.RawQuery = params.Encode()

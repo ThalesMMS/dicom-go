@@ -15,6 +15,16 @@ const (
 	DefaultTimeout = 20 * time.Second
 	// DefaultMaxBodyBytes bounds response bodies when Options.MaxBodyBytes is unset.
 	DefaultMaxBodyBytes = int64(512 << 20)
+	// DefaultMaxResponseParts bounds one WADO-RS multipart response.
+	DefaultMaxResponseParts = 100_000
+	// DefaultMaxPartBytes is the effective part ceiling when both the part and
+	// whole-response limits are unset. A zero part limit otherwise inherits the
+	// configured whole-response ceiling.
+	DefaultMaxPartBytes = DefaultMaxBodyBytes
+	// DefaultMaxPartHeaderBytes bounds raw MIME headers for one response part.
+	DefaultMaxPartHeaderBytes = 64 << 10
+	// DefaultMaxMultipartDepth accepts the single multipart/related layer used by WADO-RS.
+	DefaultMaxMultipartDepth = 1
 )
 
 // Endpoint describes a DICOMweb base URL and optional service-specific paths.
@@ -27,9 +37,25 @@ type Endpoint struct {
 
 // Options configures HTTP transport, timeouts, response limits, and auth.
 type Options struct {
-	HTTPClient    *http.Client `json:"-"`
-	Timeout       time.Duration
-	MaxBodyBytes  int64
+	HTTPClient   *http.Client `json:"-"`
+	Timeout      time.Duration
+	MaxBodyBytes int64
+	// ResponseLimits bounds WADO-RS response structure. Zero fields select
+	// finite defaults.
+	ResponseLimits ResponseLimits
+	// MetadataMediaTypes selects the ordered QIDO-RS and WADO-RS metadata
+	// representations advertised by the client. Empty preserves the historical
+	// DICOM JSON-only behavior. DICOM XML responses use multipart/related as
+	// required by PS3.18.
+	MetadataMediaTypes []MetadataMediaType
+	// MaxMetadataParts bounds multipart DICOM XML response parts. Zero uses a
+	// finite default.
+	MaxMetadataParts int
+	// BasicUsername and BasicPassword are sent only over certificate-verified
+	// HTTPS. Basic authentication rejects plaintext endpoints, skip-verify TLS,
+	// opaque RoundTrippers, custom TLS dialers, and redirects away from the
+	// original HTTPS origin. Custom roots and client certificates remain
+	// supported through a standard *http.Transport.
 	BasicUsername string `json:"-"`
 	BasicPassword string `json:"-"`
 	BearerToken   string `json:"-"`
@@ -38,17 +64,45 @@ type Options struct {
 	BearerTokenSource BearerTokenSource `json:"-"`
 }
 
+// MetadataMediaType identifies a supported QIDO-RS or WADO-RS metadata
+// representation. DICOMXML is carried in multipart/related responses while
+// DICOMJSON is carried as one JSON array.
+type MetadataMediaType string
+
+const (
+	MetadataMediaTypeDICOMJSON MetadataMediaType = "application/dicom+json"
+	MetadataMediaTypeDICOMXML  MetadataMediaType = "application/dicom+xml"
+)
+
 // String reports configuration shape without exposing credentials.
 func (o Options) String() string {
 	return fmt.Sprintf(
-		"DICOMweb options (custom_http_client=%t, timeout=%s, max_body_bytes=%d, basic_auth=%t, static_bearer=%t, dynamic_bearer=%t)",
+		"DICOMweb options (custom_http_client=%t, timeout=%s, max_body_bytes=%d, max_response_parts=%d, max_part_bytes=%d, max_part_header_bytes=%d, max_multipart_depth=%d, allowed_wado_media_types=%d, metadata_media_types=%d, max_metadata_parts=%d, basic_auth=%t, static_bearer=%t, dynamic_bearer=%t)",
 		o.HTTPClient != nil,
 		o.Timeout,
 		o.MaxBodyBytes,
+		o.ResponseLimits.MaxParts,
+		o.ResponseLimits.MaxPartBytes,
+		o.ResponseLimits.MaxPartHeaderBytes,
+		o.ResponseLimits.MaxMultipartDepth,
+		len(o.ResponseLimits.AllowedMediaTypes),
+		len(o.MetadataMediaTypes),
+		o.MaxMetadataParts,
 		strings.TrimSpace(o.BasicUsername) != "",
 		strings.TrimSpace(o.BearerToken) != "",
 		o.BearerTokenSource != nil,
 	)
+}
+
+// ResponseLimits bounds client-side WADO-RS MIME parsing. AllowedMediaTypes
+// optionally narrows the standard operation-specific part media types; it
+// cannot enable a representation incompatible with the requested resource.
+type ResponseLimits struct {
+	MaxParts           int
+	MaxPartBytes       int64
+	MaxPartHeaderBytes int
+	MaxMultipartDepth  int
+	AllowedMediaTypes  []string
 }
 
 // GoString redacts credentials from %#v formatting and crash diagnostics.
@@ -188,36 +242,37 @@ func (e *Error) Error() string {
 	if e == nil {
 		return "DICOMweb error"
 	}
-	target := strings.TrimSpace(e.URL)
-	if target == "" {
-		target = "endpoint"
-	}
+	target := SafeURL(e.URL)
+	status := safeHTTPStatus(e.StatusCode)
 	switch e.Kind {
 	case ErrorKindHTTPStatus, ErrorKindAuthStatus:
-		if e.Status != "" {
-			return fmt.Sprintf("DICOMweb %s returned %s", target, e.Status)
+		if status != "" {
+			return fmt.Sprintf("DICOMweb %s returned %s", target, status)
 		}
-		return fmt.Sprintf("DICOMweb %s returned HTTP %d", target, e.StatusCode)
+		return fmt.Sprintf("DICOMweb %s returned an HTTP error", target)
 	case ErrorKindAuthToken:
 		return fmt.Sprintf("DICOMweb authentication for %s could not obtain a bearer token", target)
 	case ErrorKindTimeout:
 		return fmt.Sprintf("DICOMweb %s timed out", target)
 	case ErrorKindInvalidEndpoint:
-		if e.Err != nil {
-			return fmt.Sprintf("invalid DICOMweb endpoint: %v", e.Err)
-		}
 		return "invalid DICOMweb endpoint"
 	case ErrorKindDecodeResponse:
-		if e.Err != nil {
-			return fmt.Sprintf("decode DICOMweb response from %s: %v", target, e.Err)
-		}
 		return fmt.Sprintf("decode DICOMweb response from %s", target)
 	default:
-		if e.Err != nil {
-			return fmt.Sprintf("DICOMweb request to %s failed: %v", target, e.Err)
+		if status != "" {
+			return fmt.Sprintf("DICOMweb request to %s failed after %s", target, status)
 		}
 		return fmt.Sprintf("DICOMweb request to %s failed", target)
 	}
+}
+
+// GoString prevents diagnostic formatting from bypassing Error's redaction.
+func (e *Error) GoString() string {
+	if e == nil {
+		return "DICOMweb error"
+	}
+	return fmt.Sprintf("DICOMweb error (kind=%q, url=%q, status_code=%d, status=%q)",
+		e.Kind, SafeURL(e.URL), e.StatusCode, safeHTTPStatus(e.StatusCode))
 }
 
 // Unwrap returns the underlying error.

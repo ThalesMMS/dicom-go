@@ -222,6 +222,19 @@ type Report struct {
 	RecognizableVisualFeatures RecognizableVisualFeaturesReport
 }
 
+// AssessVisualPHIRisk returns the metadata-only burned-in annotation and
+// recognizable-feature assessment without mutating obj. The report contains
+// only normalized YES/NO/OTHER outcomes and never echoes malformed values.
+func AssessVisualPHIRisk(obj *object.Object) Report {
+	if obj == nil {
+		return Report{}
+	}
+	return Report{
+		BurnedInPixel:              assessBurnedInPixel(obj),
+		RecognizableVisualFeatures: assessRecognizableVisualFeatures(obj),
+	}
+}
+
 // BurnedInPixelRisk is the library's metadata-only assessment of possible
 // burned-in pixel PHI.
 type BurnedInPixelRisk int

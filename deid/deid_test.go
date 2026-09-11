@@ -642,6 +642,30 @@ func TestAnonymizeObjectWithReportReportsBurnedInAnnotationWithoutModifyingPixel
 	}
 }
 
+func TestAssessVisualPHIRiskIsReadOnlyAndRedactsMalformedValues(t *testing.T) {
+	const secret = "SECRET^PATIENT"
+	obj := object.FromElements([]core.Element{
+		core.NewRawElement(testTagBurnedIn, core.VRCS, []byte("YES")),
+		core.NewRawElement(tagRecognizableVisualFeatures, core.VRCS, []byte(secret)),
+	}, std.Dictionary)
+	report := AssessVisualPHIRisk(obj)
+	if report.BurnedInPixel.Risk != BurnedInPixelRiskPresent {
+		t.Fatalf("burned-in risk = %v, want present", report.BurnedInPixel.Risk)
+	}
+	if report.RecognizableVisualFeatures.Risk != BurnedInPixelRiskUnknown || report.RecognizableVisualFeatures.MetadataValue != "OTHER" {
+		t.Fatalf("recognizable report = %#v, want unknown/OTHER", report.RecognizableVisualFeatures)
+	}
+	if strings.Contains(fmt.Sprintf("%#v", report), secret) {
+		t.Fatalf("report leaked malformed source value: %#v", report)
+	}
+	if value, _ := obj.GetString(tagRecognizableVisualFeatures); strings.TrimSpace(value) != secret {
+		t.Fatal("assessment mutated source")
+	}
+	if nilReport := AssessVisualPHIRisk(nil); nilReport.BurnedInPixel.Risk != BurnedInPixelRiskUnknown {
+		t.Fatalf("nil report = %#v", nilReport)
+	}
+}
+
 func TestAnonymizeObjectWithReportRedactsMalformedBurnedInMetadata(t *testing.T) {
 	// Given: malformed metadata may itself contain arbitrary sensitive text.
 	const sensitiveMetadata = "PATIENT_SECRET"

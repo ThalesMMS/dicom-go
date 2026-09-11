@@ -1,0 +1,3 @@
+# Explicit independent DIMSE profile; never installed by make check.
+-r requirements-pydicom-interop.txt
+pynetdicom==3.0.4

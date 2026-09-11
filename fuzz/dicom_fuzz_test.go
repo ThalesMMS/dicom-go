@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/flate"
 	"encoding/binary"
+	"io"
 	"testing"
 
 	dicom "github.com/ThalesMMS/dicom-go"
@@ -46,7 +47,13 @@ func FuzzDICOMParse(f *testing.F) {
 			fuzzTransferSyntaxRecoveryOptions(),
 		)
 		for _, syntax := range fuzzTransferSyntaxes() {
-			_, _ = object.ReadDataSetWithOptions(bytes.NewReader(data), syntax, fuzzReadFileOptions())
+			obj, err := object.ReadDataSetWithOptions(bytes.NewReader(data), syntax, fuzzReadFileOptions())
+			if err == nil {
+				// Exercise lazy charset interpretation and writing, not only parser
+				// construction. Unsupported opaque sequence output may return an error.
+				_, _ = obj.CharacterSet()
+				_ = object.WriteDataSet(io.Discard, obj, syntax)
+			}
 			_, _ = parser.NewReader(bytes.NewReader(data), syntax, fuzzReaderOptions()).ReadDataSet()
 		}
 	})
@@ -97,6 +104,7 @@ func dicomFuzzSeeds() [][]byte {
 		mustPart10(transfer.EncapsulatedUncompressedExplicitVRLittleEndian, encapsulated...),
 	)
 	seeds = append(seeds, malformedParserSeeds()...)
+	seeds = append(seeds, dicomtest.UpstreamParserRegressionSeeds()...)
 	return seeds
 }
 

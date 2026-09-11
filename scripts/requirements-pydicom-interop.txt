@@ -1,0 +1,6 @@
+# Independent toolkit used by the opt-in Part 10 interoperability matrix.
+pydicom==3.0.2
+
+# Required by pydicom's native and RLE pixel-array checks. Keep it pinned with
+# the toolkit environment so pixel semantics cannot drift between gate runs.
+numpy==2.1.3

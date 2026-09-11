@@ -1,0 +1,3 @@
+# Optional independent C-STORE/JPEG receive-and-decode gate.
+-r requirements-pynetdicom-interop.txt
+Pillow==12.3.0

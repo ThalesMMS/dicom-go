@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Structural fixture adapted from the Native DICOM Model example in
+     DICOM PS3.18 F.2.1.1.1 (2026c). It contains no patient data. -->
+<NativeDicomModel xmlns="http://dicom.nema.org/PS3.19/models/NativeDICOM" xml:space="preserve">
+  <DicomAttribute tag="0020000D" vr="UI" keyword="StudyInstanceUID">
+    <Value number="1">1.2.840.10008.1.2.3.4</Value>
+  </DicomAttribute>
+</NativeDicomModel>

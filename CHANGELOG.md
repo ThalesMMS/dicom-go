@@ -70,6 +70,14 @@ and this project uses Go module semantic version tags.
 
 ### Changed
 
+- `parser`: deferred-value locations are appended without a deduplication hash
+  during the initial ordered parse; the index is built lazily on explicit
+  rewind and retained across later generations without changing location order,
+  ambiguity, replay, or caller-ownership behavior.
+- DICOM UID syntax validation is shared by the generic validator, clinical
+  relationship resolver, DICOMweb server, DICOMDIR, UPS and DIMSE storage
+  planning. Canonical UIDs now consistently enforce OID root and second-arc
+  constraints while each API retains its existing error or status contract.
 - `net/dicomweb`: `Client.InstanceMetadata` now returns the raw DICOM JSON
   metadata datasets for one instance; callers that need an `InstanceRef` must
   obtain it from the returned dataset rather than receiving a projected value.

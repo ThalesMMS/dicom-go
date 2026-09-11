@@ -1,3 +1,6 @@
 .DS_Store
-docs/
-AGENTS.md
+
+# go test -c outputs; keep arbitrary executables and fixtures visible.
+*.test
+*.test.exe
+!**/testdata/**

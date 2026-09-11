@@ -14,7 +14,10 @@ make build
 make check
 ```
 
-`make check` is the default pre-PR workflow and runs formatting, vet, and tests in sequence.
+`make check` is the default pre-PR workflow and runs formatting, vet, tests,
+builds, offline documentation validation, and codec policy checks.
+See the [documentation validation guide](docs/DOCUMENTATION_VALIDATION.md) for
+the checked corpus, explicit exemptions, and safe command policy.
 
 ## Formatting requirements
 
@@ -44,7 +47,8 @@ make check
 
 ## Pull requests
 
-- Follow [.github/pull_request_template.md](.github/pull_request_template.md) as the canonical pull request template. Include a brief summary of the change and link the relevant issue.
+- Include a brief summary of the change, its validation, and a link to the
+  relevant issue in the pull request description.
 - Complete the interface-governance checklist whenever a change affects contracts, fingerprints, checkpoints, or exported summaries.
 - Document any intentional design decisions or divergences from the DICOM standard in the pull request description.
 - Avoid introducing new DICOM functionality in infra-only issues.

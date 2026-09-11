@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -63,7 +64,10 @@ func TestCodecFullManifestDeclaresDirectionalCapabilities(t *testing.T) {
 	manifest := CodecFullManifest()
 	for _, capability := range manifest.Capabilities {
 		wantDirections := []CodecDirection{DirectionDecode}
-		if capability.ID == "rle-lossless" || capability.ID == "encapsulated-uncompressed" {
+		if capability.ID == "jpeg-2000-lossless-encode" {
+			wantDirections = []CodecDirection{DirectionEncode}
+		}
+		if capability.ID == "jpeg-baseline" || capability.ID == "rle-lossless" || capability.ID == "encapsulated-uncompressed" || capability.ID == "jpeg-ls-lossless" || capability.ID == "jpeg-ls" {
 			wantDirections = []CodecDirection{DirectionDecode, DirectionEncode}
 		}
 		if !reflect.DeepEqual(capability.Directions, wantDirections) {
@@ -110,15 +114,68 @@ func TestCodecFullManifestDeclaresDirectionalCapabilities(t *testing.T) {
 	}
 }
 
+func TestCodecFullManifestDistinguishesJPEGBaselineAndExtendedPrecision(t *testing.T) {
+	manifest := CodecFullManifest()
+	baseline := capabilityByID(t, manifest, "jpeg-baseline")
+	extended := capabilityByID(t, manifest, "jpeg-extended")
+
+	for _, want := range []string{"Process 1 SOF0", "8-bit unsigned grayscale", "8-bit unsigned color"} {
+		if !slices.Contains(baseline.Coverage, want) {
+			t.Errorf("JPEG Baseline coverage = %#v, want %q", baseline.Coverage, want)
+		}
+	}
+	for _, want := range []string{
+		"Process 2 SOF1 8-bit unsigned grayscale and color",
+		"Process 4 SOF1 12-bit unsigned monochrome",
+		"BitsAllocated=16, BitsStored=12, HighBit=11",
+		"MONOCHROME1 and MONOCHROME2",
+	} {
+		if !slices.Contains(extended.Coverage, want) {
+			t.Errorf("JPEG Extended coverage = %#v, want %q", extended.Coverage, want)
+		}
+	}
+	if slices.Contains(extended.Directions, DirectionEncode) {
+		t.Fatalf("JPEG Extended directions = %#v, encode must remain unsupported", extended.Directions)
+	}
+}
+
+func TestCodecFullManifestDeclaresJPEGLosslessMulticomponentSubset(t *testing.T) {
+	capability := capabilityByID(t, CodecFullManifest(), "jpeg-lossless")
+	for _, want := range []string{
+		"Process 14 SOF3",
+		"8-bit and 16-bit unsigned three-component RGB and YBR_FULL with 1x1 sampling",
+		"SOF3 precision 2-16 equals BitsStored with HighBit=BitsStored-1; one-bit samples are unsupported",
+		"one interleaved three-component scan or three single-component scans in arbitrary component order",
+		"predictors 1-7 and point transforms 0 through precision-1 per scan",
+		"Process 14 SV1 requires predictor 1 in every scan",
+		"color output is interleaved and requires PlanarConfiguration=0",
+		"shared bounded JPEG Item assembly with BOT, one-Item EOT and unambiguous empty-table boundaries",
+	} {
+		if !slices.Contains(capability.Coverage, want) {
+			t.Errorf("JPEG Lossless coverage = %#v, want %q", capability.Coverage, want)
+		}
+	}
+	if slices.Contains(capability.Directions, DirectionEncode) {
+		t.Fatalf("JPEG Lossless directions = %#v, encode must remain unsupported", capability.Directions)
+	}
+}
+
 func TestManifestLegacyJSONWithoutDirectionsDefaultsToDecode(t *testing.T) {
 	manifest := CodecFullManifest()
-	for capabilityIndex := range manifest.Capabilities {
-		capability := &manifest.Capabilities[capabilityIndex]
+	filtered := manifest.Capabilities[:0]
+	for _, capability := range manifest.Capabilities {
+		capability := capability
+		encodeOnly := len(capability.Directions) == 1 && capability.Directions[0] == DirectionEncode
+		if encodeOnly {
+			continue
+		}
 		capability.Directions = nil
 		for evidenceIndex := range capability.Evidence {
 			capability.Evidence[evidenceIndex].Direction = ""
 		}
+		filtered = append(filtered, capability)
 	}
+	manifest.Capabilities = filtered
 	if err := manifest.Validate(); err != nil {
 		t.Fatalf("legacy direction-less manifest is invalid: %v", err)
 	}
@@ -140,13 +197,13 @@ func TestManifestLegacyJSONWithoutDirectionsDefaultsToDecode(t *testing.T) {
 
 func TestManifestValidationAllowsTransferSyntaxAcrossDisjointDirections(t *testing.T) {
 	manifest := CodecFullManifest()
-	jpegBaseline := capabilityByID(t, manifest, "jpeg-baseline")
+	jpegExtended := capabilityByID(t, manifest, "jpeg-extended")
 	manifest.Capabilities = append(manifest.Capabilities, Capability{
-		ID:               "jpeg-baseline-encode-test",
-		Family:           jpegBaseline.Family,
+		ID:               "jpeg-extended-encode-test",
+		Family:           jpegExtended.Family,
 		Status:           StatusValidated,
 		Directions:       []CodecDirection{DirectionEncode},
-		TransferSyntaxes: append([]TransferSyntax(nil), jpegBaseline.TransferSyntaxes...),
+		TransferSyntaxes: append([]TransferSyntax(nil), jpegExtended.TransferSyntaxes...),
 		Implementations:  []string{"test-only encoder capability"},
 		Coverage:         []string{"direction-aware manifest validation"},
 		Evidence: []Evidence{{
@@ -200,7 +257,7 @@ func TestManifestValidationRejectsInvalidDirectionContracts(t *testing.T) {
 		{
 			name: "evidence direction not declared",
 			mutate: func(manifest *ProfileManifest) {
-				capabilityByID(t, *manifest, "jpeg-baseline").Evidence[0].Direction = DirectionEncode
+				capabilityByID(t, *manifest, "jpeg-extended").Evidence[0].Direction = DirectionEncode
 			},
 			wantErr: "evidence direction",
 		},

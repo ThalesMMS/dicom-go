@@ -142,11 +142,11 @@ func CodecFullManifest() ProfileManifest {
 			},
 			{
 				ID:               "jpeg-baseline",
-				Family:           "JPEG Baseline",
+				Family:           "JPEG Baseline Process 1",
 				Status:           StatusProvisional,
 				TransferSyntaxes: syntaxes(transfer.JPEGBaseline),
 				Implementations:  []string{"Go standard-library JPEG decoder through dicom-go"},
-				Coverage:         []string{"8-bit grayscale", "8-bit color", "YBR metadata normalization"},
+				Coverage:         []string{"Process 1 SOF0", "8-bit unsigned grayscale", "8-bit unsigned color", "YBR metadata normalization"},
 				Evidence: []Evidence{toleranceEvidence(
 					"pixeldata/decompress_test.go",
 					32,
@@ -159,16 +159,33 @@ func CodecFullManifest() ProfileManifest {
 			},
 			{
 				ID:               "jpeg-extended",
-				Family:           "JPEG Extended",
+				Family:           "JPEG Extended Process 2/4",
 				Status:           StatusProvisional,
 				TransferSyntaxes: syntaxes(transfer.JPEGExtended),
-				Implementations:  []string{"dicom-go JPEG adapter"},
-				Coverage:         []string{"8-bit grayscale", "lossy absolute-error tolerance", "malformed input"},
+				Implementations: []string{
+					"Go standard-library JPEG decoder for Process 2 SOF1 8-bit",
+					"dicom-go pure-Go JPEG decoder for Process 4 SOF1 12-bit monochrome",
+				},
+				Coverage: []string{
+					"Process 2 SOF1 8-bit unsigned grayscale and color",
+					"Process 4 SOF1 12-bit unsigned monochrome",
+					"BitsAllocated=16, BitsStored=12, HighBit=11",
+					"MONOCHROME1 and MONOCHROME2",
+					"lossy absolute-error tolerance",
+					"typed malformed-stream and unsupported-metadata errors",
+				},
 				Evidence: []Evidence{toleranceEvidence(
 					"pixeldata/codecfixture/case_test.go",
 					32,
 					"Go standard-library JPEG encoder/decoder",
 					"TestCodecConformanceBaseline",
+				), toleranceEvidence(
+					"pixeldata/jpeg/jpeg_extended_conformance_test.go",
+					8,
+					"libjpeg-turbo 3.1.0 cjpeg/djpeg",
+					"TestJPEGExtendedProcess4IndependentFixture",
+					"TestJPEGExtendedProcess4RejectsMalformedHeaders",
+					"TestJPEGExtendedProcess4RejectsNonConformantDICOMMetadata",
 				)},
 				Blockers: []string{
 					"cross-check redistribution-safe Process 2/4 clinical fixtures against an independent decoder",
@@ -183,15 +200,39 @@ func CodecFullManifest() ProfileManifest {
 					transfer.JPEGLosslessSV1,
 				),
 				Implementations: []string{"dicom-go pure-Go JPEG Lossless decoder"},
-				Coverage:        []string{"Process 14", "SV1 predictor", "8-bit and 16-bit grayscale", "typed malformed-stream errors"},
-				Evidence: []Evidence{exactEvidence(
-					"pixeldata/jpeglossless/jpeglossless_test.go",
-					"deterministic in-tree encoder vectors",
-					"TestJPEGLosslessRoundTrip",
-					"TestJPEGLosslessRegisters",
-				)},
+				Coverage: []string{
+					"Process 14 SOF3",
+					"8-bit and 16-bit grayscale",
+					"8-bit and 16-bit unsigned three-component RGB and YBR_FULL with 1x1 sampling",
+					"SOF3 precision 2-16 equals BitsStored with HighBit=BitsStored-1; one-bit samples are unsupported",
+					"one interleaved three-component scan or three single-component scans in arbitrary component order",
+					"predictors 1-7 and point transforms 0 through precision-1 per scan",
+					"Process 14 SV1 requires predictor 1 in every scan",
+					"color output is interleaved and requires PlanarConfiguration=0",
+					"shared bounded JPEG Item assembly with BOT, one-Item EOT and unambiguous empty-table boundaries",
+					"typed component, sampling, metadata, and malformed-stream errors",
+				},
+				Evidence: []Evidence{
+					exactEvidence(
+						"pixeldata/jpeglossless/jpeglossless_test.go",
+						"deterministic in-tree encoder vectors",
+						"TestJPEGLosslessRoundTrip",
+						"TestJPEGLosslessRegisters",
+					),
+					exactEvidence(
+						"pixeldata/jpeglossless/multicomponent_conformance_test.go",
+						"libjpeg-turbo 3.1.0 cjpeg/djpeg independent exact RGB reference",
+						"TestJPEGLosslessMulticomponentIndependentFixtures",
+					),
+					exactEvidence(
+						"pixeldata/jpeglossless/core_multicomponent_test.go",
+						"deterministic in-tree SOF3/SOS marker vectors",
+						"TestJPEGLosslessMulticomponentInterleavedScan",
+						"TestJPEGLosslessMulticomponentSeparateScansMapIDsAndTransforms",
+					),
+				},
 				Blockers: []string{
-					"cross-check independently encoded Process 14 and SV1 clinical fixtures",
+					"add redistribution-safe representative clinical Process 14 and SV1 fixtures",
 				},
 			},
 			{
@@ -213,15 +254,12 @@ func CodecFullManifest() ProfileManifest {
 				},
 			},
 			{
-				ID:     "jpeg-ls",
-				Family: "JPEG-LS",
-				Status: StatusProvisional,
-				TransferSyntaxes: syntaxes(
-					transfer.JPEGLSLossless,
-					transfer.JPEGLSNearLossless,
-				),
-				BuildTags:       []string{"jpegls_charls"},
-				Implementations: []string{"CharLS dynamic runtime adapter"},
+				ID:               "jpeg-ls",
+				Family:           "JPEG-LS",
+				Status:           StatusProvisional,
+				TransferSyntaxes: syntaxes(transfer.JPEGLSNearLossless),
+				BuildTags:        []string{"jpegls_charls"},
+				Implementations:  []string{"CharLS dynamic runtime adapter selected by codecfull", "base alternative: dicom-go pure-Go unsigned JPEG-LS Near-Lossless decoder", "explicit pure-Go unsigned ILV=0 Near-Lossless encoder with caller-selected error and lossy authorization"},
 				Dependencies: []Dependency{
 					{
 						Name:        "github.com/ebitengine/purego",
@@ -241,14 +279,27 @@ func CodecFullManifest() ProfileManifest {
 						OverrideEnv: "DICOM_GO_CHARLS_LIBRARY",
 					},
 				},
-				Coverage: []string{"lossless 8-bit and 16-bit grayscale", "near-lossless", "metadata mismatch", "dependency unavailable"},
+				Coverage: []string{"near-lossless", "shared bounded JPEG-LS Item assembly", "metadata mismatch", "dependency unavailable", "base pure-Go decode: unsigned MONOCHROME1/2 ILV=0 and RGB ILV=0/1/2, 2-16 stored bits, full precision MAXVAL", "explicit base encode: unsigned MONOCHROME1/2 and RGB ILV=0, positive NEAR, preserved loss history and derived identity; no signed, palette, YBR or implicit fallback"},
 				Evidence: []Evidence{
-					exactEvidence(
-						"examples/codec-adapters/jpegls/charls_dynamic_test.go",
-						"CharLS reference implementation",
-						"TestCharLSDecoderConformanceLossless8Bit",
-						"TestCharLSDecoderConformanceLossless16Bit",
-					),
+					directionalExactEvidence(DirectionEncode,
+						"pixeldata/jpegls/near_encoder_oracle_test.go",
+						"216 qualified pure-Go streams; exact full CharLS 2.4.2 reconstruction plus separate normative source NEAR bounds for all 1839024 samples",
+						"TestNearEncoderMatchesIndependentCharLSCorpus"),
+					directionalExactEvidence(DirectionEncode,
+						"examples/codec-adapters/jpegls/near_encoder_interop_test.go",
+						"pinned CharLS 2.4.2 independently decodes actual transcoder output; 108 unsigned ILV=0 profiles, 216 frames, every stored sample within explicit NEAR",
+						"TestCharLSDecodesPureGoNearLosslessEncoderFullSamples"),
+					directionalExactEvidence(DirectionDecode,
+						"pixeldata/jpegls/near_lossless_test.go",
+						"116 synthetic CharLS 2.4.2 exact reconstructions and independent source NEAR bounds; two prior full-frame oracles",
+						"TestNearLosslessExistingIndependentReconstructions",
+						"TestNearLosslessCharLSFullSamplesAndSourceBounds",
+						"TestNearLosslessRejectsInvalidProfilesAndParameters",
+						"TestNearLosslessLifecycleAndRegistration"),
+					directionalExactEvidence(DirectionDecode,
+						"pixeldata/codecfixture/jpegls_interleave_test.go",
+						"full CharLS reconstructions through the public builtin registry and DICOM fragments",
+						"TestJPEGLSNearLosslessCorpusFullReconstruction"),
 					toleranceEvidence(
 						"examples/codec-adapters/jpegls/charls_dynamic_test.go",
 						1,
@@ -259,6 +310,97 @@ func CodecFullManifest() ProfileManifest {
 				Blockers: []string{
 					"add independently sourced, redistribution-safe DICOM fixtures across modalities and color spaces",
 					"record representative percentile latency and peak-memory evidence",
+				},
+			},
+			{
+				ID:               "jpeg-ls-lossless",
+				Family:           "JPEG-LS",
+				Status:           StatusValidated,
+				TransferSyntaxes: syntaxes(transfer.JPEGLSLossless),
+				Implementations:  []string{"dicom-go pure-Go JPEG-LS lossless decoder and encoder"},
+				Coverage: []string{
+					"NEAR=0 and ILV=0 decode and encode",
+					"ILV=1/2 decode for unsigned RGB, 2-16 stored bits, PlanarConfiguration=0, MAXVAL=2^precision-1",
+					"LSE preset coding parameters ID=1",
+					"8-bit and 16-bit monochrome including 12 stored bits",
+					"unsigned palette and interleaved RGB",
+					"multi-frame",
+					"single and multiple DICOM fragments with bounded frame assembly",
+					"typed capability errors for Near-Lossless and unsupported metadata",
+				},
+				Evidence: []Evidence{
+					directionalExactEvidence(
+						DirectionDecode,
+						"pixeldata/jpegls/interop_test.go",
+						"independent GDCM/CharLS codestreams paired with pydicom native references",
+						"TestDecoderMatchesIndependentPydicomReferences",
+					),
+					directionalExactEvidence(
+						DirectionDecode,
+						"pixeldata/jpegls/interleave_test.go",
+						"57 synthetic CharLS 2.4.2 streams with complete native reconstructions",
+						"TestCharLSInterleaveFullSamples",
+						"TestInterleaveRejectsHeadersAndIncompleteFrames",
+						"TestInterleaveComponentIDsAndDefaultLSE",
+						"TestInterleaveMetadataCancellationAndConcurrency",
+						"TestGolombKDoesNotOverflowInt",
+					),
+					directionalExactEvidence(
+						DirectionDecode,
+						"pixeldata/codecfixture/jpegls_interleave_test.go",
+						"CharLS 2.4.2 full-sample corpus through builtin registration and fragmented DICOM frame assembly",
+						"TestJPEGLSInterleaveCorpusFullReconstruction",
+					),
+					directionalExactEvidence(
+						DirectionEncode,
+						"pixeldata/jpegls/interleave_test.go",
+						"exact equality with independent CharLS 2.4.2 ILV=0 entropy for all default corpus profiles",
+						"TestCharLSInterleaveFullSamples",
+					),
+					directionalExactEvidence(
+						DirectionDecode,
+						"pixeldata/jpegls/decoder_strict_test.go",
+						"CharLS conformance vector and deterministic malformed codestreams",
+						"TestDecoderMatchesCharLSLosslessVector",
+						"TestDecoderAcceptsLSEID1AndApplicationSegments",
+						"TestDecoderRejectsMalformedLSE",
+						"TestDecoderRejectsMalformedSOF55AndSOS",
+						"TestDecoderAssociatesScansByComponentID",
+						"TestDecoderRejectsTrailingEntropyData",
+						"TestDecoderHonorsCancellationInsideFrame",
+						"TestDecoderRejectsRequestExceedingTotalWorkingSet",
+						"TestDecoderIsSafeForConcurrentUse",
+					),
+					directionalExactEvidence(
+						DirectionDecode,
+						"pixeldata/encapsulated/offsets_test.go",
+						"DICOM Basic/Extended Offset Tables and JPEG-LS SOI/EOI boundaries",
+						"TestAssembleFrameCodestreamsUsesBasicOffsetTable",
+						"TestAssembleFrameCodestreamsInfersEmptyBOTFrameBoundariesFromEOI",
+						"TestAssembleFrameCodestreamsUsesExtendedOffsetTable",
+						"TestAssembleFrameCodestreamsEnforcesLimits",
+					),
+					directionalExactEvidence(
+						DirectionEncode,
+						"pixeldata/jpegls/encoder_test.go",
+						"dicom-go pure-Go JPEG-LS lossless decoder",
+						"TestEncoderRegistersOnlyLosslessUID",
+						"TestEncoderRoundTripSupportedNativeFrames",
+						"TestEncoderAcceptsTwelveStoredBitsAndSignedOrUnsignedPixels",
+						"TestDecoderRejectsTruncatedAndHostileCodestreams",
+					),
+					directionalExactEvidence(
+						DirectionEncode,
+						"examples/codec-adapters/jpegls/purego_encoder_interop_test.go",
+						"CharLS reference implementation",
+						"TestCharLSDecodesPureGoLosslessEncoderOutput",
+					),
+					directionalExactEvidence(
+						DirectionEncode,
+						"pixeldata/jpegls/interop_test.go",
+						"fail-closed independent CharLS or DCMTK decoder gate",
+						"TestIndependentDecoderAcceptsGeneratedCodestreams",
+					),
 				},
 			},
 			{
@@ -275,7 +417,7 @@ func CodecFullManifest() ProfileManifest {
 					Name:        "github.com/mrjoshuak/go-jpeg2000",
 					Scope:       "build",
 					Kind:        "go-module",
-					Version:     "v1.2.1",
+					Version:     "v1.3.0",
 					License:     "Apache-2.0",
 					Acquisition: "checksum-verified Go module dependency",
 				}},
@@ -312,7 +454,7 @@ func CodecFullManifest() ProfileManifest {
 					Name:        "github.com/mrjoshuak/go-jpeg2000",
 					Scope:       "build",
 					Kind:        "go-module",
-					Version:     "v1.2.1",
+					Version:     "v1.3.0",
 					License:     "Apache-2.0",
 					Acquisition: "checksum-verified Go module dependency",
 				}},
@@ -347,7 +489,7 @@ func CodecFullManifest() ProfileManifest {
 					Name:        "github.com/mrjoshuak/go-jpeg2000",
 					Scope:       "build",
 					Kind:        "go-module",
-					Version:     "v1.2.1",
+					Version:     "v1.3.0",
 					License:     "Apache-2.0",
 					Acquisition: "checksum-verified Go module dependency",
 				}},
@@ -414,6 +556,18 @@ func CodecFullManifest() ProfileManifest {
 	}
 	declareCodecDirections(&manifest)
 	qualifyCodecFull(&manifest)
+	manifest.Capabilities = append(manifest.Capabilities, Capability{
+		ID: "jpeg-2000-lossless-encode", Family: "JPEG 2000 Part 1 Lossless explicit encoder", Status: StatusValidated,
+		Directions: []CodecDirection{DirectionEncode}, TransferSyntaxes: syntaxes(transfer.JPEG2000LosslessOnly),
+		BuildTags:       []string{"jpeg2000_openjpeg", "codecfull"},
+		Implementations: []string{"OpenJPEG 2.5.4 opj_compress through explicit caller-owned encoder registry"},
+		Dependencies:    []Dependency{{Name: "OpenJPEG", Scope: "runtime", Kind: "executable", Version: "2.5.4", License: "BSD-2-Clause", Acquisition: "explicit opj_compress runtime; not required or registered by decoder-only startup", OverrideEnv: "DICOM_GO_OPENJPEG_COMPRESS"}},
+		Coverage:        []string{".90 only; reversible transform; unsigned MONOCHROME1/2 and RGB; 8..16 stored bits in 8/16 allocated bits", "explicit registration and separate encoder preflight; no implicit color conversion", "42 multiframe corpus frames, 141974 exact samples; encoder Windows/amd64 and Linux/amd64; independent native FFmpeg verifier Linux/amd64", "macOS encoding, signed samples, sub-8-bit precision and other JPEG 2000 encode UIDs remain unqualified/unsupported"},
+		Evidence: []Evidence{
+			directionalExactEvidence(DirectionEncode, "examples/codec-adapters/jpeg2000/encoder_interop_test.go", "native FFmpeg jpeg2000 decoder 7.1.5, explicitly not libopenjpeg; original synthetic samples", "TestOpenJPEGLosslessEncoderIndependentFFmpeg"),
+			directionalExactEvidence(DirectionEncode, "examples/codec-adapters/jpeg2000/encoder_process_test.go", "synthetic subprocess fault and cancellation injection", "TestOpenJPEGEncoderSubprocessFailuresCancelAndCleanup"),
+		},
+	})
 	manifest.ClinicalReleaseReady = len(manifest.releaseBlockers()) == 0
 	return manifest
 }
@@ -423,6 +577,21 @@ func declareCodecDirections(manifest *ProfileManifest) {
 		capability := &manifest.Capabilities[index]
 		capability.Directions = []CodecDirection{DirectionDecode}
 		switch capability.ID {
+		case "jpeg-ls":
+			capability.Directions = []CodecDirection{DirectionDecode, DirectionEncode}
+		case "jpeg-baseline":
+			capability.Directions = []CodecDirection{DirectionDecode, DirectionEncode}
+			capability.Implementations = append(capability.Implementations, "Go standard-library JPEG Baseline encoder through dicom-go")
+			capability.Coverage = append(capability.Coverage, "lossy encoding at explicit quality for 8-bit unsigned grayscale and interleaved RGB")
+			capability.Evidence = append(capability.Evidence, directionalToleranceEvidence(
+				DirectionEncode,
+				"pixeldata/jpeg/encoder_test.go",
+				32,
+				"Go standard-library JPEG decoder and deterministic native source pixels",
+				"TestJPEGEncoderTranscodeRoundTripAndMetadata",
+				"TestJPEGEncoderRGBUpdatesPhotometricAndRoundTrips",
+				"TestJPEGEncoderRejectsIncompatibleMetadataBeforeEncoding",
+			))
 		case "encapsulated-uncompressed":
 			capability.Directions = []CodecDirection{DirectionDecode, DirectionEncode}
 			capability.Evidence = append(capability.Evidence, directionalExactEvidence(
@@ -450,6 +619,14 @@ func declareCodecDirections(manifest *ProfileManifest) {
 				"pixeldata/transcode_rle_test.go",
 				"pure-Go RLE decoder and exact native frame comparison",
 				"TestTranscodeNativeRLEPipelineIsBitExactAcrossProfiles",
+			))
+		case "jpeg-ls-lossless":
+			capability.Directions = []CodecDirection{DirectionDecode, DirectionEncode}
+			capability.Evidence = append(capability.Evidence, directionalExactEvidence(
+				DirectionEncode,
+				"pixeldata/transcode_jpegls_test.go",
+				"dicom-go pure-Go JPEG-LS lossless decoder and exact native frame comparison",
+				"TestTranscodeNativeJPEGLSPipelineIsBitExactAcrossProfiles",
 			))
 		}
 	}
@@ -529,11 +706,6 @@ func qualifyCodecFull(manifest *ProfileManifest) {
 				dependency.Version = "2.4.2"
 			}
 			capability.Evidence = append(capability.Evidence,
-				exactEvidence(
-					"examples/codecfull/corpus_test.go",
-					"pydicom native pairs and pyjpegls/pylibjpeg references",
-					"TestIndependentLosslessAndLossyPairs",
-				),
 				toleranceEvidence(
 					"examples/codecfull/corpus_test.go",
 					1,
@@ -918,6 +1090,12 @@ func toleranceEvidence(path string, tolerance int, reference string, tests ...st
 		NoPHI:              true,
 		RedistributionSafe: true,
 	}
+}
+
+func directionalToleranceEvidence(direction CodecDirection, path string, tolerance int, reference string, tests ...string) Evidence {
+	evidence := toleranceEvidence(path, tolerance, reference, tests...)
+	evidence.Direction = direction
+	return evidence
 }
 
 func invalid(format string, args ...any) error {

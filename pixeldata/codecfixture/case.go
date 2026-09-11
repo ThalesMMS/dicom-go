@@ -2,6 +2,7 @@ package codecfixture
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -14,13 +15,17 @@ import (
 
 	"github.com/ThalesMMS/dicom-go/core"
 	"github.com/ThalesMMS/dicom-go/dictionary/std"
+	"github.com/ThalesMMS/dicom-go/internal/jpegfixture"
 	"github.com/ThalesMMS/dicom-go/object"
 	"github.com/ThalesMMS/dicom-go/pixeldata"
+	"github.com/ThalesMMS/dicom-go/pixeldata/builtin"
 	"github.com/ThalesMMS/dicom-go/pixeldata/jpeg"
 	"github.com/ThalesMMS/dicom-go/pixeldata/jpeglossless"
 	"github.com/ThalesMMS/dicom-go/pixeldata/rle"
 	"github.com/ThalesMMS/dicom-go/transfer"
 )
+
+const jpegLosslessSV1RGB8InterleavedBase64 = "/9j/7gAOQWRvYmUAZAAAAAAA/8MAEQgAAwAEA1IRAEcRAEIRAP/EABsAAQACAwEBAAAAAAAAAAAAAAgABwIFBgED/9oADANSAEcAQgABAAA/n8/v+QAP+QAP/wByz2G/752txd0CQhH9HxfVvGnT3LUt79u9ej//2Q=="
 
 const (
 	SizeSmall  SizeClass = "small"
@@ -87,23 +92,27 @@ type Provenance struct {
 
 // Case is a synthetic pixel-data conformance fixture.
 type Case struct {
-	Name           string
-	Description    string
-	Syntax         transfer.Syntax
-	Size           SizeClass
-	Provenance     Provenance
-	Elements       []core.Element
-	ExpectedFrames [][]byte
-	ExpectedError  ErrorKind
-	Tolerance      byte
-	RegisterCodecs func(pixeldata.Registry) error
+	Name            string
+	Description     string
+	Syntax          transfer.Syntax
+	Size            SizeClass
+	Provenance      Provenance
+	Elements        []core.Element
+	ExpectedFrames  [][]byte
+	ExpectedError   ErrorKind
+	Tolerance       byte
+	SamplePolicy    *SamplePolicy
+	DecodedLayout   *SampleLayout
+	ReferenceLayout *SampleLayout
+	RegisterCodecs  func(pixeldata.Registry) error
 }
 
 // Result captures the raw outcome of running a case through a registry.
 type Result struct {
-	Frames pixeldata.Frames
-	Err    error
-	Kind   ErrorKind
+	Frames     pixeldata.Frames
+	Err        error
+	Kind       ErrorKind
+	Comparison ComparisonReport
 }
 
 // Object builds a fresh DICOM object for the case.
@@ -162,10 +171,11 @@ func RunCase(registry pixeldata.Registry, c Case) Result {
 	if err != nil {
 		return Result{Err: err, Kind: ClassifyError(err)}
 	}
-	if err := compareFrames(c, frames); err != nil {
-		return Result{Frames: frames, Err: err, Kind: ClassifyError(err)}
+	comparison, err := compareCaseSamples(c, frames)
+	if err != nil {
+		return Result{Frames: frames, Err: err, Kind: ClassifyError(err), Comparison: comparison}
 	}
-	return Result{Frames: frames}
+	return Result{Frames: frames, Comparison: comparison}
 }
 
 // ValidateCase returns nil when the case outcome matches its expectation.
@@ -194,7 +204,7 @@ func ClassifyError(err error) ErrorKind {
 	switch {
 	case errors.Is(err, ErrDecodeMismatch):
 		return ErrorDecodeMismatch
-	case errors.Is(err, ErrDependencyUnavailable) || strings.Contains(strings.ToLower(err.Error()), "decoder unavailable"):
+	case errors.Is(err, ErrDependencyUnavailable) || errorChainContains(err, "decoder unavailable"):
 		return ErrorDependencyUnavailable
 	case errors.Is(err, pixeldata.ErrCodecNotFound), errors.Is(err, pixeldata.ErrCodecRegistryNil):
 		return ErrorMissingOptionalAdapter
@@ -213,6 +223,8 @@ func ClassifyError(err error) ErrorKind {
 		errors.Is(err, pixeldata.ErrUnsupportedPixelRepresentation),
 		errors.Is(err, pixeldata.ErrUnsupportedPlanarConfiguration),
 		errors.Is(err, jpeg.ErrUnsupportedBitsAllocated),
+		errors.Is(err, jpeg.ErrUnsupportedBitsStored),
+		errors.Is(err, jpeg.ErrUnsupportedHighBit),
 		errors.Is(err, jpeg.ErrUnsupportedSamplesPerPixel),
 		errors.Is(err, jpeglossless.ErrUnsupportedBitsAllocated),
 		errors.Is(err, jpeglossless.ErrUnsupportedScan),
@@ -224,15 +236,30 @@ func ClassifyError(err error) ErrorKind {
 	}
 }
 
+func errorChainContains(err error, text string) bool {
+	if err == nil {
+		return false
+	}
+	if strings.Contains(strings.ToLower(err.Error()), strings.ToLower(text)) {
+		return true
+	}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		for _, child := range joined.Unwrap() {
+			if errorChainContains(child, text) {
+				return true
+			}
+		}
+		return false
+	}
+	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
+		return errorChainContains(wrapped.Unwrap(), text)
+	}
+	return false
+}
+
 // RegisterBuiltinCodecs registers built-in pure-Go codecs used by the baseline.
 func RegisterBuiltinCodecs(registry pixeldata.Registry) error {
-	if err := jpeg.Register(registry); err != nil {
-		return err
-	}
-	if err := jpeglossless.Register(registry); err != nil {
-		return err
-	}
-	return rle.Register(registry)
+	return builtin.Register(registry)
 }
 
 // NativeSmall returns a 2x2 native Explicit VR Little Endian case.
@@ -267,6 +294,7 @@ func JPEGBaselineSmall() Case {
 	fragment := mustEncodeGrayJPEG(2, 1, frame)
 	c := encapsulatedCase("jpeg-baseline-small", transfer.JPEGBaseline, SizeSmall, 1, 2, [][]byte{frame}, ErrorNone, fragment, RegisterBuiltinCodecs)
 	c.Tolerance = 32
+	c.SamplePolicy = smallJPEGPolicy()
 	return c
 }
 
@@ -276,6 +304,36 @@ func JPEGExtendedSmall() Case {
 	fragment := makeJPEGExtendedSOF1(mustEncodeGrayJPEG(2, 1, frame))
 	c := encapsulatedCase("jpeg-extended-small", transfer.JPEGExtended, SizeSmall, 1, 2, [][]byte{frame}, ErrorNone, fragment, RegisterBuiltinCodecs)
 	c.Tolerance = 32
+	c.SamplePolicy = smallJPEGPolicy()
+	return c
+}
+
+func smallJPEGPolicy() *SamplePolicy {
+	return &SamplePolicy{MaxAbsoluteError: 32, MinPSNR: 35, MaxTileMeanAbsoluteError: 4, Rationale: "8-bit synthetic two-pixel DCT boundary: existing max-abs 32 supplemented by >=35 dB and tile mean <=4; source comparison is a regression, not independent decoder evidence"}
+}
+
+// JPEGExtendedProcess4Mono12 returns an independently encoded JPEG Extended
+// Process 4/SOF1 12-bit unsigned monochrome case. It shares the complete
+// independent libjpeg-turbo reconstruction with pixeldata/jpeg.
+func JPEGExtendedProcess4Mono12() Case {
+	fragment, err := base64.StdEncoding.DecodeString(jpegfixture.Process4Base64)
+	if err != nil {
+		panic("codecfixture: invalid embedded JPEG Extended Process 4 fixture: " + err.Error())
+	}
+	c := encapsulatedCase("jpeg-extended-process4-mono12", transfer.JPEGExtended, SizeSmall, 8, 8, nil, ErrorNone, fragment, RegisterBuiltinCodecs)
+	c.Description = "independently encoded JPEG Extended Process 4/SOF1 12-bit unsigned monochrome case"
+	c.Provenance.Source = "libjpeg-turbo 3.1.0 cjpeg -precision 12 from synthetic pixels"
+	c.Provenance.Permission = "generated non-PHI test vector"
+	c.Elements = replaceElement(c.Elements, uint16Element(tagBitsAllocated, 16))
+	c.Elements = replaceElement(c.Elements, uint16Element(tagBitsStored, 12))
+	c.Elements = replaceElement(c.Elements, uint16Element(tagHighBit, 11))
+	frame := make([]byte, 8*8*2)
+	for i, sample := range jpegfixture.ReferenceSamples() {
+		binary.LittleEndian.PutUint16(frame[i*2:], sample)
+	}
+	c.ExpectedFrames = [][]byte{frame}
+	c.SamplePolicy = &SamplePolicy{MaxAbsoluteError: 8, MinPSNR: 54, MaxTileMeanAbsoluteError: 4,
+		Rationale: "12-bit sequential DCT: independent integer versus floating IDCT rounding; existing max-abs 8, PSNR >=54 dB and 8x8 mean <=4 sample units"}
 	return c
 }
 
@@ -285,6 +343,35 @@ func JPEGLosslessSmall() Case {
 	samples := []int32{0, 64, 128, 255}
 	fragment := encodeLossless(2, 2, 8, 1, samples)
 	return encapsulatedCase("jpeg-lossless-small", transfer.JPEGLosslessNonHierarchical, SizeSmall, 2, 2, [][]byte{frame}, ErrorNone, fragment, RegisterBuiltinCodecs)
+}
+
+// JPEGLosslessSV1RGB8Interleaved returns an independently encoded JPEG
+// Lossless Process 14 SV1 RGB case with exact native interleaved reference
+// samples.
+func JPEGLosslessSV1RGB8Interleaved() Case {
+	fragment, err := base64.StdEncoding.DecodeString(jpegLosslessSV1RGB8InterleavedBase64)
+	if err != nil {
+		panic("codecfixture: invalid embedded JPEG Lossless SV1 RGB fixture: " + err.Error())
+	}
+	frame := []byte{
+		0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255,
+		1, 2, 3, 17, 33, 65, 254, 253, 252, 128, 64, 32,
+		5, 250, 125, 99, 100, 101, 200, 10, 220, 255, 255, 255,
+	}
+	c := encapsulatedCase("jpeg-lossless-sv1-rgb8-interleaved", transfer.JPEGLosslessSV1, SizeSmall, 3, 4, [][]byte{frame}, ErrorNone, fragment, RegisterBuiltinCodecs)
+	c.Description = "independently encoded JPEG Lossless Process 14 SV1 8-bit unsigned RGB case"
+	c.Provenance = Provenance{
+		Source:     "libjpeg-turbo 3.1.0 cjpeg -precision 8 -lossless 1,0 -rgb -sample 1x1,1x1,1x1 from a synthetic 4x3 RGB PPM",
+		Synthetic:  true,
+		License:    "generated non-PHI test vector; libjpeg-turbo BSD-3-Clause",
+		Permission: "generated from synthetic source for redistribution with the repository",
+		NoPHI:      true,
+		Notes:      "codestream SHA-256 c9643dc57a6e631865084223af411c514d52edc30caaa3fe99eab5c9561d7e68; exact reference from djpeg -strict -rgb -pnm",
+	}
+	c.Elements = replaceElement(c.Elements, uint16Element(tagSamplesPerPixel, 3))
+	c.Elements = replaceElement(c.Elements, stringElement(tagPhotometricInterpretation, core.VRCS, "RGB"))
+	c.Elements = replaceElement(c.Elements, uint16Element(tagPlanarConfiguration, 0))
+	return c
 }
 
 // MalformedJPEGExtended returns a JPEG case with malformed encoded bytes.
@@ -510,34 +597,8 @@ func fragmentElement(fragments ...[]byte) core.Element {
 }
 
 func compareFrames(c Case, got pixeldata.Frames) error {
-	if len(c.ExpectedFrames) == 0 {
-		return nil
-	}
-	if len(got.Data) != len(c.ExpectedFrames) {
-		return fmt.Errorf("%w: %s got %d frame(s), want %d", ErrDecodeMismatch, c.Name, len(got.Data), len(c.ExpectedFrames))
-	}
-	for i := range got.Data {
-		if !bytesWithinTolerance(got.Data[i], c.ExpectedFrames[i], c.Tolerance) {
-			return fmt.Errorf("%w: %s frame %d got %v want %v", ErrDecodeMismatch, c.Name, i, got.Data[i], c.ExpectedFrames[i])
-		}
-	}
-	return nil
-}
-
-func bytesWithinTolerance(got, want []byte, tolerance byte) bool {
-	if len(got) != len(want) {
-		return false
-	}
-	for i := range got {
-		delta := int(got[i]) - int(want[i])
-		if delta < 0 {
-			delta = -delta
-		}
-		if delta > int(tolerance) {
-			return false
-		}
-	}
-	return true
+	_, err := compareCaseSamples(c, got)
+	return err
 }
 
 func cloneElements(elements []core.Element) []core.Element {
@@ -557,6 +618,24 @@ func cloneValue(value core.Value) core.Value {
 		return core.RawValue(core.CloneBytes(v))
 	case core.StringValue:
 		return append(core.StringValue(nil), v...)
+	case core.Uint16Value:
+		return append(core.Uint16Value(nil), v...)
+	case core.Int16Value:
+		return append(core.Int16Value(nil), v...)
+	case core.Uint32Value:
+		return append(core.Uint32Value(nil), v...)
+	case core.Int32Value:
+		return append(core.Int32Value(nil), v...)
+	case core.Uint64Value:
+		return append(core.Uint64Value(nil), v...)
+	case core.Int64Value:
+		return append(core.Int64Value(nil), v...)
+	case core.Float32Value:
+		return append(core.Float32Value(nil), v...)
+	case core.Float64Value:
+		return append(core.Float64Value(nil), v...)
+	case core.TagValue:
+		return append(core.TagValue(nil), v...)
 	case core.FragmentSequence:
 		return core.FragmentSequence{
 			OffsetTable: core.CloneBytes(v.OffsetTable),

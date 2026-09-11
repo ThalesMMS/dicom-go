@@ -3,6 +3,7 @@ package codecfixture
 import (
 	"bytes"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/ThalesMMS/dicom-go/core"
@@ -17,7 +18,9 @@ func TestCodecConformanceBaseline(t *testing.T) {
 		RLELosslessSmall(),
 		JPEGBaselineSmall(),
 		JPEGExtendedSmall(),
+		JPEGExtendedProcess4Mono12(),
 		JPEGLosslessSmall(),
+		JPEGLosslessSV1RGB8Interleaved(),
 	} {
 		t.Run(tc.Name, func(t *testing.T) {
 			if !tc.Provenance.Synthetic || !tc.Provenance.NoPHI {
@@ -31,6 +34,18 @@ func TestCodecConformanceBaseline(t *testing.T) {
 				t.Fatal(err)
 			}
 		})
+	}
+}
+
+func TestCaseObjectDetachesTypedNumericValues(t *testing.T) {
+	c := NativeSmall()
+	c.Elements = append(c.Elements, core.Element{Header: core.ElementHeader{Tag: core.NewTag(0x0011, 0x1001), VR: core.VRUS}, Value: core.Uint16Value{7, 9}})
+	first, second := c.Object(), c.Object()
+	elem, _ := first.Get(core.NewTag(0x0011, 0x1001))
+	elem.Value.(core.Uint16Value)[0] = 123
+	other, _ := second.Get(core.NewTag(0x0011, 0x1001))
+	if other.Value.(core.Uint16Value)[0] != 7 {
+		t.Fatal("independent fixture objects share typed numeric storage")
 	}
 }
 
@@ -115,6 +130,7 @@ func TestCodecFixtureUIDsAreUniquePerCase(t *testing.T) {
 		JPEGBaselineSmall(),
 		JPEGExtendedSmall(),
 		JPEGLosslessSmall(),
+		JPEGLosslessSV1RGB8Interleaved(),
 		MalformedJPEGExtended(),
 		UnsupportedMetadataJPEGExtended(),
 		MetadataMismatchRLE(),
@@ -134,6 +150,24 @@ func TestCodecFixtureUIDsAreUniquePerCase(t *testing.T) {
 			}
 			seen[uid] = tc.Name
 		}
+	}
+}
+
+func TestJPEGLosslessSV1RGB8InterleavedProvenance(t *testing.T) {
+	tc := JPEGLosslessSV1RGB8Interleaved()
+	for _, want := range []string{
+		"libjpeg-turbo 3.1.0",
+		"cjpeg -precision 8 -lossless 1,0 -rgb -sample 1x1,1x1,1x1",
+	} {
+		if !strings.Contains(tc.Provenance.Source, want) {
+			t.Fatalf("provenance source = %q, want substring %q", tc.Provenance.Source, want)
+		}
+	}
+	if !strings.Contains(tc.Provenance.Notes, "c9643dc57a6e631865084223af411c514d52edc30caaa3fe99eab5c9561d7e68") {
+		t.Fatalf("provenance notes = %q, want codestream SHA-256", tc.Provenance.Notes)
+	}
+	if !tc.Provenance.Synthetic || !tc.Provenance.NoPHI || tc.Provenance.Permission == "" {
+		t.Fatalf("provenance = %#v, want redistributable synthetic no-PHI fixture", tc.Provenance)
 	}
 }
 

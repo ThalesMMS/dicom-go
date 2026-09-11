@@ -8,6 +8,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/ThalesMMS/dicom-go/object"
+	"github.com/ThalesMMS/dicom-go/pixeldata"
 )
 
 type codecFullCorpusManifest struct {
@@ -28,22 +31,240 @@ type codecFullCorpusManifest struct {
 	Fixtures []codecFullCorpusFixture `json:"fixtures"`
 }
 
+// CodecFullCorpusJSON projects the existing, validated fixture inventory into
+// capability reports. It contains provenance and metadata, never patient values
+// or decoded sample buffers. Presence is structural evidence, not execution.
+func CodecFullCorpusJSON(moduleRoot string) (json.RawMessage, error) {
+	root := filepath.Join(moduleRoot, "pixeldata", "codecfixture", "testdata", "codecfull")
+	if err := validateCodecFullCorpus(root); err != nil {
+		return nil, err
+	}
+	return os.ReadFile(filepath.Join(root, "manifest.json"))
+}
+
 type codecFullCorpusFixture struct {
-	ID               string
-	Family           string
-	Path             string
-	SHA256           string
-	ReferencePath    string
-	ReferenceSHA256  string `json:"referenceSha256"`
-	Test             string
-	Comparison       string
-	MaxAbsoluteError int
-	Modality         string
-	BitsAllocated    int
-	Signed           bool
-	Color            bool
-	Multiframe       bool
-	Lossy            bool
+	ID                 string
+	Family             string
+	Path               string
+	SHA256             string
+	ReferencePath      string
+	ReferenceSHA256    string `json:"referenceSha256"`
+	Test               string
+	Comparison         string
+	MaxAbsoluteError   int
+	Modality           string
+	BitsAllocated      int
+	Signed             bool
+	Color              bool
+	Multiframe         bool
+	Lossy              bool
+	Reconstruction     *ReconstructionEvidence `json:"reconstruction,omitempty"`
+	Input              CorpusInput             `json:"input"`
+	Generator          string                  `json:"generator"`
+	Expectation        string                  `json:"expectation"`
+	BaselineSkip       string                  `json:"baselineSkip"`
+	QualificationLimit string                  `json:"qualificationLimit"`
+	CaseName           string                  `json:"caseName,omitempty"`
+	SamplePolicy       *SamplePolicy           `json:"samplePolicy,omitempty"`
+	Provenance         Provenance              `json:"provenance"`
+	SourceSamples      *SourceSampleEvidence   `json:"sourceSamples,omitempty"`
+}
+
+// SourceSampleEvidence is the original image before JPEG-LS encoding. NEAR
+// bounds source error; Reconstruction remains an exact decoder oracle.
+type SourceSampleEvidence struct {
+	Path   string `json:"path"`
+	SHA256 string `json:"sha256"`
+	Near   int    `json:"near"`
+}
+
+func validateSourceSamples(root string, f codecFullCorpusFixture) error {
+	s := f.SourceSamples
+	if s == nil {
+		return nil
+	}
+	if f.Reconstruction == nil || f.Family != "jpeg-ls" || f.Input.Signed || s.Near < 0 || s.Near > 255 || s.Near > ((1<<f.Input.BitsStored)-1)/2 || f.Lossy != (s.Near > 0) {
+		return fmt.Errorf("codecfixture: invalid JPEG-LS source-bound evidence for %s", f.ID)
+	}
+	path, err := resolveCodecFullCorpusPath(root, s.Path)
+	if err != nil {
+		return err
+	}
+	if err := validateSHA256(path, s.SHA256); err != nil {
+		return err
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	if info.Size() != int64(f.Reconstruction.Layout.frameBytes())*int64(f.Input.Frames) {
+		return fmt.Errorf("codecfixture: source layout mismatch for %s", f.ID)
+	}
+	return nil
+}
+
+// CorpusSamplePolicy returns the approved per-codec full-sample policy. Legacy
+// point or absolute-only checks are explicitly unqualified and cannot be used
+// through this API as reconstruction evidence.
+func CorpusSamplePolicy(moduleRoot, id string) (SamplePolicy, error) {
+	root := filepath.Join(moduleRoot, "pixeldata", "codecfixture", "testdata", "codecfull")
+	m, err := readCodecFullCorpusManifest(root)
+	if err != nil {
+		return SamplePolicy{}, err
+	}
+	for _, f := range m.Fixtures {
+		if f.ID != id {
+			continue
+		}
+		if f.SamplePolicy != nil {
+			return *f.SamplePolicy, nil
+		}
+		if f.Comparison == "exact" || f.Comparison == "exact-reconstruction" {
+			return SamplePolicy{}, nil
+		}
+		return SamplePolicy{}, fmt.Errorf("codecfixture: %s has no full-sample policy", id)
+	}
+	return SamplePolicy{}, fmt.Errorf("codecfixture: unknown corpus fixture %s", id)
+}
+
+// CorpusInput records encoded DICOM metadata separately from output layout.
+type CorpusInput struct {
+	TransferSyntax      string `json:"transferSyntax"`
+	Rows                int    `json:"rows"`
+	Columns             int    `json:"columns"`
+	Components          int    `json:"components"`
+	BitsAllocated       int    `json:"bitsAllocated"`
+	BitsStored          int    `json:"bitsStored"`
+	HighBit             int    `json:"highBit"`
+	Signed              bool   `json:"signed"`
+	Photometric         string `json:"photometric"`
+	PlanarConfiguration int    `json:"planarConfiguration"`
+	Frames              int    `json:"frames"`
+}
+
+func corpusInput(uid string, m pixeldata.Metadata) CorpusInput {
+	return CorpusInput{uid, int(m.Rows), int(m.Columns), int(m.SamplesPerPixel), int(m.BitsAllocated), int(m.BitsStored), int(m.HighBit), m.PixelRepresentation == 1, m.PhotometricInterpretation, int(m.PlanarConfiguration), m.NumberOfFrames}
+}
+
+func validateCorpusInput(root string, f codecFullCorpusFixture) error {
+	i := f.Input
+	l := SampleLayout{Rows: i.Rows, Columns: i.Columns, Components: i.Components, BitsAllocated: i.BitsAllocated, BitsStored: i.BitsStored, HighBit: i.HighBit, Signed: i.Signed}
+	if err := l.validate(); err != nil {
+		return fmt.Errorf("codecfixture: %s input: %w", f.ID, err)
+	}
+	if i.TransferSyntax == "" || i.Photometric == "" || i.PlanarConfiguration < 0 || i.PlanarConfiguration > 1 || i.Frames < 1 || f.Generator == "" || f.Expectation == "" {
+		return fmt.Errorf("codecfixture: incomplete input/provenance for %s", f.ID)
+	}
+	if !f.Provenance.NoPHI || f.Provenance.Source == "" || f.Provenance.License == "" || f.Provenance.Permission == "" {
+		return fmt.Errorf("codecfixture: incomplete per-fixture provenance for %s", f.ID)
+	}
+	if i.BitsAllocated != f.BitsAllocated || i.Signed != f.Signed || (i.Components > 1) != f.Color || (i.Frames > 1) != f.Multiframe {
+		return fmt.Errorf("codecfixture: contradictory coverage for %s", f.ID)
+	}
+	if strings.EqualFold(filepath.Ext(f.Path), ".dcm") {
+		path, err := resolveCodecFullCorpusPath(root, f.Path)
+		if err != nil {
+			return err
+		}
+		file, err := object.OpenFile(path)
+		if err != nil {
+			return fmt.Errorf("codecfixture: %s DICOM parse: %w", f.ID, err)
+		}
+		defer file.Close()
+		meta, err := pixeldata.ExtractMetadata(file.Dataset)
+		if err != nil {
+			return err
+		}
+		if corpusInput(file.TransferSyntax.UID, meta) != i {
+			return fmt.Errorf("codecfixture: encoded metadata drift for %s", f.ID)
+		}
+	}
+	return nil
+}
+
+// ReconstructionEvidence binds approved raw samples to their actual decoder.
+// Backend identifies the implementation, not merely a Python/Go wrapper.
+type ReconstructionEvidence struct {
+	Layout    SampleLayout `json:"layout"`
+	Frames    int          `json:"frames"`
+	Backend   string       `json:"backend"`
+	Version   string       `json:"version"`
+	Source    string       `json:"source"`
+	Generator string       `json:"generator"`
+}
+
+// ReadFullReconstruction loads hash-checked, approved raw full-frame expectations
+// from the existing codecfull corpus. Missing evidence is an error, never a skip.
+func ReadFullReconstruction(moduleRoot, id string) (ReconstructionEvidence, [][]byte, error) {
+	root := filepath.Join(moduleRoot, "pixeldata", "codecfixture", "testdata", "codecfull")
+	manifest, err := readCodecFullCorpusManifest(root)
+	if err != nil {
+		return ReconstructionEvidence{}, nil, err
+	}
+	for _, fixture := range manifest.Fixtures {
+		if fixture.ID != id {
+			continue
+		}
+		if fixture.Reconstruction == nil {
+			break
+		}
+		e := *fixture.Reconstruction
+		if err := validateReconstruction(root, fixture); err != nil {
+			return e, nil, err
+		}
+		path, err := resolveCodecFullCorpusPath(root, fixture.ReferencePath)
+		if err != nil {
+			return e, nil, err
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return e, nil, err
+		}
+		size := int(e.Layout.frameBytes())
+		frames := make([][]byte, e.Frames)
+		for i := range frames {
+			frames[i] = data[i*size : (i+1)*size]
+		}
+		return e, frames, nil
+	}
+	return ReconstructionEvidence{}, nil, fmt.Errorf("codecfixture: full reconstruction unavailable for %s", id)
+}
+
+func validateReconstruction(root string, f codecFullCorpusFixture) error {
+	e := f.Reconstruction
+	if e == nil {
+		return nil
+	}
+	if err := e.Layout.validate(); err != nil {
+		return err
+	}
+	if e.Layout.Rows != f.Input.Rows || e.Layout.Columns != f.Input.Columns || e.Layout.Components != f.Input.Components || e.Layout.BitsStored != f.Input.BitsStored || e.Layout.Signed != f.Input.Signed || e.Frames != f.Input.Frames {
+		return fmt.Errorf("codecfixture: reconstructed layout contradicts input for %s", f.ID)
+	}
+	if e.Frames < 1 || e.Frames > 10000 || e.Backend == "" || e.Version == "" || e.Source == "" || e.Generator == "" || f.Comparison != "exact-reconstruction" {
+		return fmt.Errorf("codecfixture: incomplete reconstruction provenance for %s", f.ID)
+	}
+	for _, file := range []struct{ path, hash string }{{f.Path, f.SHA256}, {f.ReferencePath, f.ReferenceSHA256}} {
+		path, err := resolveCodecFullCorpusPath(root, file.path)
+		if err != nil {
+			return err
+		}
+		if err := validateSHA256(path, file.hash); err != nil {
+			return err
+		}
+	}
+	path, err := resolveCodecFullCorpusPath(root, f.ReferencePath)
+	if err != nil {
+		return err
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	if info.Size() != e.Layout.frameBytes()*int64(e.Frames) || info.Size() > 64<<20 {
+		return fmt.Errorf("codecfixture: incomplete or excessive reconstruction for %s", f.ID)
+	}
+	return nil
 }
 
 type codecFullPerformanceReport struct {
@@ -120,6 +341,7 @@ func validateCodecFullCorpusManifest(root string, manifest codecFullCorpusManife
 	}
 
 	requiredFamilies := map[string]bool{
+		"native":                    false,
 		"encapsulated-uncompressed": false,
 		"jpeg-baseline":             false,
 		"jpeg-extended":             false,
@@ -138,6 +360,15 @@ func validateCodecFullCorpusManifest(root string, manifest codecFullCorpusManife
 			return fmt.Errorf("codecfixture: blank or duplicate fixture id %q", fixture.ID)
 		}
 		ids[fixture.ID] = true
+		if err := validateCorpusInput(root, fixture); err != nil {
+			return err
+		}
+		if err := validateReconstruction(root, fixture); err != nil {
+			return err
+		}
+		if err := validateSourceSamples(root, fixture); err != nil {
+			return err
+		}
 		if _, ok := requiredFamilies[fixture.Family]; !ok {
 			return fmt.Errorf("codecfixture: fixture %s has unknown family %q", fixture.ID, fixture.Family)
 		}

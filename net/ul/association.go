@@ -163,6 +163,7 @@ type Association struct {
 	CallingAETitle                         string
 	Contexts                               []PresentationContext
 	AcceptedContexts                       []AcceptedContext
+	ContextOutcomes                        []PresentationContextOutcome
 	PeerMaxPDU                             uint32
 	MaxPDU                                 uint32
 	ProtocolVersion                        uint16
@@ -524,6 +525,7 @@ func Accept(conn net.Conn, opts AcceptOptions) (*Association, error) {
 		return nil, err
 	}
 	results, accepted := negotiatePresentationContexts(rq.PresentationContexts, opts)
+	outcomes := presentationContextOutcomesFromResults(rq.PresentationContexts, results)
 	if len(accepted) == 0 {
 		rj := &AssociationRJ{
 			Result: AssociateRJResultPermanent,
@@ -533,7 +535,7 @@ func Accept(conn net.Conn, opts AcceptOptions) (*Association, error) {
 		notifyAssociationRejected(opts)
 		_ = writeAssociationPDUObserved(opts.Context, conn, rj, operational)
 		_ = conn.Close()
-		return nil, ErrNoAcceptedPresentationContexts
+		return nil, noAcceptedPresentationContextsError(outcomes)
 	}
 	requestedRoles, acceptedRoles, err := negotiateRoleSelections(rq.UserInfo, opts.RoleSelections, accepted)
 	if err != nil {
@@ -615,6 +617,7 @@ func Accept(conn net.Conn, opts AcceptOptions) (*Association, error) {
 		CallingAETitle:                         rq.CallingAETitle,
 		Contexts:                               append([]PresentationContext(nil), rq.PresentationContexts...),
 		AcceptedContexts:                       accepted,
+		ContextOutcomes:                        outcomes,
 		PeerMaxPDU:                             maxPDUFromUserInfo(rq.UserInfo),
 		MaxPDU:                                 opts.MaxPDU,
 		ProtocolVersion:                        DefaultProtocolVersion,
@@ -1245,7 +1248,7 @@ func negotiateSCU(conn net.Conn, opts DialOptions, operational *operationalState
 
 	switch resp := pdu.(type) {
 	case *AssociationAC:
-		accepted, err := processAssociationAC(resp, rq.PresentationContexts, opts)
+		accepted, outcomes, err := processAssociationAC(resp, rq.PresentationContexts, opts)
 		if err != nil {
 			return nil, err
 		}
@@ -1283,6 +1286,7 @@ func negotiateSCU(conn net.Conn, opts DialOptions, operational *operationalState
 			CallingAETitle:                         resp.CallingAETitle,
 			Contexts:                               append([]PresentationContext(nil), rq.PresentationContexts...),
 			AcceptedContexts:                       accepted,
+			ContextOutcomes:                        outcomes,
 			PeerMaxPDU:                             maxPDUFromUserInfo(resp.UserInfo),
 			MaxPDU:                                 opts.MaxPDU,
 			ProtocolVersion:                        resp.ProtocolVersion,
@@ -1313,15 +1317,15 @@ func negotiateSCU(conn net.Conn, opts DialOptions, operational *operationalState
 	}
 }
 
-func processAssociationAC(ac *AssociationAC, proposed []PresentationContextProposed, opts DialOptions) ([]AcceptedContext, error) {
+func processAssociationAC(ac *AssociationAC, proposed []PresentationContextProposed, opts DialOptions) ([]AcceptedContext, []PresentationContextOutcome, error) {
 	if ac.ProtocolVersion != opts.ProtocolVersion {
-		return nil, fmt.Errorf("%w: protocol version %d, want %d", ErrInvalidPDUField, ac.ProtocolVersion, opts.ProtocolVersion)
+		return nil, nil, fmt.Errorf("%w: protocol version %d, want %d", ErrInvalidPDUField, ac.ProtocolVersion, opts.ProtocolVersion)
 	}
 	if ac.ApplicationContextName != opts.ApplicationContextName {
-		return nil, fmt.Errorf("%w: application context %q, want %q", ErrInvalidPDUField, ac.ApplicationContextName, opts.ApplicationContextName)
+		return nil, nil, fmt.Errorf("%w: application context %q, want %q", ErrInvalidPDUField, ac.ApplicationContextName, opts.ApplicationContextName)
 	}
 	if len(ac.PresentationContexts) != len(proposed) {
-		return nil, fmt.Errorf("%w: presentation context result count %d, want %d", ErrInvalidPDUField, len(ac.PresentationContexts), len(proposed))
+		return nil, nil, fmt.Errorf("%w: presentation context result count %d, want %d", ErrInvalidPDUField, len(ac.PresentationContexts), len(proposed))
 	}
 
 	proposedByID := make(map[byte]PresentationContextProposed, len(proposed))
@@ -1333,7 +1337,7 @@ func processAssociationAC(ac *AssociationAC, proposed []PresentationContextPropo
 	seenResults := make(map[byte]bool, len(ac.PresentationContexts))
 	for _, result := range ac.PresentationContexts {
 		if _, ok := proposedByID[result.ID]; !ok || seenResults[result.ID] {
-			return nil, fmt.Errorf("%w: unexpected or duplicate presentation context result %d", ErrInvalidPDUField, result.ID)
+			return nil, nil, fmt.Errorf("%w: unexpected or duplicate presentation context result %d", ErrInvalidPDUField, result.ID)
 		}
 		seenResults[result.ID] = true
 		if result.Result != PresentationContextAcceptance {
@@ -1341,10 +1345,10 @@ func processAssociationAC(ac *AssociationAC, proposed []PresentationContextPropo
 		}
 		pc, ok := proposedByID[result.ID]
 		if !ok {
-			return nil, fmt.Errorf("%w: accepted presentation context %d with transfer syntax %q was not proposed", ErrInvalidPDUField, result.ID, result.TransferSyntaxUID)
+			return nil, nil, fmt.Errorf("%w: accepted presentation context %d with transfer syntax %q was not proposed", ErrInvalidPDUField, result.ID, result.TransferSyntaxUID)
 		}
 		if !containsString(pc.TransferSyntaxUIDs, result.TransferSyntaxUID) {
-			return nil, fmt.Errorf("%w: accepted transfer syntax %q was not proposed for context %d", ErrInvalidPDUField, result.TransferSyntaxUID, result.ID)
+			return nil, nil, fmt.Errorf("%w: accepted transfer syntax %q was not proposed for context %d", ErrInvalidPDUField, result.TransferSyntaxUID, result.ID)
 		}
 		accepted = append(accepted, AcceptedContext{
 			ID:                result.ID,
@@ -1352,10 +1356,11 @@ func processAssociationAC(ac *AssociationAC, proposed []PresentationContextPropo
 			TransferSyntaxUID: result.TransferSyntaxUID,
 		})
 	}
+	outcomes := presentationContextOutcomesFromResults(proposed, ac.PresentationContexts)
 	if len(accepted) == 0 {
-		return nil, ErrNoAcceptedPresentationContexts
+		return nil, outcomes, noAcceptedPresentationContextsError(outcomes)
 	}
-	return accepted, nil
+	return accepted, outcomes, nil
 }
 
 func notifyAssociationRejected(opts AcceptOptions) {

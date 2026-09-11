@@ -1,6 +1,7 @@
 package dimse
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 
@@ -13,6 +14,77 @@ func presentationContextFor(abstractSyntaxUID string, transferSyntaxUIDs []strin
 		AbstractSyntaxUID:  abstractSyntaxUID,
 		TransferSyntaxUIDs: append([]string(nil), transferSyntaxUIDs...),
 	}
+}
+
+// MissingPresentationContextError explains why a SOP Class has no accepted
+// presentation context using preserved UL negotiation results. It never
+// inspects error strings and never includes dataset or patient identifiers.
+type MissingPresentationContextError struct {
+	SOPClassUID string
+	Outcomes    []ul.PresentationContextOutcome
+}
+
+func (e *MissingPresentationContextError) Error() string {
+	if e == nil {
+		return "dicom dimse: no accepted presentation context"
+	}
+	if len(e.Outcomes) == 0 {
+		return fmt.Sprintf("dicom dimse: no accepted presentation context for SOP Class UID %q", e.SOPClassUID)
+	}
+	parts := make([]string, 0, len(e.Outcomes))
+	for _, outcome := range e.Outcomes {
+		parts = append(parts, outcome.Explain())
+	}
+	return fmt.Sprintf("dicom dimse: no accepted presentation context for SOP Class UID %q: %s", e.SOPClassUID, strings.Join(parts, "; "))
+}
+
+// Result returns the peer result/reason of the first matching outcome.
+func (e *MissingPresentationContextError) Result() byte {
+	if e == nil || len(e.Outcomes) == 0 {
+		return 0
+	}
+	return e.Outcomes[0].Result
+}
+
+// ResultName returns the stable label for Result.
+func (e *MissingPresentationContextError) ResultName() string {
+	if e == nil || len(e.Outcomes) == 0 {
+		return ""
+	}
+	return e.Outcomes[0].ResultName()
+}
+
+// ExplainMissingPresentationContext reports why sopClassUID has no accepted
+// presentation context. Callers should inspect Result/ResultName rather than
+// matching diagnostic text.
+func ExplainMissingPresentationContext(assoc *ul.Association, sopClassUID string) error {
+	if assoc == nil {
+		return fmt.Errorf("dicom dimse: nil association")
+	}
+	matching := make([]ul.PresentationContextOutcome, 0, 1)
+	for _, outcome := range assoc.PresentationContextOutcomes() {
+		if outcome.AbstractSyntaxUID == sopClassUID && !outcome.Accepted() {
+			matching = append(matching, outcome)
+		}
+	}
+	return &MissingPresentationContextError{SOPClassUID: sopClassUID, Outcomes: matching}
+}
+
+// FormatPresentationContextDiagnostic extracts a PHI-free presentation-context
+// explanation from err when one is available.
+func FormatPresentationContextDiagnostic(err error) string {
+	if err == nil {
+		return ""
+	}
+	var missing *MissingPresentationContextError
+	if errors.As(err, &missing) {
+		return missing.Error()
+	}
+	var noneAccepted *ul.NoAcceptedPresentationContextsError
+	if errors.As(err, &noneAccepted) {
+		return noneAccepted.Error()
+	}
+	return ""
 }
 
 // AcceptedContextByID returns the accepted presentation context with the given

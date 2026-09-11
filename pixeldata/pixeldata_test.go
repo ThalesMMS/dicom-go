@@ -5,9 +5,11 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"math"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"unsafe"
 
@@ -778,6 +780,55 @@ func TestMemoryRegistryRegisterAndGetCodec(t *testing.T) {
 	}
 }
 
+func TestMemoryRegistryConcurrentRegisterAndGet(t *testing.T) {
+	const registrations = 64
+	const readers = 16
+	registry := &MemoryRegistry{}
+	uids := make([]string, registrations)
+	codecs := make([]Codec, registrations)
+	for index := range registrations {
+		uids[index] = fmt.Sprintf("1.2.840.10008.1.2.999.%d", index+1)
+		codecs[index] = &fakeCodec{}
+	}
+
+	start := make(chan struct{})
+	errorsFound := make(chan error, registrations)
+	var wait sync.WaitGroup
+	wait.Add(registrations + readers)
+	for index := range registrations {
+		go func() {
+			defer wait.Done()
+			<-start
+			if err := registry.RegisterCodec(uids[index], codecs[index]); err != nil {
+				errorsFound <- err
+			}
+		}()
+	}
+	for range readers {
+		go func() {
+			defer wait.Done()
+			<-start
+			for pass := 0; pass < registrations; pass++ {
+				for _, uid := range uids {
+					_, _ = registry.GetCodec(uid)
+				}
+			}
+		}()
+	}
+	close(start)
+	wait.Wait()
+	close(errorsFound)
+	for err := range errorsFound {
+		t.Fatalf("RegisterCodec() error = %v", err)
+	}
+	for index, uid := range uids {
+		got, ok := registry.GetCodec(uid)
+		if !ok || got != codecs[index] {
+			t.Fatalf("GetCodec(%q) = %#v, %t; want registered codec", uid, got, ok)
+		}
+	}
+}
+
 func TestMemoryRegistryRegisterCodecReturnsValidationErrors(t *testing.T) {
 	t.Run("nil receiver", func(t *testing.T) {
 		var r *MemoryRegistry
@@ -1140,17 +1191,26 @@ func TestDecodeFramesKnownJPEG2000ErrorIncludesOptionalAdapterHint(t *testing.T)
 	}
 }
 
-func TestDecodeFramesKnownJPEGLSErrorIncludesOptionalAdapterHint(t *testing.T) {
+func TestDecodeFramesKnownJPEGLSErrorIncludesRegistrationHint(t *testing.T) {
 	obj, pixel := testEncapsulatedPixelObject(t)
 
-	tests := []transfer.Syntax{
-		transfer.JPEGLSLossless,
-		transfer.JPEGLSNearLossless,
+	tests := []struct {
+		syntax transfer.Syntax
+		wants  []string
+	}{
+		{
+			syntax: transfer.JPEGLSLossless,
+			wants:  []string{"built-in pure-Go", "pixeldata/jpegls", "pixeldata/builtin"},
+		},
+		{
+			syntax: transfer.JPEGLSNearLossless,
+			wants:  []string{"pure-Go", "pixeldata/jpegls.RegisterNearLossless", "optional CharLS adapter", "examples/codec-adapters/jpegls"},
+		},
 	}
 
-	for _, syntax := range tests {
-		t.Run(syntax.Name, func(t *testing.T) {
-			_, err := NewMemoryRegistry().DecodeFrames(syntax.UID, pixel, obj)
+	for _, test := range tests {
+		t.Run(test.syntax.Name, func(t *testing.T) {
+			_, err := NewMemoryRegistry().DecodeFrames(test.syntax.UID, pixel, obj)
 			if err == nil {
 				t.Fatal("DecodeFrames() error = nil, want ErrCodecNotFound")
 			}
@@ -1161,18 +1221,11 @@ func TestDecodeFramesKnownJPEGLSErrorIncludesOptionalAdapterHint(t *testing.T) {
 			if !errors.As(err, &availability) {
 				t.Fatalf("error = %T, want CodecAvailabilityError", err)
 			}
-			if availability.TransferSyntaxUID != syntax.UID {
-				t.Fatalf("TransferSyntaxUID = %q, want %q", availability.TransferSyntaxUID, syntax.UID)
+			if availability.TransferSyntaxUID != test.syntax.UID {
+				t.Fatalf("TransferSyntaxUID = %q, want %q", availability.TransferSyntaxUID, test.syntax.UID)
 			}
-			for _, want := range []string{
-				syntax.UID,
-				syntax.Name,
-				"JPEG-LS",
-				"no default decoder adapter",
-				"examples/codec-adapters/jpegls",
-				"RegisterDefault",
-				"registered codecs: none",
-			} {
+			wants := append([]string{test.syntax.UID, test.syntax.Name, "JPEG-LS", "registered codecs: none"}, test.wants...)
+			for _, want := range wants {
 				if !strings.Contains(err.Error(), want) {
 					t.Fatalf("error = %q, want substring %q", err, want)
 				}

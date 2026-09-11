@@ -70,7 +70,9 @@ type EncoderRegistry interface {
 	EncodeFrame(ctx context.Context, uid string, frame []byte, metadata Metadata) (EncodedFrame, error)
 }
 
-// MemoryEncoderRegistry stores explicit frame encoder registrations.
+// MemoryEncoderRegistry stores explicit frame encoder registrations. Each
+// instance is safe for concurrent registration and lookup; duplicate UIDs are
+// rejected with ErrEncoderAlreadyRegistered.
 type MemoryEncoderRegistry struct {
 	mu    sync.RWMutex
 	byUID map[string]registeredFrameEncoder

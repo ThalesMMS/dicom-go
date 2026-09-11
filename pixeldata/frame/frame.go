@@ -393,7 +393,7 @@ func renderImage(data []byte, metadata pixeldata.Metadata, order binary.ByteOrde
 	case 1:
 		return renderGrayscaleImage(data, metadata, photometric, rows, cols, order, rescale, window)
 	case 3:
-		return renderRGBImage(data, metadata, photometric, rows, cols)
+		return RenderColor(data, metadata, order)
 	default:
 		return nil, fmt.Errorf("%w: SamplesPerPixel=%d", ErrUnsupportedSamplesPerPixel, metadata.SamplesPerPixel)
 	}
@@ -439,36 +439,90 @@ func renderGrayscaleImage(data []byte, metadata pixeldata.Metadata, photometric 
 	return out, nil
 }
 
-func renderRGBImage(data []byte, metadata pixeldata.Metadata, photometric string, rows, cols int) (*image.RGBA, error) {
+// RenderColor renders native or decoded three-sample color bytes through the
+// shared display pipeline. It supports 8-bit unsigned RGB and YBR_FULL in
+// interleaved or planar layout, plus interleaved YBR_FULL_422. PALETTE COLOR is
+// intentionally outside this adapter because pixeldata.Metadata does not carry
+// the required palette LUTs.
+func RenderColor(data []byte, metadata pixeldata.Metadata, order binary.ByteOrder) (*image.RGBA, error) {
 	if metadata.BitsAllocated != 8 {
-		return nil, fmt.Errorf("%w: BitsAllocated=%d for RGB", ErrUnsupportedBitsAllocated, metadata.BitsAllocated)
+		return nil, fmt.Errorf("%w: %w: BitsAllocated=%d for color", ErrUnsupportedBitsAllocated, display.ErrUnsupportedColorLayout, metadata.BitsAllocated)
 	}
 	if metadata.PixelRepresentation != 0 {
-		return nil, fmt.Errorf("%w: PixelRepresentation=%d for RGB", ErrInvalidFrameMetadata, metadata.PixelRepresentation)
+		return nil, fmt.Errorf("%w: PixelRepresentation=%d for color", ErrInvalidFrameMetadata, metadata.PixelRepresentation)
 	}
-	if metadata.PlanarConfigurationPresent && metadata.PlanarConfiguration != 0 {
-		return nil, fmt.Errorf("%w: PlanarConfiguration=%d for RGB", ErrUnsupportedPlanarConfiguration, metadata.PlanarConfiguration)
+	photometric := normalizedPhotometric(metadata.PhotometricInterpretation)
+	planar := 0
+	if metadata.PlanarConfigurationPresent {
+		planar = int(metadata.PlanarConfiguration)
 	}
-	if photometric != "RGB" {
-		return nil, fmt.Errorf("%w: %q for SamplesPerPixel=3", ErrUnsupportedPhotometricInterpretation, metadata.PhotometricInterpretation)
+	if planar != 0 && planar != 1 || planar == 1 && photometric != "RGB" && photometric != "YBR_FULL" {
+		return nil, fmt.Errorf("%w: %w: PlanarConfiguration=%d for %s", ErrUnsupportedPlanarConfiguration, display.ErrUnsupportedColorLayout, planar, photometric)
 	}
-
-	const samplesPerPixel = 3
-	expected := rows * cols * samplesPerPixel
-	if len(data) < expected {
-		return nil, fmt.Errorf("%w: got %d bytes, want %d", ErrPixelDataTooShort, len(data), expected)
+	switch photometric {
+	case "RGB", "YBR_FULL", "YBR_FULL_422":
+	case "PALETTE COLOR":
+		return nil, fmt.Errorf("%w: %q requires palette LUT metadata", ErrUnsupportedPhotometricInterpretation, metadata.PhotometricInterpretation)
+	default:
+		return nil, fmt.Errorf("%w: %w: %q for SamplesPerPixel=3", ErrUnsupportedPhotometricInterpretation, display.ErrUnsupportedColorPhotometric, metadata.PhotometricInterpretation)
 	}
-
-	out := image.NewRGBA(image.Rect(0, 0, cols, rows))
-	for pixelIndex := 0; pixelIndex < rows*cols; pixelIndex++ {
-		src := pixelIndex * samplesPerPixel
-		dst := pixelIndex * 4
-		out.Pix[dst] = data[src]
-		out.Pix[dst+1] = data[src+1]
-		out.Pix[dst+2] = data[src+2]
-		out.Pix[dst+3] = 255
+	if order == nil {
+		order = binary.LittleEndian
+	}
+	out, err := display.RenderColor(display.ColorFrame{
+		Rows:                int(metadata.Rows),
+		Columns:             int(metadata.Columns),
+		Pixels:              data,
+		Photometric:         photometric,
+		SamplesPerPixel:     int(metadata.SamplesPerPixel),
+		PlanarConfiguration: planar,
+		Format: display.PixelFormat{
+			BitsAllocated: int(metadata.BitsAllocated),
+			BitsStored:    int(metadata.BitsStored),
+			HighBit:       int(metadata.HighBit),
+			Signed:        metadata.PixelRepresentation != 0,
+			ByteOrder:     order,
+		},
+	})
+	if err != nil {
+		return nil, translateColorRenderError(err)
 	}
 	return out, nil
+}
+
+func translateColorRenderError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var legacy error
+	var validation *display.FrameValidationError
+	if errors.As(err, &validation) {
+		switch validation.Field {
+		case "SamplesPerPixel":
+			legacy = ErrUnsupportedSamplesPerPixel
+		case "BitsAllocated":
+			legacy = ErrUnsupportedBitsAllocated
+		case "PlanarConfiguration":
+			legacy = ErrUnsupportedPlanarConfiguration
+		case "PhotometricInterpretation":
+			legacy = ErrUnsupportedPhotometricInterpretation
+		case "Pixels":
+			legacy = ErrPixelDataTooShort
+		}
+	}
+	if legacy == nil {
+		switch {
+		case errors.Is(err, display.ErrPixelDataTooShort):
+			legacy = ErrPixelDataTooShort
+		case errors.Is(err, display.ErrUnsupportedColorPhotometric):
+			legacy = ErrUnsupportedPhotometricInterpretation
+		case errors.Is(err, display.ErrInvalidFrame), errors.Is(err, display.ErrFrameSizeOverflow), errors.Is(err, display.ErrUnsupportedColorLayout):
+			legacy = ErrInvalidFrameMetadata
+		default:
+			return err
+		}
+	}
+	return fmt.Errorf("%w: %w", legacy, err)
 }
 
 func frameOptions(opts ...Option) options {

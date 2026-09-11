@@ -100,6 +100,8 @@ func (e *DecompressResourceLimitError) Unwrap() error {
 // cancellation while decoding. Existing Codec implementations remain valid;
 // context-aware decompression prefers this interface when it is available.
 type ContextCodec interface {
+	// DecodeContext has the same borrowed-input and owned-output contract as
+	// Codec.Decode and additionally observes ctx cancellation.
 	DecodeContext(context.Context, PixelData, *object.Object) (Frames, error)
 }
 
@@ -412,23 +414,7 @@ func decodeForDecompressionContext(ctx context.Context, source transfer.Syntax, 
 	if registry == nil {
 		return Frames{}, codecAvailabilityError(ErrCodecRegistryNil, source.UID, nil)
 	}
-	if codec, ok := registry.GetCodec(source.UID); ok {
-		if contextual, ok := codec.(ContextCodec); ok {
-			frames, err := contextual.DecodeContext(ctx, pixel, dataset)
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				return Frames{}, ctxErr
-			}
-			if err != nil {
-				return Frames{}, codecDecodeError(source.UID, err)
-			}
-			return frames, nil
-		}
-	}
-	frames, err := registry.DecodeFrames(source.UID, pixel, dataset)
-	if ctxErr := ctx.Err(); ctxErr != nil {
-		return Frames{}, ctxErr
-	}
-	return frames, err
+	return decodeFramesWithRegistry(ctx, registry, source.UID, pixel, dataset)
 }
 
 func nativeFrameBytesContext(ctx context.Context, metadata Metadata, frames Frames) ([]byte, error) {

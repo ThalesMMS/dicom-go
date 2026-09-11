@@ -356,8 +356,12 @@ func TestFromParserFramePreservesPlanarConfiguration(t *testing.T) {
 	}
 
 	frame := FromParserFrame(source)
-	if _, err := frame.GetImage(); !errors.Is(err, ErrUnsupportedPlanarConfiguration) {
-		t.Fatalf("GetImage() error = %v, want ErrUnsupportedPlanarConfiguration", err)
+	img, err := frame.GetImage()
+	if err != nil {
+		t.Fatalf("GetImage() error = %v", err)
+	}
+	if got := requireRGBA(t, img).RGBAAt(0, 0); got != (color.RGBA{R: 255, A: 255}) {
+		t.Fatalf("planar RGB pixel = %#v, want opaque red", got)
 	}
 }
 
@@ -585,25 +589,171 @@ func TestNativeFrameGetImageRejectsUnsupportedSamplesPerPixel(t *testing.T) {
 	}
 }
 
-func TestNativeFrameGetImageRejectsPlanarRGB(t *testing.T) {
-	frame := NewNativeFrame(
-		0,
-		[]byte{255, 0, 0},
-		pixeldata.Metadata{
-			Rows:                       1,
-			Columns:                    1,
-			SamplesPerPixel:            3,
-			BitsAllocated:              8,
-			BitsStored:                 8,
-			HighBit:                    7,
-			PlanarConfiguration:        1,
-			PlanarConfigurationPresent: true,
-			PhotometricInterpretation:  "RGB",
+func TestNativeFrameGetImageColorLayouts(t *testing.T) {
+	tests := []struct {
+		name        string
+		photometric string
+		planar      uint16
+		data        []byte
+		want        []color.RGBA
+	}{
+		{
+			name:        "planar RGB",
+			photometric: "RGB",
+			planar:      1,
+			data:        []byte{255, 0, 0, 0, 255, 0, 0, 0, 255},
+			want:        []color.RGBA{{R: 255, A: 255}, {G: 255, A: 255}, {B: 255, A: 255}},
 		},
-	)
-	_, err := frame.GetImage()
-	if !errors.Is(err, ErrUnsupportedPlanarConfiguration) {
-		t.Fatalf("GetImage() error = %v, want ErrUnsupportedPlanarConfiguration", err)
+		{
+			name:        "interleaved YBR FULL",
+			photometric: "YBR_FULL",
+			data:        []byte{128, 128, 128, 128, 128, 200},
+			want:        []color.RGBA{{R: 128, G: 128, B: 128, A: 255}, {R: 229, G: 77, B: 128, A: 255}},
+		},
+		{
+			name:        "planar YBR FULL",
+			photometric: "YBR_FULL",
+			planar:      1,
+			data:        []byte{128, 128, 128, 128, 128, 200},
+			want:        []color.RGBA{{R: 128, G: 128, B: 128, A: 255}, {R: 229, G: 77, B: 128, A: 255}},
+		},
+		{
+			name:        "interleaved YBR FULL 422",
+			photometric: "YBR_FULL_422",
+			data:        []byte{128, 128, 128, 200},
+			want:        []color.RGBA{{R: 229, G: 77, B: 128, A: 255}, {R: 229, G: 77, B: 128, A: 255}},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			frame := NewNativeFrame(0, tc.data, colorTestMetadata(uint16(len(tc.want)), tc.photometric, tc.planar))
+			img, err := frame.GetImage()
+			if err != nil {
+				t.Fatalf("GetImage() error = %v", err)
+			}
+			rgba := requireRGBA(t, img)
+			for x, want := range tc.want {
+				if got := rgba.RGBAAt(x, 0); got != want {
+					t.Fatalf("pixel %d = %#v, want %#v", x, got, want)
+				}
+			}
+		})
+	}
+}
+
+func TestNativeFrameGetImageTreatsAbsentPlanarConfigurationAsInterleaved(t *testing.T) {
+	metadata := colorTestMetadata(2, "RGB", 1)
+	metadata.PlanarConfigurationPresent = false
+	frame := NewNativeFrame(0, []byte{255, 0, 0, 0, 255, 0}, metadata)
+
+	img, err := frame.GetImage()
+	if err != nil {
+		t.Fatalf("GetImage() error = %v", err)
+	}
+	rgba := requireRGBA(t, img)
+	if got := rgba.RGBAAt(0, 0); got != (color.RGBA{R: 255, A: 255}) {
+		t.Fatalf("pixel 0 = %#v, want red", got)
+	}
+	if got := rgba.RGBAAt(1, 0); got != (color.RGBA{G: 255, A: 255}) {
+		t.Fatalf("pixel 1 = %#v, want green", got)
+	}
+}
+
+func TestExtractFramesRendersNativeYBRFull422(t *testing.T) {
+	elements := []core.Element{
+		dicomtest.Uint16Element(core.NewTag(0x0028, 0x0002), core.VRUS, binary.LittleEndian, 3),
+		dicomtest.NewStringElement(core.NewTag(0x0028, 0x0004), core.VRCS, "YBR_FULL_422"),
+		dicomtest.Uint16Element(core.NewTag(0x0028, 0x0006), core.VRUS, binary.LittleEndian, 0),
+		dicomtest.Uint16Element(core.NewTag(0x0028, 0x0010), core.VRUS, binary.LittleEndian, 1),
+		dicomtest.Uint16Element(core.NewTag(0x0028, 0x0011), core.VRUS, binary.LittleEndian, 2),
+		dicomtest.Uint16Element(core.NewTag(0x0028, 0x0100), core.VRUS, binary.LittleEndian, 8),
+		dicomtest.Uint16Element(core.NewTag(0x0028, 0x0101), core.VRUS, binary.LittleEndian, 8),
+		dicomtest.Uint16Element(core.NewTag(0x0028, 0x0102), core.VRUS, binary.LittleEndian, 7),
+		dicomtest.Uint16Element(core.NewTag(0x0028, 0x0103), core.VRUS, binary.LittleEndian, 0),
+		dicomtest.NewOBElement(core.TagPixelData, []byte{128, 128, 128, 200}),
+	}
+	data, err := dicomtest.Part10File(transfer.ExplicitVRLittleEndian, elements...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, err := object.ReadFile(bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	frames, err := ExtractFrames(file)
+	if err != nil {
+		t.Fatalf("ExtractFrames() error = %v", err)
+	}
+	if len(frames) != 1 {
+		t.Fatalf("frame count = %d, want 1", len(frames))
+	}
+	img, err := frames[0].GetImage()
+	if err != nil {
+		t.Fatalf("GetImage() error = %v", err)
+	}
+	for x := 0; x < 2; x++ {
+		if got := requireRGBA(t, img).RGBAAt(x, 0); got != (color.RGBA{R: 229, G: 77, B: 128, A: 255}) {
+			t.Fatalf("pixel %d = %#v, want converted YBR red", x, got)
+		}
+	}
+}
+
+func TestNativeFrameGetImageColorErrorsRemainTyped(t *testing.T) {
+	tests := []struct {
+		name        string
+		data        []byte
+		metadata    pixeldata.Metadata
+		wantErr     error
+		wantDisplay error
+	}{
+		{name: "invalid planar configuration", data: make([]byte, 3), metadata: colorTestMetadata(1, "RGB", 2), wantErr: ErrUnsupportedPlanarConfiguration, wantDisplay: display.ErrUnsupportedColorLayout},
+		{name: "planar YBR FULL 422", data: make([]byte, 4), metadata: colorTestMetadata(2, "YBR_FULL_422", 1), wantErr: ErrUnsupportedPlanarConfiguration, wantDisplay: display.ErrUnsupportedColorLayout},
+		{name: "odd width YBR FULL 422", data: make([]byte, 8), metadata: colorTestMetadata(3, "YBR_FULL_422", 0), wantErr: ErrInvalidFrameMetadata, wantDisplay: display.ErrUnsupportedColorLayout},
+		{name: "unsupported photometric", data: make([]byte, 3), metadata: colorTestMetadata(1, "YBR_PARTIAL_420", 0), wantErr: ErrUnsupportedPhotometricInterpretation, wantDisplay: display.ErrUnsupportedColorPhotometric},
+		{name: "unsupported bits", data: make([]byte, 6), metadata: func() pixeldata.Metadata { m := colorTestMetadata(1, "RGB", 0); m.BitsAllocated = 16; return m }(), wantErr: ErrUnsupportedBitsAllocated, wantDisplay: display.ErrUnsupportedColorLayout},
+		{name: "bits retain precedence over signed samples", data: make([]byte, 6), metadata: func() pixeldata.Metadata {
+			m := colorTestMetadata(1, "RGB", 0)
+			m.BitsAllocated = 16
+			m.PixelRepresentation = 1
+			return m
+		}(), wantErr: ErrUnsupportedBitsAllocated, wantDisplay: display.ErrUnsupportedColorLayout},
+		{name: "planar retains precedence over unsupported photometric", data: make([]byte, 3), metadata: colorTestMetadata(1, "YBR_PARTIAL_420", 1), wantErr: ErrUnsupportedPlanarConfiguration, wantDisplay: display.ErrUnsupportedColorLayout},
+		{name: "signed samples", data: make([]byte, 3), metadata: func() pixeldata.Metadata { m := colorTestMetadata(1, "RGB", 0); m.PixelRepresentation = 1; return m }(), wantErr: ErrInvalidFrameMetadata},
+		{name: "short pixels", data: []byte{0}, metadata: colorTestMetadata(1, "RGB", 0), wantErr: ErrPixelDataTooShort, wantDisplay: display.ErrPixelDataTooShort},
+		{name: "palette remains outside frame adapter", data: []byte{0}, metadata: func() pixeldata.Metadata {
+			m := colorTestMetadata(1, "PALETTE COLOR", 0)
+			m.SamplesPerPixel = 1
+			return m
+		}(), wantErr: ErrUnsupportedPhotometricInterpretation},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := NewNativeFrame(0, tc.data, tc.metadata).GetImage()
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("GetImage() error = %v, want %v", err, tc.wantErr)
+			}
+			if tc.wantDisplay != nil && !errors.Is(err, tc.wantDisplay) {
+				t.Fatalf("GetImage() error = %v, also want shared display error %v", err, tc.wantDisplay)
+			}
+		})
+	}
+}
+
+func BenchmarkNativeFrameGetImageRGB512(b *testing.B) {
+	frame := NewNativeFrame(0, make([]byte, 512*512*3), colorTestMetadata(512, "RGB", 0))
+	frame.NativeData.Metadata.Rows = 512
+	b.ReportAllocs()
+	b.ResetTimer()
+	var img image.Image
+	var err error
+	for i := 0; i < b.N; i++ {
+		img, err = frame.GetImage()
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+	if img == nil {
+		b.Fatal("GetImage() returned nil")
 	}
 }
 
@@ -636,6 +786,21 @@ func testMetadata(rows, columns, bitsAllocated, bitsStored, highBit, pixelRepres
 		PixelRepresentation:       pixelRepresentation,
 		NumberOfFrames:            1,
 		PhotometricInterpretation: photometric,
+	}
+}
+
+func colorTestMetadata(columns uint16, photometric string, planar uint16) pixeldata.Metadata {
+	return pixeldata.Metadata{
+		Rows:                       1,
+		Columns:                    columns,
+		SamplesPerPixel:            3,
+		BitsAllocated:              8,
+		BitsStored:                 8,
+		HighBit:                    7,
+		PlanarConfiguration:        planar,
+		PlanarConfigurationPresent: true,
+		NumberOfFrames:             1,
+		PhotometricInterpretation:  photometric,
 	}
 }
 

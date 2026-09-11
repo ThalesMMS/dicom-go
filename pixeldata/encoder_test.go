@@ -3,6 +3,7 @@ package pixeldata
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"sync"
@@ -177,25 +178,55 @@ func TestEncoderRegistryPreservesTypedBackendErrorsWithoutEchoingThem(t *testing
 	}
 }
 
-func TestMemoryEncoderRegistryConcurrentUse(t *testing.T) {
-	registry := NewMemoryEncoderRegistry()
-	capabilities := testEncoderCapabilities()
-	encoder := &testFrameEncoder{capabilities: capabilities, encoded: EncodedFrame{Data: []byte{1}}}
-	if err := registry.RegisterEncoder(capabilities.TransferSyntaxUID, encoder); err != nil {
-		t.Fatal(err)
+func TestMemoryEncoderRegistryConcurrentRegisterAndGet(t *testing.T) {
+	const registrations = 64
+	const readers = 16
+	registry := &MemoryEncoderRegistry{}
+	uids := make([]string, registrations)
+	encoders := make([]FrameEncoder, registrations)
+	for index := range registrations {
+		capabilities := testEncoderCapabilities()
+		capabilities.TransferSyntaxUID = fmt.Sprintf("1.2.840.10008.1.2.998.%d", index+1)
+		uids[index] = capabilities.TransferSyntaxUID
+		encoders[index] = &testFrameEncoder{capabilities: capabilities, encoded: EncodedFrame{Data: []byte{1}}}
 	}
-	const workers = 16
+
+	start := make(chan struct{})
+	errorsFound := make(chan error, registrations)
 	var wait sync.WaitGroup
-	wait.Add(workers)
-	for i := 0; i < workers; i++ {
+	wait.Add(registrations + readers)
+	for index := range registrations {
 		go func() {
 			defer wait.Done()
-			if _, ok := registry.GetEncoder(capabilities.TransferSyntaxUID); !ok {
-				t.Error("GetEncoder() = false")
+			<-start
+			if err := registry.RegisterEncoder(uids[index], encoders[index]); err != nil {
+				errorsFound <- err
 			}
 		}()
 	}
+	for range readers {
+		go func() {
+			defer wait.Done()
+			<-start
+			for pass := 0; pass < registrations; pass++ {
+				for _, uid := range uids {
+					_, _ = registry.GetEncoder(uid)
+				}
+			}
+		}()
+	}
+	close(start)
 	wait.Wait()
+	close(errorsFound)
+	for err := range errorsFound {
+		t.Fatalf("RegisterEncoder() error = %v", err)
+	}
+	for index, uid := range uids {
+		got, ok := registry.GetEncoder(uid)
+		if !ok || got.Capabilities().TransferSyntaxUID != uid {
+			t.Fatalf("GetEncoder(%q) = %#v, %t; want encoder %d", uid, got, ok, index)
+		}
+	}
 }
 
 func TestMemoryEncoderRegistryRejectsDuplicateUID(t *testing.T) {

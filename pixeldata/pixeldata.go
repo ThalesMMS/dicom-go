@@ -1,6 +1,7 @@
 package pixeldata
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"math"
@@ -171,8 +172,11 @@ func (m Metadata) TotalSize() int64 {
 }
 
 type Codec interface {
-	// Decode must treat pixel and obj as read-only. Returned frame buffers may
-	// alias pixel data when the codec does not need to transform it.
+	// Decode must treat pixel and obj as borrowed, read-only inputs. A codec must
+	// not retain either input (or any buffer reachable from them) after Decode
+	// returns. Returned frame buffers must own their storage and must not alias
+	// pixel or obj. These rules let callers safely decode an ExtractView result
+	// without cloning the compressed payload first.
 	Decode(pixel PixelData, obj *object.Object) (Frames, error)
 }
 
@@ -182,6 +186,9 @@ type Registry interface {
 	DecodeFrames(uid string, pixel PixelData, obj *object.Object) (Frames, error)
 }
 
+// MemoryRegistry is safe for concurrent registration and lookup. Registrations
+// are synchronized per instance, and registering an existing UID replaces its
+// codec as it has historically done.
 type MemoryRegistry struct {
 	mu    sync.RWMutex
 	byUID map[string]Codec
@@ -351,45 +358,7 @@ func (r *MemoryRegistry) RegisteredCodecUIDs() []string {
 }
 
 func (r *MemoryRegistry) DecodeFrames(uid string, pixel PixelData, obj *object.Object) (Frames, error) {
-	normalizedUID := transfer.NormalizeUID(uid)
-	if IsJPIPReferencedTransferSyntax(normalizedUID) {
-		ref, err := ExtractJPIPReference(normalizedUID, obj)
-		if err != nil {
-			return Frames{}, err
-		}
-		return Frames{}, &JPIPRetrievalRequiredError{Reference: ref}
-	}
-	if transfer.IsVideoTransferSyntax(normalizedUID) {
-		return Frames{}, mediaPayloadNotRenderableError(normalizedUID, pixel)
-	}
-	if syntax, ok := transfer.DefaultRegistry.Get(normalizedUID); ok {
-		switch {
-		case syntax.Encapsulated && !pixel.Encapsulated:
-			return Frames{}, fmt.Errorf("%w: transfer syntax %q expects encapsulated pixel data", ErrIncompatiblePixelData, syntax.UID)
-		case !syntax.Encapsulated && pixel.Encapsulated:
-			return Frames{}, fmt.Errorf("%w: transfer syntax %q expects native pixel data", ErrIncompatiblePixelData, syntax.UID)
-		}
-	}
-
-	if normalizedUID == transfer.EncapsulatedUncompressedExplicitVRLittleEndian.UID {
-		return decodeEncapsulatedUncompressedFrames(pixel, obj)
-	}
-	if !pixel.Encapsulated {
-		return decodeNativeFrames(pixel, obj)
-	}
-	if r == nil {
-		return Frames{}, codecAvailabilityError(ErrCodecRegistryNil, normalizedUID, nil)
-	}
-
-	codec, ok := r.GetCodec(normalizedUID)
-	if !ok {
-		return Frames{}, codecAvailabilityError(ErrCodecNotFound, normalizedUID, r.RegisteredCodecUIDs())
-	}
-	frames, err := codec.Decode(pixel, obj)
-	if err != nil {
-		return Frames{}, codecDecodeError(normalizedUID, err)
-	}
-	return frames, nil
+	return r.DecodeFramesContext(context.Background(), uid, pixel, obj)
 }
 
 // IsJPIPReferencedTransferSyntax reports whether uid is one of the DICOM JPIP
@@ -474,24 +443,7 @@ func CheckCodecAvailability(registry Registry, uid string) error {
 }
 
 func DecodeFrames(uid string, pixel PixelData, obj *object.Object) (Frames, error) {
-	normalizedUID := transfer.NormalizeUID(uid)
-	if IsJPIPReferencedTransferSyntax(normalizedUID) {
-		ref, err := ExtractJPIPReference(normalizedUID, obj)
-		if err != nil {
-			return Frames{}, err
-		}
-		return Frames{}, &JPIPRetrievalRequiredError{Reference: ref}
-	}
-	if transfer.IsVideoTransferSyntax(normalizedUID) {
-		return Frames{}, mediaPayloadNotRenderableError(normalizedUID, pixel)
-	}
-	if normalizedUID == transfer.EncapsulatedUncompressedExplicitVRLittleEndian.UID {
-		return decodeEncapsulatedUncompressedFrames(pixel, obj)
-	}
-	if DefaultRegistry == nil {
-		return Frames{}, codecAvailabilityError(ErrCodecRegistryNil, normalizedUID, nil)
-	}
-	return DefaultRegistry.DecodeFrames(normalizedUID, pixel, obj)
+	return DecodeFramesContext(context.Background(), uid, pixel, obj)
 }
 
 func mediaPayloadNotRenderableError(uid string, pixel PixelData) error {
@@ -535,15 +487,18 @@ func codecRegistrationHint(syntax transfer.Syntax) string {
 	case transfer.JPEGBaseline.UID:
 		return "register the JPEG Baseline codec with pixeldata/jpeg.RegisterDefault or jpeg.Register(registry)"
 	case transfer.JPEGExtended.UID:
-		return "register the JPEG Extended 8-bit codec with pixeldata/jpeg.RegisterDefault or jpeg.Register(registry)"
+		return "register the JPEG Extended Process 2/4 codec with pixeldata/jpeg.RegisterDefault or jpeg.Register(registry)"
 	case transfer.JPEGLosslessNonHierarchical.UID,
 		transfer.JPEGLosslessSV1.UID:
 		return "register the JPEG Lossless codec with pixeldata/jpeglossless.RegisterDefault or jpeglossless.Register(registry)"
 	case transfer.RLELossless.UID:
 		return "register the RLE Lossless codec with pixeldata/rle.RegisterDefault or rle.Register(registry)"
 	}
-	if transfer.IsJPEGLSTransferSyntax(syntax.UID) {
-		return "JPEG-LS transfer syntax is recognized, but dicom-go has no default decoder adapter; metadata and encapsulated Pixel Data can be preserved, or register the optional adapter from examples/codec-adapters/jpegls with jpegls.RegisterDefault(decoder) or jpegls.Register(registry, decoder)"
+	if syntax.UID == transfer.JPEGLSLossless.UID {
+		return "register the built-in pure-Go JPEG-LS Lossless codec with pixeldata/jpegls.RegisterDefault, jpegls.Register(registry), or pixeldata/builtin.Register(registry)"
+	}
+	if syntax.UID == transfer.JPEGLSNearLossless.UID {
+		return "register the qualified unsigned pure-Go JPEG-LS Near-Lossless decoder with pixeldata/jpegls.RegisterNearLossless(registry) or pixeldata/builtin.Register(registry); the optional CharLS adapter remains available from examples/codec-adapters/jpegls"
 	}
 	if transfer.IsJPEG2000TransferSyntax(syntax.UID) {
 		return "JPEG 2000 / HTJ2K transfer syntax is recognized, but dicom-go has no default decoder adapter; metadata and encapsulated Pixel Data can be preserved, or register the optional adapter from examples/codec-adapters/jpeg2000 with jpeg2000.RegisterDefault or jpeg2000.Register(registry)"
@@ -922,11 +877,17 @@ func pixelDataLengthMatches(actual, expected int64) bool {
 
 func getUint16(obj *object.Object, tag core.Tag) (uint16, bool) {
 	elem, ok := obj.Get(tag)
-	if !ok {
+	if !ok || elem.VR() != core.VRUS {
 		return 0, false
 	}
+	if values, ok := elem.Value.(core.Uint16Value); ok {
+		if len(values) != 1 {
+			return 0, false
+		}
+		return values[0], true
+	}
 	raw, ok := elem.RawBytes()
-	if !ok || len(raw) < 2 {
+	if !ok || len(raw) != 2 {
 		return 0, false
 	}
 	return obj.ValueByteOrder().Uint16(raw[:2]), true

@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"maps"
 	"sort"
 	"strconv"
 	"time"
@@ -29,30 +30,38 @@ type TextOptions struct {
 }
 
 type sequenceItemTemplate struct {
-	elements          map[core.Tag]core.Element
-	order             []core.Tag
-	orderIndex        map[core.Tag]int
-	staleOrder        int
-	ambiguousDeferred map[core.Tag]bool
-	deferredCount     int
-	itemOffset        int64
-	itemOffsetSet     bool
-	inheritedCharset  dicomenc.SpecificCharacterSet
-	inheritedErr      error
+	privateDuplicateSlots map[core.Tag]bool
+	privateScope          *dictionary.PrivateReservations
+	privateScopeError     error
+	elements              map[core.Tag]core.Element
+	order                 []core.Tag
+	orderIndex            map[core.Tag]int
+	staleOrder            int
+	ambiguousDeferred     map[core.Tag]bool
+	deferredCount         int
+	itemOffset            int64
+	itemOffsetSet         bool
+	inheritedCharset      dicomenc.SpecificCharacterSet
+	inheritedErr          error
 }
 
 type Object struct {
-	elements      map[core.Tag]core.Element
-	order         []core.Tag
-	orderIndex    map[core.Tag]int
-	staleOrder    int
-	sequenceCache map[core.Tag][]sequenceItemTemplate
-	sharedBacking bool
-	dict          dictionary.DataDictionary
-	text          TextOptions
-	byteOrder     binary.ByteOrder
-	itemOffset    int64
-	itemOffsetSet bool
+	privateDuplicateSlots       map[core.Tag]bool
+	privateScope                *dictionary.PrivateReservations
+	privateScopeError           error
+	privateDiagnostics          []PrivateDiagnostic
+	privateDiagnosticsTruncated bool
+	elements                    map[core.Tag]core.Element
+	order                       []core.Tag
+	orderIndex                  map[core.Tag]int
+	staleOrder                  int
+	sequenceCache               map[core.Tag][]sequenceItemTemplate
+	sharedBacking               bool
+	dict                        dictionary.DataDictionary
+	text                        TextOptions
+	byteOrder                   binary.ByteOrder
+	itemOffset                  int64
+	itemOffsetSet               bool
 
 	valueProvider            valueProvider
 	source                   io.Closer
@@ -142,6 +151,7 @@ func FromElements(elements []core.Element, dict dictionary.DataDictionary) *Obje
 	for _, elem := range elements {
 		obj.Put(elem)
 	}
+	obj.capturePrivateScope(elements)
 	return obj
 }
 
@@ -161,6 +171,7 @@ func dataSetObjectWithTextOptions(ds core.DataSet, dict dictionary.DataDictionar
 	}
 	obj.itemOffset = ds.ItemOffset
 	obj.itemOffsetSet = ds.ItemOffsetSet
+	obj.capturePrivateScope(ds.Elements)
 	return obj
 }
 
@@ -169,6 +180,7 @@ func FromElementsWithTextOptions(elements []core.Element, dict dictionary.DataDi
 	for _, elem := range elements {
 		obj.Put(elem)
 	}
+	obj.capturePrivateScope(elements)
 	return obj
 }
 
@@ -181,6 +193,7 @@ func fromParsedDataSetWithTextOptions(ds core.DataSet, dict dictionary.DataDicti
 	for _, elem := range ds.Elements {
 		obj.put(elem, true)
 	}
+	obj.capturePrivateScope(ds.Elements)
 	return obj
 }
 
@@ -226,6 +239,11 @@ func (o *Object) put(elem core.Element, parsedDuplicateIsAmbiguous bool) {
 		o.elements = map[core.Tag]core.Element{}
 	}
 	tag := elem.Tag()
+	if dictionary.IsPrivateCreatorTag(tag) {
+		o.privateScope = nil
+		o.privateScopeError = nil
+		delete(o.privateDuplicateSlots, tag)
+	}
 	delete(o.sequenceCache, tag)
 	if existing, exists := o.elements[tag]; exists {
 		if o.orderIndex == nil && len(o.order) >= orderIndexThreshold {
@@ -282,6 +300,11 @@ func (o *Object) Remove(tag core.Tag) bool {
 		return false
 	}
 	o.detachBacking()
+	if dictionary.IsPrivateCreatorTag(tag) {
+		o.privateScope = nil
+		o.privateScopeError = nil
+		delete(o.privateDuplicateSlots, tag)
+	}
 	delete(o.sequenceCache, tag)
 	if !o.ambiguousDeferred[tag] {
 		o.deferredCount -= countDeferredElement(existing)
@@ -330,6 +353,7 @@ func (o *Object) detachBacking() {
 	}
 	o.elements = elements
 	o.order = append([]core.Tag(nil), o.order...)
+	o.privateDuplicateSlots = maps.Clone(o.privateDuplicateSlots)
 	if o.orderIndex != nil {
 		index := make(map[core.Tag]int, len(o.orderIndex))
 		for tag, position := range o.orderIndex {
@@ -451,6 +475,9 @@ func (o *Object) GetRaw(tag core.Tag) ([]byte, bool) {
 //     source with an attached valueProvider.
 //   - For skipped values, CopyValueTo uses recorded value offsets when available
 //     and may reparse the underlying stream as a compatibility fallback.
+//   - Keep the source stable: replay reads its current bytes, not a cached
+//     snapshot. Same-size source edits cannot be detected by recorded offsets.
+//     Discard partial output when replay returns an error.
 //
 // If the element was materialized in memory, CopyValueTo copies from its RawValue.
 // If the element value was skipped during parsing (e.g., because
@@ -760,16 +787,19 @@ func (o *Object) GetSequence(tag core.Tag) ([]*Object, bool) {
 
 func sequenceItemTemplateFromObject(obj *Object) sequenceItemTemplate {
 	return sequenceItemTemplate{
-		elements:          obj.elements,
-		order:             obj.order,
-		orderIndex:        obj.orderIndex,
-		staleOrder:        obj.staleOrder,
-		ambiguousDeferred: obj.ambiguousDeferred,
-		deferredCount:     obj.deferredCount,
-		itemOffset:        obj.itemOffset,
-		itemOffsetSet:     obj.itemOffsetSet,
-		inheritedCharset:  obj.inheritedCharset,
-		inheritedErr:      obj.inheritedCharsetErr,
+		privateDuplicateSlots: obj.privateDuplicateSlots,
+		privateScope:          obj.privateScope,
+		privateScopeError:     obj.privateScopeError,
+		elements:              obj.elements,
+		order:                 obj.order,
+		orderIndex:            obj.orderIndex,
+		staleOrder:            obj.staleOrder,
+		ambiguousDeferred:     obj.ambiguousDeferred,
+		deferredCount:         obj.deferredCount,
+		itemOffset:            obj.itemOffset,
+		itemOffsetSet:         obj.itemOffsetSet,
+		inheritedCharset:      obj.inheritedCharset,
+		inheritedErr:          obj.inheritedCharsetErr,
 	}
 }
 
@@ -781,21 +811,24 @@ func sequenceItemFacades(parent *Object, templates []sequenceItemTemplate) []*Ob
 	items := make([]*Object, len(templates))
 	for i, template := range templates {
 		objects[i] = Object{
-			elements:            template.elements,
-			order:               template.order,
-			orderIndex:          template.orderIndex,
-			staleOrder:          template.staleOrder,
-			sharedBacking:       true,
-			dict:                parent.dict,
-			text:                parent.text,
-			byteOrder:           parent.ValueByteOrder(),
-			itemOffset:          template.itemOffset,
-			itemOffsetSet:       template.itemOffsetSet,
-			deferredCount:       template.deferredCount,
-			ambiguousDeferred:   template.ambiguousDeferred,
-			inheritedCharsetSet: true,
-			inheritedCharset:    template.inheritedCharset,
-			inheritedCharsetErr: template.inheritedErr,
+			privateDuplicateSlots: template.privateDuplicateSlots,
+			privateScope:          template.privateScope,
+			privateScopeError:     template.privateScopeError,
+			elements:              template.elements,
+			order:                 template.order,
+			orderIndex:            template.orderIndex,
+			staleOrder:            template.staleOrder,
+			sharedBacking:         true,
+			dict:                  parent.dict,
+			text:                  parent.text,
+			byteOrder:             parent.ValueByteOrder(),
+			itemOffset:            template.itemOffset,
+			itemOffsetSet:         template.itemOffsetSet,
+			deferredCount:         template.deferredCount,
+			ambiguousDeferred:     template.ambiguousDeferred,
+			inheritedCharsetSet:   true,
+			inheritedCharset:      template.inheritedCharset,
+			inheritedCharsetErr:   template.inheritedErr,
 		}
 		items[i] = &objects[i]
 	}
@@ -892,6 +925,9 @@ func (o *Object) decodeTextValues(elem core.Element) ([]string, error) {
 		}
 		return values, nil
 	case core.RawValue:
+		if dictionary.IsPrivateCreatorTag(elem.Tag()) {
+			return decodeRawTextValuesWithCharacterSet(elem.VR(), value.Bytes(), dicomenc.DefaultCharacterSet)
+		}
 		charset, err := o.characterSetForVR(elem.VR())
 		if err != nil {
 			return nil, err
@@ -945,6 +981,9 @@ func decodeRawTextValues(vr core.VR, raw []byte, codec dicomenc.TextCodec) ([]st
 func decodeRawTextValuesWithCharacterSet(vr core.VR, raw []byte, charset dicomenc.SpecificCharacterSet) ([]string, error) {
 	if vr == core.VRPN {
 		return decodeRawTextValuesFunc(vr, raw, charset.DecodePersonName)
+	}
+	if !vr.UsesTextValueDelimiter() {
+		return decodeRawTextValuesFunc(vr, raw, charset.DecodeSingleValue)
 	}
 	return decodeRawTextValuesFunc(vr, raw, charset.Decode)
 }

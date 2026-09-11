@@ -240,15 +240,15 @@ func TestLookupStringsDecodesSpecificCharacterSet(t *testing.T) {
 }
 
 func TestLookupStringsSplitsMultiValueTextAfterCharsetDecode(t *testing.T) {
-	charset, err := dicomenc.ParseCharacterSet("ISO 2022 IR 13")
+	charset, err := dicomenc.ParseCharacterSet("", "ISO 2022 IR 87")
 	if err != nil {
 		t.Fatalf("ParseCharacterSet() error = %v", err)
 	}
-	first, err := charset.Encode("表")
+	first, err := charset.Encode("к")
 	if err != nil {
 		t.Fatalf("Encode(first) error = %v", err)
 	}
-	second, err := charset.Encode("裏")
+	second, err := charset.Encode("ы")
 	if err != nil {
 		t.Fatalf("Encode(second) error = %v", err)
 	}
@@ -263,13 +263,15 @@ func TestLookupStringsSplitsMultiValueTextAfterCharsetDecode(t *testing.T) {
 	rawLO := append(append(append([]byte(nil), first...), '\\'), second...)
 	rawLO = append(rawLO, ' ')
 
-	rawPN := append(append([]byte(nil), first...), []byte("^Taro")...)
+	rawPN := append([]byte{'='}, first...)
+	rawPN = append(rawPN, []byte("^Taro")...)
 	rawPN = append(rawPN, '\\')
+	rawPN = append(rawPN, '=')
 	rawPN = append(rawPN, second...)
 	rawPN = append(rawPN, []byte("^Jiro ")...)
 
 	obj := FromElements([]core.Element{
-		dicomtest.NewStringElement(charsetTag, core.VRCS, "ISO 2022 IR 13"),
+		core.NewRawElement(charsetTag, core.VRCS, []byte("\\ISO 2022 IR 87")),
 		core.NewRawElement(loTag, core.VRLO, rawLO),
 		core.NewRawElement(pnTag, core.VRPN, rawPN),
 	}, std.Dictionary)
@@ -278,16 +280,16 @@ func TestLookupStringsSplitsMultiValueTextAfterCharsetDecode(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LookupStrings(LO) error = %v", err)
 	}
-	if len(loValues) != 2 || loValues[0] != "表" || loValues[1] != "裏" {
-		t.Fatalf("LookupStrings(LO) = %v, want [表 裏]", loValues)
+	if len(loValues) != 2 || loValues[0] != "к" || loValues[1] != "ы" {
+		t.Fatalf("LookupStrings(LO) = %v, want [к ы]", loValues)
 	}
 
 	pnValues, err := obj.LookupStrings(pnTag)
 	if err != nil {
 		t.Fatalf("LookupStrings(PN) error = %v", err)
 	}
-	if len(pnValues) != 2 || pnValues[0] != "表^Taro" || pnValues[1] != "裏^Jiro" {
-		t.Fatalf("LookupStrings(PN) = %v, want [表^Taro 裏^Jiro]", pnValues)
+	if len(pnValues) != 2 || pnValues[0] != "=к^Taro" || pnValues[1] != "=ы^Jiro" {
+		t.Fatalf("LookupStrings(PN) = %v, want [=к^Taro =ы^Jiro]", pnValues)
 	}
 }
 
@@ -329,30 +331,6 @@ func TestLookupStringsFallbackSpecificCharacterSet(t *testing.T) {
 	}
 }
 
-func TestLookupStringsDecodesPersonNameComponentGroups(t *testing.T) {
-	charsetTag := core.NewTag(0x0008, 0x0005)
-	nameTag := core.NewTag(0x0010, 0x0010)
-	rawName := append([]byte("Jos\xe9^Silva="), []byte("山田^太郎")...)
-	rawName = append(rawName, '=')
-	rawName = append(rawName, 0xD6, 0xD0, 0xCE, 0xC4)
-	obj := FromElements([]core.Element{
-		core.NewRawElement(charsetTag, core.VRCS, []byte("ISO_IR 100\\ISO_IR 192\\GBK")),
-		core.NewRawElement(nameTag, core.VRPN, rawName),
-	}, std.Dictionary)
-
-	values, err := obj.LookupStrings(nameTag)
-	if err != nil {
-		t.Fatalf("LookupStrings() error = %v", err)
-	}
-	if len(values) != 1 || values[0] != "José^Silva=山田^太郎=中文" {
-		t.Fatalf("LookupStrings() = %v", values)
-	}
-	name, ok := obj.GetPersonName(nameTag)
-	if !ok || name.ToDICOMString() != "José^Silva=山田^太郎=中文" {
-		t.Fatalf("GetPersonName() = (%q, %v)", name.ToDICOMString(), ok)
-	}
-}
-
 func TestLookupStringsDecodesISO2022PersonNameComponentGroups(t *testing.T) {
 	charsetTag := core.NewTag(0x0008, 0x0005)
 	nameTag := core.NewTag(0x0010, 0x0010)
@@ -361,12 +339,12 @@ func TestLookupStringsDecodesISO2022PersonNameComponentGroups(t *testing.T) {
 		'^',
 		0x1B, 0x24, 0x42, 0x42, 0x40, 0x4F, 0x3A, 0x1B, 0x28, 0x42,
 	}
-	korean := []byte{0xC8, 0xAB, 0xB1, 0xE6, 0xB5, 0xBF}
-	rawName := append([]byte("Jos\xe9^Silva="), japanese...)
+	korean := []byte{0x1B, 0x24, 0x29, 0x43, 0xC8, 0xAB, 0xB1, 0xE6, 0xB5, 0xBF}
+	rawName := append([]byte("Jose^Silva="), japanese...)
 	rawName = append(rawName, '=')
 	rawName = append(rawName, korean...)
 	obj := FromElements([]core.Element{
-		core.NewRawElement(charsetTag, core.VRCS, []byte("ISO_IR 100\\ISO 2022 IR 87\\ISO 2022 IR 149")),
+		core.NewRawElement(charsetTag, core.VRCS, []byte("\\ISO 2022 IR 87\\ISO 2022 IR 149")),
 		core.NewRawElement(nameTag, core.VRPN, rawName),
 	}, std.Dictionary)
 
@@ -374,11 +352,11 @@ func TestLookupStringsDecodesISO2022PersonNameComponentGroups(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LookupStrings() error = %v", err)
 	}
-	if len(values) != 1 || values[0] != "José^Silva=山田^太郎=홍길동" {
+	if len(values) != 1 || values[0] != "Jose^Silva=山田^太郎=홍길동" {
 		t.Fatalf("LookupStrings() = %v", values)
 	}
 	name, ok := obj.GetPersonName(nameTag)
-	if !ok || name.ToDICOMString() != "José^Silva=山田^太郎=홍길동" {
+	if !ok || name.ToDICOMString() != "Jose^Silva=山田^太郎=홍길동" {
 		t.Fatalf("GetPersonName() = (%q, %v)", name.ToDICOMString(), ok)
 	}
 }

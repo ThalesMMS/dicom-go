@@ -53,6 +53,34 @@ func (f *File) ValidateFile(ctx context.Context, opts validation.Options) (valid
 	return validation.ValidateFile(ctx, meta, dataset, f.TransferSyntax, opts)
 }
 
+// ValidatePart10Identity compares only the Media Storage SOP Class UID, Media
+// Storage SOP Instance UID, and Transfer Syntax UID in File Meta Information
+// with the parsed data set and effective transfer syntax. This focused policy
+// reports missing or empty identity fields as mismatches; callers handling the
+// Basic Directory IOD should retain its intentional data-set UID exception.
+func (f *File) ValidatePart10Identity() (validation.Report, error) {
+	if f == nil {
+		return validation.Report{}, ErrNilFile
+	}
+	var meta, dataset core.DataSet
+	meta.Elements = selectedElements(f.Meta, tagMediaStorageSOPClassUID, tagMediaStorageSOPInstanceUID, tagTransferSyntaxUID)
+	dataset.Elements = selectedElements(f.Dataset, tagSOPClassUID, tagSOPInstanceUID)
+	return validation.ValidateFileMetaConsistency(meta, dataset, f.TransferSyntax), nil
+}
+
+func selectedElements(object *Object, tags ...core.Tag) []core.Element {
+	if object == nil {
+		return nil
+	}
+	elements := make([]core.Element, 0, len(tags))
+	for _, tag := range tags {
+		if element, ok := object.Get(tag); ok {
+			elements = append(elements, element)
+		}
+	}
+	return elements
+}
+
 // ReadDataSetWithValidation parses a raw data set with lifecycle hooks and
 // returns the bounded report even when strict validation rejects the result.
 func ReadDataSetWithValidation(ctx context.Context, source io.Reader, syntax transfer.Syntax, readOpts ReadFileOptions, validationOpts validation.Options) (*Object, validation.Report, error) {
@@ -115,6 +143,7 @@ func readDataSetObjectWithValidation(ctx context.Context, source io.Reader, synt
 	}
 	obj := fromParsedDataSetWithTextOptions(dataset, readerOpts.Dictionary, opts.TextOptions)
 	obj.SetValueByteOrder(syntax.ByteOrder)
+	obj.privateDiagnostics, obj.privateDiagnosticsTruncated = reader.PrivateDiagnostics()
 	if streamValues && obj.deferredCount > 0 &&
 		(readerOptionsNeedValueProvider(readerOpts) || readerHasRecordedLocation(reader, obj.Elements())) {
 		obj.setValueProvider(&readerValueProvider{reader: reader})

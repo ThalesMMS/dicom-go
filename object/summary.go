@@ -90,7 +90,7 @@ func (o *Object) SummarizeElements(opts SummaryOptions) []ElementSummary {
 			Private: tag.IsPrivate(),
 		}
 		if dict != nil {
-			if entry, ok := dict.ByTag(tag); ok {
+			if entry, ok := o.scopedSummaryEntry(dict, tag); ok {
 				row.Keyword = entry.Keyword
 				row.Name = entry.Name
 			}

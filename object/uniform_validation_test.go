@@ -48,6 +48,78 @@ func TestObjectUniformValidationAndFileConsistency(t *testing.T) {
 	}
 }
 
+func TestFileValidatePart10IdentityIsFocusedAndComplete(t *testing.T) {
+	sopClass := core.NewTag(0x0008, 0x0016)
+	sopInstance := core.NewTag(0x0008, 0x0018)
+	file := &File{
+		Meta: FromElements([]core.Element{
+			newStringElement(tagMediaStorageSOPClassUID, core.VRUI, "9.9"),
+			newStringElement(tagMediaStorageSOPInstanceUID, core.VRUI, "9.9.1"),
+			newStringElement(tagTransferSyntaxUID, core.VRUI, transfer.ImplicitVRLittleEndian.UID),
+		}, std.Dictionary),
+		Dataset: FromElements([]core.Element{
+			newStringElement(sopClass, core.VRUI, "1.2.3"),
+			newStringElement(sopInstance, core.VRUI, "1.2.3.4"),
+			// This unrelated malformed UID must remain outside the focused gate.
+			newStringElement(core.NewTag(0x0020, 0x000d), core.VRUI, "1..2"),
+		}, std.Dictionary),
+		TransferSyntax: transfer.ExplicitVRLittleEndian,
+	}
+
+	report, err := file.ValidatePart10Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Count(validation.CodeFileMetaMismatch) != 3 || len(report.Findings) != 3 {
+		t.Fatalf("focused identity report = %#v, want exactly three mismatches", report)
+	}
+	wantTags := []core.Tag{tagMediaStorageSOPClassUID, tagMediaStorageSOPInstanceUID, tagTransferSyntaxUID}
+	for i, want := range wantTags {
+		if report.Findings[i].Tag != want || report.Findings[i].Severity != validation.SeverityError {
+			t.Fatalf("finding[%d] = %#v, want error for %s", i, report.Findings[i], want)
+		}
+	}
+}
+
+func TestFileValidatePart10IdentityAcceptsMatchingIdentity(t *testing.T) {
+	data, err := dicomtest.Part10File(transfer.ExplicitVRLittleEndian, dicomtest.MinimalDataset()...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, err := ReadFile(bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	report, err := file.ValidatePart10Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.Findings) != 0 {
+		t.Fatalf("matching identity report = %#v, want no findings", report)
+	}
+}
+
+func TestFileValidatePart10IdentityRejectsEmptyIdentityValues(t *testing.T) {
+	file := &File{
+		Meta: FromElements([]core.Element{
+			newStringElement(tagMediaStorageSOPClassUID, core.VRUI, " "),
+			newStringElement(tagMediaStorageSOPInstanceUID, core.VRUI, ""),
+			newStringElement(tagTransferSyntaxUID, core.VRUI, "\x00"),
+		}, std.Dictionary),
+		Dataset: FromElements([]core.Element{
+			newStringElement(tagSOPClassUID, core.VRUI, ""),
+			newStringElement(tagSOPInstanceUID, core.VRUI, " "),
+		}, std.Dictionary),
+	}
+	report, err := file.ValidatePart10Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Count(validation.CodeFileMetaMismatch) != 3 {
+		t.Fatalf("empty identity report = %#v, want three mismatches", report)
+	}
+}
+
 func TestReadDataSetWithValidationAppliesLifecycleAndReturnsReport(t *testing.T) {
 	patientID := core.NewTag(0x0010, 0x0020)
 	var encoded bytes.Buffer

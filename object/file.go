@@ -47,6 +47,13 @@ type File struct {
 	transferSyntaxResolution *TransferSyntaxResolution
 }
 
+// BulkDataSource is a defined-length stream returned by BulkDataResolver.
+type BulkDataSource = parser.BulkDataSource
+
+// BulkDataResolver opens one externally referenced Bulk Data value for
+// WriteFileWithOptions.
+type BulkDataResolver = parser.BulkDataResolver
+
 type WriteFileOptions struct {
 	// Preamble provides the 128-byte Part 10 preamble. A nil value writes a
 	// zero-filled preamble.
@@ -67,6 +74,10 @@ type WriteFileOptions struct {
 	// whose File-set UID is conveyed as the Media Storage SOP Instance UID.
 	// The zero value retains the historical reconciliation behavior.
 	OmitReconciledDataSetSOPUIDs bool
+	// BulkDataResolver materializes core.BulkDataValue references while writing
+	// the data set, including references nested in sequence items. The writer
+	// owns and closes every non-nil source Reader returned by the resolver.
+	BulkDataResolver BulkDataResolver
 }
 
 var (
@@ -203,6 +214,10 @@ type ReadFileOptions struct {
 	// Dictionary controls the dictionary used when parsing the main dataset.
 	// A nil value defaults to dictionary/std.Dictionary.
 	Dictionary dictionary.DataDictionary
+	// Private resolution activates only with a PrivateDataDictionary in Dictionary.
+	MaxPrivateCreators           int
+	MaxPrivateDiagnostics        int
+	RejectInvalidPrivateCreators bool
 	// FileMetaDictionary controls the dictionary used when parsing the Part 10
 	// file meta information. A nil value defaults to dictionary/std.Dictionary.
 	FileMetaDictionary dictionary.DataDictionary
@@ -226,6 +241,14 @@ type ReadFileOptions struct {
 	// A zero value preserves historical behavior of always materializing
 	// defined-length values (subject to MaxElementBytes).
 	InlineValueBytesThreshold int64
+	// MaxPixelDataBytes limits native Pixel Data values and the cumulative bytes
+	// of encapsulated Pixel Data. When non-zero, it replaces MaxElementBytes for
+	// Pixel Data while other elements keep their own ceiling.
+	MaxPixelDataBytes int64
+	// MaxDeformableVectorGridBytes limits each deformable Vector Grid Data
+	// (0064,0009) value before allocation, including values nested in sequences.
+	// A zero value leaves these values subject to MaxElementBytes.
+	MaxDeformableVectorGridBytes int64
 	// MaxTotalBytes limits the absolute logical extent consumed by each parser
 	// pass. A zero value means unlimited. Explicit multi-pass recovery can reread
 	// a seekable prefix; its separate probe remains capped by this value and by
@@ -262,6 +285,10 @@ type ReadFileOptions struct {
 	// FrameSink receives native Pixel Data frames while the parser reads them.
 	// Native Pixel Data is not materialized when a sink is configured.
 	FrameSink FrameSink
+	// EncapsulatedSink streams top-level encoded Pixel Data through an assembler.
+	// DeferPixelData explicitly retains replay from a seekable source; otherwise
+	// core.DiscardedValue prevents later serialization of the discarded payload.
+	EncapsulatedSink parser.EncapsulatedSink
 	// SkipProcessingPixelDataValue is kept for ParseOption source compatibility.
 	//
 	// Deprecated: this option has no effect. dicom-go preserves raw Pixel Data
@@ -295,6 +322,8 @@ func OpenFile(path string) (*File, error) {
 }
 
 func OpenFileWithOptions(path string, opts ReadFileOptions) (result *File, err error) {
+	finishFrames := finalizeFrameSink(&opts)
+	defer finishFrames(&err)
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -347,7 +376,9 @@ func ReadFile(r io.Reader) (*File, error) {
 	return ReadFileWithOptions(r, ReadFileOptions{})
 }
 
-func ReadFileWithOptions(r io.Reader, opts ReadFileOptions) (*File, error) {
+func ReadFileWithOptions(r io.Reader, opts ReadFileOptions) (result *File, err error) {
+	finishFrames := finalizeFrameSink(&opts)
+	defer finishFrames(&err)
 	// Preserve ReadFile's historical zero-value behavior.
 	if opts.FileMetaDictionary == nil {
 		opts.FileMetaDictionary = std.Dictionary
@@ -421,6 +452,7 @@ func ReadFileWithOptions(r io.Reader, opts ReadFileOptions) (*File, error) {
 	}
 	datasetObject := fromParsedDataSetWithTextOptions(dataset, readerOpts.Dictionary, opts.TextOptions)
 	datasetObject.SetValueByteOrder(syntax.ByteOrder)
+	datasetObject.privateDiagnostics, datasetObject.privateDiagnosticsTruncated = reader.PrivateDiagnostics()
 	file := &File{
 		Preamble:       preamble,
 		Meta:           meta,
@@ -457,6 +489,7 @@ func readFileMetaElements(r *bufio.Reader, baseOffset int64, opts ReadFileOption
 	metaOpts.DeferPixelData = false
 	metaOpts.DeferWaveformData = false
 	metaOpts.FrameSink = nil
+	metaOpts.EncapsulatedSink = nil
 	if opts.FileMetaDictionary != nil {
 		metaOpts.Dictionary = opts.FileMetaDictionary
 	}
@@ -540,8 +573,10 @@ func ReadDataSet(r io.Reader, syntax transfer.Syntax) (*Object, error) {
 	return ReadDataSetWithOptions(r, syntax, ReadFileOptions{})
 }
 
-func ReadDataSetWithOptions(r io.Reader, syntax transfer.Syntax, opts ReadFileOptions) (*Object, error) {
-	syntax, err := validateReadableSyntax(syntax)
+func ReadDataSetWithOptions(r io.Reader, syntax transfer.Syntax, opts ReadFileOptions) (result *Object, err error) {
+	finishFrames := finalizeFrameSink(&opts)
+	defer finishFrames(&err)
+	syntax, err = validateReadableSyntax(syntax)
 	if err != nil {
 		return nil, err
 	}
@@ -572,6 +607,7 @@ func readDataSetObject(r io.Reader, syntax transfer.Syntax, opts ReadFileOptions
 	}
 	obj := fromParsedDataSetWithTextOptions(dataset, readerOpts.Dictionary, opts.TextOptions)
 	obj.SetValueByteOrder(syntax.ByteOrder)
+	obj.privateDiagnostics, obj.privateDiagnosticsTruncated = reader.PrivateDiagnostics()
 	if readerOptionsNeedValueProvider(readerOpts) && streamValues && obj.deferredCount > 0 {
 		obj.setValueProvider(&readerValueProvider{reader: reader})
 	}
@@ -583,6 +619,8 @@ func OpenDataSet(path string, syntax transfer.Syntax) (*Object, error) {
 }
 
 func OpenDataSetWithOptions(path string, syntax transfer.Syntax, opts ReadFileOptions) (result *Object, err error) {
+	finishFrames := finalizeFrameSink(&opts)
+	defer finishFrames(&err)
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -632,6 +670,9 @@ func (f *File) RebuildFileMeta() error {
 }
 
 func WriteFileWithOptions(w io.Writer, file *File, opts WriteFileOptions) error {
+	if file != nil && file.Dataset != nil && file.Dataset.HasDiscardedValues() {
+		return core.ErrDiscardedValue
+	}
 	if file == nil {
 		return fmt.Errorf("dicom: nil file")
 	}
@@ -675,7 +716,7 @@ func WriteFileWithOptions(w io.Writer, file *File, opts WriteFileOptions) error 
 		return err
 	}
 
-	if err := writeDataSet(buffered, dataset, syntax); err != nil {
+	if err := writeDataSetWithOptions(buffered, dataset, syntax, parser.WriterOptions{BulkDataResolver: opts.BulkDataResolver}); err != nil {
 		return err
 	}
 	return buffered.Flush()
@@ -690,8 +731,15 @@ func WriteDataSet(w io.Writer, obj *Object, syntax transfer.Syntax) (err error) 
 }
 
 func writeDataSet(w io.Writer, obj *Object, syntax transfer.Syntax) (err error) {
+	return writeDataSetWithOptions(w, obj, syntax, parser.WriterOptions{})
+}
+
+func writeDataSetWithOptions(w io.Writer, obj *Object, syntax transfer.Syntax, writerOpts parser.WriterOptions) (err error) {
 	if obj == nil {
 		return fmt.Errorf("dicom: nil object passed to WriteDataSet")
+	}
+	if obj.HasDiscardedValues() {
+		return core.ErrDiscardedValue
 	}
 	if hasDeferredSequenceValue(obj) {
 		return ErrDeferredSequenceValueWrite
@@ -720,7 +768,8 @@ func writeDataSet(w io.Writer, obj *Object, syntax transfer.Syntax) (err error) 
 		}()
 		w = deflater
 	}
-	writer := parser.NewWriterWithOptions(w, syntax, parser.WriterOptions{CharacterSet: characterSet})
+	writerOpts.CharacterSet = characterSet
+	writer := parser.NewWriterWithOptions(w, syntax, writerOpts)
 	for _, el := range obj.SortedElements() {
 		if el.Value == nil {
 			if err := writeDeferredElement(writer, obj, el); err != nil {
@@ -789,20 +838,26 @@ func (o ReadFileOptions) parserReaderOptions(baseOffset int64) parser.ReaderOpti
 		dict = o.Dictionary
 	}
 	return parser.ReaderOptions{
-		Dictionary:                dict,
-		MaxElementBytes:           o.MaxElementBytes,
-		MaxTotalBytes:             o.MaxTotalBytes,
-		BaseOffset:                baseOffset,
-		MaxSequenceDepth:          o.MaxSequenceDepth,
-		MaxElements:               o.MaxElements,
-		MaxFragments:              o.MaxFragments,
-		InlineValueBytesThreshold: o.InlineValueBytesThreshold,
-		StrictReservedBytes:       o.StrictReservedBytes,
-		OddLengthPolicy:           o.OddLengthPolicy,
-		SkipPixelData:             o.SkipPixelData,
-		DeferPixelData:            o.DeferPixelData,
-		DeferWaveformData:         o.DeferWaveformData,
-		FrameSink:                 o.FrameSink,
+		Dictionary:                   dict,
+		MaxPrivateCreators:           o.MaxPrivateCreators,
+		MaxPrivateDiagnostics:        o.MaxPrivateDiagnostics,
+		RejectInvalidPrivateCreators: o.RejectInvalidPrivateCreators,
+		MaxElementBytes:              o.MaxElementBytes,
+		MaxPixelDataBytes:            o.MaxPixelDataBytes,
+		MaxDeformableVectorGridBytes: o.MaxDeformableVectorGridBytes,
+		MaxTotalBytes:                o.MaxTotalBytes,
+		BaseOffset:                   baseOffset,
+		MaxSequenceDepth:             o.MaxSequenceDepth,
+		MaxElements:                  o.MaxElements,
+		MaxFragments:                 o.MaxFragments,
+		InlineValueBytesThreshold:    o.InlineValueBytesThreshold,
+		StrictReservedBytes:          o.StrictReservedBytes,
+		OddLengthPolicy:              o.OddLengthPolicy,
+		SkipPixelData:                o.SkipPixelData,
+		DeferPixelData:               o.DeferPixelData,
+		DeferWaveformData:            o.DeferWaveformData,
+		FrameSink:                    o.FrameSink,
+		EncapsulatedSink:             o.EncapsulatedSink,
 	}
 }
 

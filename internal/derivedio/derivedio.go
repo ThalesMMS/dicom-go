@@ -265,6 +265,26 @@ func LookupInts(obj *object.Object, tag core.Tag) ([]int64, error) {
 		}
 		return values, nil
 	}
+	switch values := element.Value.(type) {
+	case core.Uint16Value:
+		out := make([]int64, len(values))
+		for i, value := range values {
+			out[i] = int64(value)
+		}
+		return out, nil
+	case core.Int32Value:
+		out := make([]int64, len(values))
+		for i, value := range values {
+			out[i] = int64(value)
+		}
+		return out, nil
+	case core.Uint32Value:
+		out := make([]int64, len(values))
+		for i, value := range values {
+			out[i] = int64(value)
+		}
+		return out, nil
+	}
 	raw, ok := element.RawBytes()
 	if !ok {
 		return nil, fmt.Errorf("dicom derived: element %s with VR %s is not raw integer data", tag, element.VR())
@@ -335,6 +355,16 @@ func LookupFloats(obj *object.Object, tag core.Tag) ([]float64, error) {
 			return nil, err
 		}
 		return values, nil
+	}
+	switch values := element.Value.(type) {
+	case core.Float32Value:
+		out := make([]float64, len(values))
+		for i, value := range values {
+			out[i] = float64(value)
+		}
+		return out, nil
+	case core.Float64Value:
+		return append([]float64(nil), values...), nil
 	}
 	raw, ok := element.RawBytes()
 	if !ok {

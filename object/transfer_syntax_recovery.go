@@ -131,13 +131,15 @@ func ReadDataSetWithTransferSyntaxRecovery(
 	r io.Reader,
 	readOptions ReadFileOptions,
 	recoveryOptions TransferSyntaxRecoveryOptions,
-) (*Object, TransferSyntaxResolution, error) {
+) (result *Object, resolution TransferSyntaxResolution, err error) {
+	finishFrames := finalizeFrameSink(&readOptions)
+	defer finishFrames(&err)
 	source, start, originallySeekable, err := prepareTransferSyntaxRecoverySource(r, readOptions, recoveryOptions)
 	if err != nil {
 		return nil, TransferSyntaxResolution{}, err
 	}
 	report, err := probeTransferSyntaxAt(source, start, recoveryOptions.Probe, readOptions.MaxTotalBytes, 0)
-	resolution := resolutionFromProbe(report, TransferSyntaxSourceInferredRawDataSet, "")
+	resolution = resolutionFromProbe(report, TransferSyntaxSourceInferredRawDataSet, "")
 	if err != nil {
 		return nil, resolution, err
 	}
@@ -161,6 +163,8 @@ func OpenDataSetWithTransferSyntaxRecovery(
 	readOptions ReadFileOptions,
 	recoveryOptions TransferSyntaxRecoveryOptions,
 ) (result *Object, resolution TransferSyntaxResolution, err error) {
+	finishFrames := finalizeFrameSink(&readOptions)
+	defer finishFrames(&err)
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, TransferSyntaxResolution{}, err
@@ -193,7 +197,9 @@ func ReadFileWithTransferSyntaxRecovery(
 	r io.Reader,
 	readOptions ReadFileOptions,
 	recoveryOptions TransferSyntaxRecoveryOptions,
-) (*File, TransferSyntaxResolution, error) {
+) (result *File, resolution TransferSyntaxResolution, err error) {
+	finishFrames := finalizeFrameSink(&readOptions)
+	defer finishFrames(&err)
 	if !recoveryOptions.enablesFileRecovery() {
 		file, err := ReadFileWithOptions(r, readOptions)
 		if err != nil {
@@ -399,7 +405,7 @@ func readDeclaredOrMismatchAt(
 					declaredSyntax, declaredSource, declaredUID,
 					readOptions, originallySeekable, report,
 				)
-				if declaredErr == nil || readOptions.FrameSink != nil {
+				if declaredErr == nil || readOptions.FrameSink != nil || readOptions.EncapsulatedSink != nil {
 					return file, resolution, declaredErr
 				}
 				recovered := resolutionFromProbe(report, TransferSyntaxSourceRecoveredMismatch, declaredUID)
@@ -539,6 +545,8 @@ func OpenFileWithTransferSyntaxRecovery(
 	readOptions ReadFileOptions,
 	recoveryOptions TransferSyntaxRecoveryOptions,
 ) (result *File, resolution TransferSyntaxResolution, err error) {
+	finishFrames := finalizeFrameSink(&readOptions)
+	defer finishFrames(&err)
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, TransferSyntaxResolution{}, err

@@ -812,6 +812,24 @@ func TestReadDataSetWithOptionsAppliesParserLimits(t *testing.T) {
 		t.Fatalf("expected ErrMaxElementBytesExceeded, got %v", err)
 	}
 }
+
+func TestReadDataSetWithOptionsAppliesVectorGridBudgetInsideSequence(t *testing.T) {
+	vectorGridData := core.NewTag(0x0064, 0x0009)
+	gridSequence := dicomtest.NewSequenceElement(
+		core.NewTag(0x0064, 0x0005),
+		core.DataSet{Elements: []core.Element{
+			dicomtest.BytesElement(vectorGridData, core.VROF, make([]byte, 12)),
+		}},
+	)
+	data := dicomtest.EncodeElements(transfer.ExplicitVRLittleEndian, gridSequence)
+
+	_, err := ReadDataSetWithOptions(bytes.NewReader(data), transfer.ExplicitVRLittleEndian, ReadFileOptions{
+		MaxDeformableVectorGridBytes: 8,
+	})
+	if !errors.Is(err, parser.ErrMaxDeformableVectorGridBytesExceeded) {
+		t.Fatalf("error = %v, want parser.ErrMaxDeformableVectorGridBytesExceeded", err)
+	}
+}
 func TestReadDataSetWithOptionsDefersValuesWhenInlineThresholdSet(t *testing.T) {
 	tag := core.NewTag(0x7FE0, 0x0010)
 	want := []byte{0x01, 0x02, 0x03, 0x04}

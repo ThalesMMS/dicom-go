@@ -2,6 +2,7 @@ package object
 
 import (
 	"bytes"
+	"runtime"
 	"testing"
 
 	"github.com/ThalesMMS/dicom-go/core"
@@ -21,6 +22,7 @@ func BenchmarkReadFile(b *testing.B) {
 		fixture := fixture
 		b.Run(fixture.name, func(b *testing.B) {
 			b.ReportAllocs()
+			b.SetBytes(int64(len(fixture.data)))
 			b.ResetTimer()
 
 			for i := 0; i < b.N; i++ {
@@ -30,8 +32,32 @@ func BenchmarkReadFile(b *testing.B) {
 			}
 		})
 
+		if fixture.name != "with_pixel_data" {
+			continue
+		}
 		b.Run(fixture.name+"_streaming_threshold", func(b *testing.B) {
-			b.Skip("streaming/threshold benchmarks are covered at the parser layer; object-level fixture needs a larger Pixel Data payload to meaningfully exercise the skip path")
+			opts := ReadFileOptions{InlineValueBytesThreshold: 48}
+			probe, err := ReadFileWithOptions(bytes.NewReader(fixture.data), opts)
+			if err != nil {
+				b.Fatal(err)
+			}
+			if len(probe.ValueLocations(core.TagPixelData)) == 0 {
+				b.Fatal("object reader did not retain a deferred value location")
+			}
+			if err := probe.Close(); err != nil {
+				b.Fatal(err)
+			}
+			b.ReportAllocs()
+			b.SetBytes(int64(len(fixture.data)))
+			b.ResetTimer()
+
+			for i := 0; i < b.N; i++ {
+				file, err := ReadFileWithOptions(bytes.NewReader(fixture.data), opts)
+				if err != nil {
+					b.Fatal(err)
+				}
+				runtime.KeepAlive(file)
+			}
 		})
 	}
 }

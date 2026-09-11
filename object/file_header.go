@@ -89,6 +89,7 @@ func readPart10FileMetaElements(source io.ReadSeeker, baseOffset int64, opts Rea
 	metaOpts.DeferPixelData = false
 	metaOpts.DeferWaveformData = false
 	metaOpts.FrameSink = nil
+	metaOpts.EncapsulatedSink = nil
 	if opts.FileMetaDictionary != nil {
 		metaOpts.Dictionary = opts.FileMetaDictionary
 	}

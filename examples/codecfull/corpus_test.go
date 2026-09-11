@@ -5,6 +5,7 @@ package codecfull
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"image"
 	"image/color"
@@ -57,9 +58,7 @@ func TestIndependentLosslessAndLossyPairs(t *testing.T) {
 				compressedMetadata.SamplesPerPixel != referenceMetadata.SamplesPerPixel {
 				t.Fatalf("metadata mismatch: compressed=%+v reference=%+v", compressedMetadata, referenceMetadata)
 			}
-			if got := framesMaxAbsoluteError(compressed, reference, referenceMetadata.BitsAllocated); got > test.tolerance {
-				t.Fatalf("maximum absolute pixel error = %d, want <= %d", got, test.tolerance)
-			}
+			compareCorpusSamples(t, test.name, compressed, reference, referenceMetadata)
 		})
 	}
 }
@@ -152,13 +151,58 @@ func TestIndependentReferencePoints(t *testing.T) {
 	})
 }
 
+func TestApprovedFullReconstructions(t *testing.T) {
+	registry := mustRegistry(t)
+	for _, tc := range []struct{ id, name string }{
+		{"jpegls-near-lossless-8", "JPEGLSNearLossless_08.dcm"},
+		{"jpegls-near-lossless-16", "JPEGLSNearLossless_16.dcm"},
+		{"rle-rgb16-multiframe", "SC_rgb_rle_16bit_2frame.dcm"},
+	} {
+		t.Run(tc.id, func(t *testing.T) {
+			e, want, err := codecfixture.ReadFullReconstruction("../..", tc.id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, _ := decodeDICOM(t, registry, pydicomFixture(tc.name))
+			r, err := codecfixture.CompareSamples(got, e.Layout, want, e.Layout, codecfixture.SamplePolicy{})
+			if err != nil || !r.Qualified {
+				t.Fatalf("full reconstruction: %+v %v", r, err)
+			}
+		})
+	}
+}
+
+func compareCorpusSamples(t *testing.T, id string, got, want [][]byte, meta pixeldata.Metadata) {
+	t.Helper()
+	policy, err := codecfixture.CorpusSamplePolicy("../..", id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	layout := codecfixture.SampleLayout{Rows: int(meta.Rows), Columns: int(meta.Columns), Components: int(meta.SamplesPerPixel), BitsAllocated: int(meta.BitsAllocated), BitsStored: int(meta.BitsStored), HighBit: int(meta.HighBit), Signed: meta.PixelRepresentation == 1}
+	r, err := codecfixture.CompareSamples(got, layout, want, layout, policy)
+	if err != nil || !r.Qualified {
+		t.Fatalf("%s full sample comparison: %+v %v", id, r, err)
+	}
+	encoded, err := json.Marshal(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("%s %s", id, encoded)
+}
+
 func TestSyntheticQualifiedCoverage(t *testing.T) {
 	registry := mustRegistry(t)
 	if err := codecfixture.ValidateCase(registry, codecfixture.JPEGBaselineSmall()); err != nil {
 		t.Fatalf("JPEG Baseline SOF0: %v", err)
 	}
 	if err := codecfixture.ValidateCase(registry, codecfixture.JPEGExtendedSmall()); err != nil {
-		t.Fatalf("JPEG Extended SOF1: %v", err)
+		t.Fatalf("JPEG Extended Process 2 SOF1 8-bit: %v", err)
+	}
+	if err := codecfixture.ValidateCase(registry, codecfixture.JPEGExtendedProcess4Mono12()); err != nil {
+		t.Fatalf("JPEG Extended Process 4 SOF1 12-bit: %v", err)
+	}
+	if err := codecfixture.ValidateCase(registry, codecfixture.JPEGLosslessSV1RGB8Interleaved()); err != nil {
+		t.Fatalf("JPEG Lossless Process 14 SV1 RGB8 interleaved: %v", err)
 	}
 
 	source := syntheticJ2KGray8()
@@ -198,6 +242,19 @@ func TestSyntheticQualifiedCoverage(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("jpeg2000-part2-lossy-full-metrics", func(t *testing.T) {
+		c := codecfixture.JPEG2000Part2Lossy(codecfullGrayHeight, codecfullGrayWidth, readFixture(t, jpeg2000Fixture("part2-lossy.j2k")), source, 32)
+		policy, err := codecfixture.CorpusSamplePolicy("../..", "jpeg2000-part2-lossy")
+		if err != nil {
+			t.Fatal(err)
+		}
+		c.SamplePolicy = &policy
+		r := codecfixture.RunCase(registry, c)
+		if r.Err != nil || !r.Comparison.Qualified {
+			t.Fatalf("full metric policy: %+v %v", r.Comparison, r.Err)
+		}
+	})
 
 	t.Run("encapsulated-uncompressed-multiframe", func(t *testing.T) {
 		obj, pixel := testPixelObject(
@@ -244,17 +301,13 @@ func TestJPEGXLQualifiedFixtures(t *testing.T) {
 	t.Run("lossy-rgb8", func(t *testing.T) {
 		got := decodeJXLFixture(t, registry, "rgb8-lossy.jxl", transfer.JPEGXL, codecfullColorHeight, codecfullColorWidth, 3, 8, "RGB")
 		want := syntheticRGB8()
-		if errorValue := framesMaxAbsoluteError(got, [][]byte{want}, 8); errorValue > 80 {
-			t.Fatalf("maximum absolute pixel error = %d, want <= 80", errorValue)
-		}
+		compareCorpusSamples(t, "jpegxl-lossy-rgb8", got, [][]byte{want}, pixeldata.Metadata{Rows: codecfullColorHeight, Columns: codecfullColorWidth, SamplesPerPixel: 3, BitsAllocated: 8, BitsStored: 8, HighBit: 7})
 	})
 
 	t.Run("jpeg-recompression", func(t *testing.T) {
 		got := decodeJXLFixture(t, registry, "jpeg-recompression.jxl", transfer.JPEGXLJPEGRecompression, codecfullColorHeight, codecfullColorWidth, 3, 8, "RGB")
 		want := syntheticJPEGReference(t)
-		if errorValue := framesMaxAbsoluteError(got, [][]byte{want}, 8); errorValue > 80 {
-			t.Fatalf("maximum absolute pixel error = %d, want <= 80 across independent JPEG pixel decoders", errorValue)
-		}
+		compareCorpusSamples(t, "jpegxl-jpeg-recompression", got, [][]byte{want}, pixeldata.Metadata{Rows: codecfullColorHeight, Columns: codecfullColorWidth, SamplesPerPixel: 3, BitsAllocated: 8, BitsStored: 8, HighBit: 7})
 	})
 }
 
@@ -301,6 +354,9 @@ func decodeDICOM(t *testing.T, registry pixeldata.Registry, path string) ([][]by
 	frames, err := registry.DecodeFrames(file.TransferSyntax.UID, pixel, file.Dataset)
 	if err != nil {
 		t.Fatalf("decode %s: %v", filepath.Base(path), err)
+	}
+	if frames.Rows != int(metadata.Rows) || frames.Columns != int(metadata.Columns) || len(frames.Data) != metadata.NumberOfFrames {
+		t.Fatal("decoded geometry or frame count differs from DICOM metadata")
 	}
 	return frames.Data, metadata
 }

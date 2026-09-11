@@ -9,9 +9,7 @@ import (
 	jpegls "github.com/ThalesMMS/dicom-go/examples/codec-adapters/jpegls"
 	jpegxl "github.com/ThalesMMS/dicom-go/examples/codec-adapters/jpegxl"
 	"github.com/ThalesMMS/dicom-go/pixeldata"
-	"github.com/ThalesMMS/dicom-go/pixeldata/jpeg"
-	"github.com/ThalesMMS/dicom-go/pixeldata/jpeglossless"
-	"github.com/ThalesMMS/dicom-go/pixeldata/rle"
+	"github.com/ThalesMMS/dicom-go/pixeldata/builtin"
 )
 
 const BuildTag = "codecfull"
@@ -42,16 +40,20 @@ func Register(registry pixeldata.Registry) error {
 	if err := ValidateRuntime(); err != nil {
 		return err
 	}
-	for name, register := range map[string]func() error{
-		"JPEG Baseline/Extended": func() error { return jpeg.Register(registry) },
-		"JPEG Lossless":          func() error { return jpeglossless.Register(registry) },
-		"RLE Lossless":           func() error { return rle.Register(registry) },
-		"JPEG 2000/HTJ2K":        func() error { return jpeg2000.RegisterClinical(registry) },
-		"JPEG-LS":                func() error { return jpegls.Register(registry, jpegls.NewCharLSDecoder()) },
-		"JPEG XL":                func() error { return jpegxl.Register(registry) },
-	} {
-		if err := register(); err != nil {
-			return fmt.Errorf("register %s: %w", name, err)
+	if err := builtin.Register(registry); err != nil {
+		return err
+	}
+	optionalCodecs := []struct {
+		name     string
+		register func() error
+	}{
+		{name: "JPEG 2000/HTJ2K", register: func() error { return jpeg2000.RegisterClinical(registry) }},
+		{name: "JPEG-LS Near-Lossless", register: func() error { return jpegls.RegisterNearLossless(registry, jpegls.NewCharLSDecoder()) }},
+		{name: "JPEG XL", register: func() error { return jpegxl.Register(registry) }},
+	}
+	for _, codec := range optionalCodecs {
+		if err := codec.register(); err != nil {
+			return fmt.Errorf("register %s: %w", codec.name, err)
 		}
 	}
 	return nil

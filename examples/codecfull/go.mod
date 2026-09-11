@@ -11,7 +11,8 @@ require (
 
 require (
 	github.com/ebitengine/purego v0.10.1 // indirect
-	github.com/mrjoshuak/go-jpeg2000 v1.2.1 // indirect
+	github.com/mrjoshuak/go-jpeg2000 v1.3.0 // indirect
+	golang.org/x/sys v0.30.0 // indirect
 	golang.org/x/text v0.3.8 // indirect
 )
 

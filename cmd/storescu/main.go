@@ -14,15 +14,30 @@ import (
 	"time"
 
 	"github.com/ThalesMMS/dicom-go/internal/clidiag"
+	"github.com/ThalesMMS/dicom-go/internal/clisignal"
+	"github.com/ThalesMMS/dicom-go/internal/dimsecli"
 	"github.com/ThalesMMS/dicom-go/net/dimse"
+	"github.com/ThalesMMS/dicom-go/net/storetranscode"
 	"github.com/ThalesMMS/dicom-go/net/ul"
+	"github.com/ThalesMMS/dicom-go/pixeldata"
+	"github.com/ThalesMMS/dicom-go/pixeldata/builtin"
+	"github.com/ThalesMMS/dicom-go/pixeldata/jpeg"
+	"github.com/ThalesMMS/dicom-go/pixeldata/jpegls"
+	"github.com/ThalesMMS/dicom-go/pixeldata/rle"
+	"github.com/ThalesMMS/dicom-go/transfer"
 )
 
 func main() {
-	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
+	ctx, stop := clisignal.NotifyInterruptContext(context.Background())
+	defer stop()
+	os.Exit(runWithContext(ctx, os.Args[1:], os.Stdout, os.Stderr))
 }
 
 func run(args []string, stdout, stderr io.Writer) int {
+	return runWithContext(context.Background(), args, stdout, stderr)
+}
+
+func runWithContext(parent context.Context, args []string, stdout, stderr io.Writer) int {
 	opts, err := parseArgs(args, stderr)
 	if err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -34,8 +49,11 @@ func run(args []string, stdout, stderr io.Writer) int {
 		clidiag.Fprintln(stderr, "storescu", err)
 		return 1
 	}
-	if err := runStore(opts, stdout, stderr); err != nil {
+	if err := runStoreWithContext(parent, opts, stdout, stderr); err != nil {
 		clidiag.Fprintln(stderr, "storescu", err)
+		if dimsecli.IsCanceled(parent, err) {
+			return dimsecli.ExitCanceled
+		}
 		return 1
 	}
 	return 0
@@ -44,17 +62,26 @@ func run(args []string, stdout, stderr io.Writer) int {
 var errUsage = errors.New("usage error")
 
 type options struct {
-	address         string
-	calledAE        string
-	callingAE       string
-	timeout         time.Duration
-	files           []string
-	continueOnError bool
+	transcodeUID      string
+	transcodeFallback bool
+	allowLossy        bool
+	jpegQuality       int
+	spoolDirectory    string
+	maxSpoolBytes     int64
+	address           string
+	calledAE          string
+	callingAE         string
+	timeout           time.Duration
+	files             []string
+	continueOnError   bool
+	maxInvoked        int
+	maxInFlightBytes  int64
 }
 
 const (
 	defaultDialTimeout    = 10 * time.Second
 	defaultReleaseTimeout = 5 * time.Second
+	defaultAbortTimeout   = time.Second
 	defaultMaxStoreFiles  = 100_000
 	defaultMaxStoreDirs   = 50_000
 	defaultMaxStoreDepth  = 64
@@ -63,18 +90,28 @@ const (
 
 func parseArgs(args []string, stderr io.Writer) (options, error) {
 	opts := options{
+		jpegQuality:     jpeg.DefaultQuality,
 		calledAE:        "ANY-SCP",
 		callingAE:       "STORESCU",
 		timeout:         defaultDialTimeout,
 		continueOnError: true,
+		maxInvoked:      1,
 	}
 
 	fs := flag.NewFlagSet("storescu", flag.ContinueOnError)
 	fs.SetOutput(stderr)
+	fs.StringVar(&opts.transcodeUID, "transcode-to", "", "explicit target Transfer Syntax UID; empty preserves existing source behavior")
+	fs.BoolVar(&opts.transcodeFallback, "transcode-fallback-original", false, "also offer original bytes; requires -transcode-to and forbids -allow-lossy")
+	fs.BoolVar(&opts.allowLossy, "allow-lossy", false, "authorize a new lossy representation and new SOP Instance identity")
+	fs.IntVar(&opts.jpegQuality, "jpeg-quality", opts.jpegQuality, "JPEG Baseline quality (1..100), used only with -allow-lossy")
+	fs.StringVar(&opts.spoolDirectory, "transcode-spool-dir", "", "parent directory for private bounded transcode temporaries")
+	fs.Int64Var(&opts.maxSpoolBytes, "transcode-max-spool-bytes", 0, "aggregate temporary bytes per preparation; 0 uses 2 GiB")
 	fs.StringVar(&opts.calledAE, "called", opts.calledAE, "called AE title")
 	fs.StringVar(&opts.callingAE, "calling", opts.callingAE, "calling AE title")
 	fs.DurationVar(&opts.timeout, "timeout", opts.timeout, "connection timeout")
 	fs.BoolVar(&opts.continueOnError, "continue-on-error", opts.continueOnError, "continue after per-file failures")
+	fs.IntVar(&opts.maxInvoked, "max-invoked", opts.maxInvoked, "maximum outstanding C-STORE operations; 1 keeps the serial baseline")
+	fs.Int64Var(&opts.maxInFlightBytes, "max-in-flight-bytes", opts.maxInFlightBytes, "maximum payload bytes in flight; 0 uses session defaults")
 	fs.Usage = func() {
 		_, _ = fmt.Fprintf(stderr, "Usage: %s [flags] address file-or-directory [...]\n\nSend DICOM Part 10 files with a reusable C-STORE session.\n\nFlags:\n", fs.Name())
 		fs.PrintDefaults()
@@ -97,12 +134,70 @@ func parseArgs(args []string, stderr io.Writer) (options, error) {
 		fs.Usage()
 		return opts, errUsage
 	}
+	if opts.maxInvoked < 1 {
+		_, _ = fmt.Fprintln(stderr, "-max-invoked must be at least 1")
+		fs.Usage()
+		return opts, errUsage
+	}
+	if opts.maxInFlightBytes < 0 {
+		_, _ = fmt.Fprintln(stderr, "-max-in-flight-bytes must not be negative")
+		fs.Usage()
+		return opts, errUsage
+	}
+	if _, err := storeTranscodeOptions(opts); err != nil {
+		_, _ = fmt.Fprintln(stderr, "invalid transcode options: select a known Transfer Syntax UID, positive JPEG quality within 1..100, and nonnegative spool limit; lossy authorization forbids original fallback")
+		return opts, errUsage
+	}
 	return opts, nil
 }
 
+func storeTranscodeOptions(opts options) (storetranscode.Options, error) {
+	if opts.maxSpoolBytes < 0 || opts.transcodeFallback && opts.allowLossy {
+		return storetranscode.Options{}, storetranscode.ErrOptions
+	}
+	if opts.transcodeUID == "" {
+		if opts.transcodeFallback || opts.allowLossy || opts.spoolDirectory != "" || opts.maxSpoolBytes != 0 {
+			return storetranscode.Options{}, storetranscode.ErrOptions
+		}
+		return storetranscode.Options{}, nil
+	}
+	target, ok := transfer.DefaultRegistry.Get(transfer.NormalizeUID(opts.transcodeUID))
+	if !ok {
+		return storetranscode.Options{}, storetranscode.ErrOptions
+	}
+	if opts.jpegQuality < jpeg.MinQuality || opts.jpegQuality > jpeg.MaxQuality {
+		return storetranscode.Options{}, jpeg.ErrInvalidQuality
+	}
+	decoders, err := builtin.NewRegistry()
+	if err != nil {
+		return storetranscode.Options{}, err
+	}
+	encoders := pixeldata.NewMemoryEncoderRegistry()
+	if err := rle.RegisterEncoder(encoders); err != nil {
+		return storetranscode.Options{}, err
+	}
+	if err := jpegls.RegisterEncoder(encoders); err != nil {
+		return storetranscode.Options{}, err
+	}
+	if opts.allowLossy {
+		if err := jpeg.RegisterEncoder(encoders, opts.jpegQuality); err != nil {
+			return storetranscode.Options{}, err
+		}
+	}
+	return storetranscode.Options{Target: target, FallbackOriginal: opts.transcodeFallback, SpoolDirectory: opts.spoolDirectory, MaxSpoolBytes: opts.maxSpoolBytes,
+		Transcode: pixeldata.TranscodeOptions{DecoderRegistry: decoders, EncoderRegistry: encoders, AllowLossy: opts.allowLossy}}, nil
+}
+
 func runStore(opts options, stdout, stderr io.Writer) error {
+	return runStoreWithContext(context.Background(), opts, stdout, stderr)
+}
+
+func runStoreWithContext(parent context.Context, opts options, stdout, stderr io.Writer) error {
 	_ = stderr
-	inputs, err := expandStoreInputSpecs(context.Background(), opts.files, storeInputLimits{
+	if parent == nil {
+		parent = context.Background()
+	}
+	inputs, err := expandStoreInputSpecs(parent, opts.files, storeInputLimits{
 		maxFiles: defaultMaxStoreFiles,
 		maxDirs:  defaultMaxStoreDirs,
 		maxDepth: defaultMaxStoreDepth,
@@ -112,8 +207,18 @@ func runStore(opts options, stdout, stderr io.Writer) error {
 		return err
 	}
 	sources := make([]dimse.StoreSource, len(inputs))
+	transcodeOptions, err := storeTranscodeOptions(opts)
+	if err != nil {
+		return err
+	}
 	for i := range inputs {
 		sources[i] = dimse.NewRootedPathStoreSource(inputs[i].root, inputs[i].relative)
+		if transcodeOptions.Target.UID != "" {
+			sources[i], err = storetranscode.NewSource(sources[i], transcodeOptions)
+			if err != nil {
+				return err
+			}
+		}
 	}
 	session, err := dimse.NewStoreSession(opts.address, dimse.StoreSessionOptions{
 		DialOptions: ul.DialOptions{
@@ -123,15 +228,25 @@ func runStore(opts options, stdout, stderr io.Writer) error {
 			ReadProgressTimeout:  opts.timeout,
 			WriteProgressTimeout: opts.timeout,
 		},
-		ContinueOnError: opts.continueOnError,
-		ReleaseTimeout:  defaultReleaseTimeout,
+		ContinueOnError:      opts.continueOnError,
+		MaxInvokedOperations: opts.maxInvoked,
+		MaxInFlightBytes:     opts.maxInFlightBytes,
+		ReleaseTimeout:       defaultReleaseTimeout,
+		CleanupTimeout:       defaultAbortTimeout,
 	})
 	if err != nil {
 		return err
 	}
-	defer func() { _ = session.Abort(context.Background()) }()
-	result, err := session.StoreBatch(context.Background(), sources)
+	result, err := session.StoreBatch(parent, sources)
 	for _, item := range result.Items {
+		if source, ok := sources[item.SourceIndex].(*storetranscode.Source); ok {
+			source.RecordResult(item)
+			report := source.Report()
+			_, _ = fmt.Fprintf(stdout, "C-STORE representation source=%d original=%s selected=%s negotiation=%s\n", item.SourceIndex+1, report.OriginalTransferSyntaxUID, report.SelectedTransferSyntaxUID, report.Negotiation)
+			for _, candidate := range report.Candidates {
+				_, _ = fmt.Fprintf(stdout, "C-STORE candidate source=%d syntax=%s operation=%s producible=%t reason=%s runtime-missing=%t lossy=%t\n", item.SourceIndex+1, candidate.TransferSyntaxUID, candidate.Operation, candidate.Producible, candidate.Reason, candidate.RuntimeMissing, candidate.Lossy)
+			}
+		}
 		status := ""
 		if item.StatusSet {
 			status = fmt.Sprintf(" status=0x%04X", item.Status)
@@ -139,12 +254,18 @@ func runStore(opts options, stdout, stderr io.Writer) error {
 		_, _ = fmt.Fprintf(stdout, "C-STORE source=%d outcome=%s%s\n", item.SourceIndex+1, item.Outcome, status)
 	}
 	if err != nil {
-		return err
+		cleanupCtx, cancelCleanup := context.WithTimeout(context.Background(), defaultAbortTimeout)
+		abortErr := session.Abort(cleanupCtx)
+		cancelCleanup()
+		return errors.Join(err, abortErr)
 	}
+	cleanupCtx, cancelCleanup := context.WithTimeout(context.Background(), defaultReleaseTimeout)
+	closeErr := session.Close(cleanupCtx)
+	cancelCleanup()
 	if result.Failed > 0 || result.Unknown > 0 {
-		return fmt.Errorf("C-STORE batch completed with %d failed and %d uncertain", result.Failed, result.Unknown)
+		return errors.Join(fmt.Errorf("C-STORE batch completed with %d failed and %d uncertain", result.Failed, result.Unknown), closeErr)
 	}
-	return session.Close(context.Background())
+	return closeErr
 }
 
 func expandStoreInputs(ctx context.Context, inputs []string, maxFiles int) ([]string, error) {

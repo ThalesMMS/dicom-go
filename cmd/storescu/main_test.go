@@ -8,10 +8,13 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/ThalesMMS/dicom-go/internal/dicomtest"
+	"github.com/ThalesMMS/dicom-go/internal/dimsecli"
+	"github.com/ThalesMMS/dicom-go/internal/testutil"
 	"github.com/ThalesMMS/dicom-go/net/dimse"
 	"github.com/ThalesMMS/dicom-go/net/ul"
 	"github.com/ThalesMMS/dicom-go/transfer"
@@ -22,8 +25,31 @@ func TestParseArgsDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parseArgs() error = %v", err)
 	}
-	if opts.address != "127.0.0.1:104" || opts.calledAE != "ANY-SCP" || opts.callingAE != "STORESCU" || opts.timeout != defaultDialTimeout || len(opts.files) != 1 || opts.files[0] != "file.dcm" {
+	if opts.address != "127.0.0.1:104" || opts.calledAE != "ANY-SCP" || opts.callingAE != "STORESCU" || opts.timeout != defaultDialTimeout || len(opts.files) != 1 || opts.files[0] != "file.dcm" || opts.maxInvoked != 1 || opts.maxInFlightBytes != 0 {
 		t.Fatalf("parseArgs() defaults = %#v", opts)
+	}
+}
+
+func TestParseArgsTranscodeRequiresExplicitConsistentPolicy(t *testing.T) {
+	for _, flags := range [][]string{
+		{"-transcode-to", transfer.RLELossless.UID},
+		{"-transcode-to", transfer.JPEGLSLossless.UID, "-transcode-fallback-original"},
+		{"-transcode-to", transfer.JPEGBaseline.UID, "-allow-lossy", "-jpeg-quality", "95"},
+	} {
+		opts, err := parseArgs(append(flags, "127.0.0.1:104", "synthetic.dcm"), &bytes.Buffer{})
+		if err != nil || opts.transcodeUID == "" {
+			t.Fatalf("explicit policy rejected: %v", err)
+		}
+	}
+	for _, flags := range [][]string{
+		{"-allow-lossy"}, {"-transcode-fallback-original"}, {"-transcode-to", "1.2.3"},
+		{"-transcode-to", transfer.JPEGBaseline.UID, "-allow-lossy", "-transcode-fallback-original"},
+		{"-transcode-to", transfer.JPEGBaseline.UID, "-allow-lossy", "-jpeg-quality", "0"},
+		{"-transcode-to", transfer.RLELossless.UID, "-transcode-max-spool-bytes", "-1"},
+	} {
+		if _, err := parseArgs(append(flags, "127.0.0.1:104", "synthetic.dcm"), &bytes.Buffer{}); !errors.Is(err, errUsage) {
+			t.Fatalf("invalid policy accepted: %v", flags)
+		}
 	}
 }
 
@@ -40,6 +66,21 @@ func TestParseArgsCustomValues(t *testing.T) {
 	}
 	if opts.address != "127.0.0.1:104" || opts.calledAE != "SCP" || opts.callingAE != "SCU" || opts.timeout != 2*time.Second || len(opts.files) != 1 || opts.files[0] != "file.dcm" {
 		t.Fatalf("parseArgs() = %#v", opts)
+	}
+}
+
+func TestParseArgsPipelineFlags(t *testing.T) {
+	opts, err := parseArgs([]string{
+		"-max-invoked", "4",
+		"-max-in-flight-bytes", "1048576",
+		"127.0.0.1:104",
+		"file.dcm",
+	}, &bytes.Buffer{})
+	if err != nil {
+		t.Fatalf("parseArgs() error = %v", err)
+	}
+	if opts.maxInvoked != 4 || opts.maxInFlightBytes != 1048576 {
+		t.Fatalf("pipeline flags = %#v", opts)
 	}
 }
 
@@ -70,6 +111,26 @@ func TestRunMissingFileErrorIsClassified(t *testing.T) {
 	}
 	if got := stderr.String(); !strings.Contains(got, "storescu: error: file inspection failed") || strings.Contains(got, missingPath) {
 		t.Fatalf("stderr = %q, want redacted file classification", got)
+	}
+}
+
+func TestRunWithContextCancellationDuringInputExpansion(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "sensitive-study.dcm")
+	if err := os.WriteFile(path, []byte("not inspected"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx := newCancelOnErrCheckContext(context.Background(), 2)
+	var stdout, stderr bytes.Buffer
+	code := runWithContext(ctx, []string{"127.0.0.1:104", root}, &stdout, &stderr)
+	if code != dimsecli.ExitCanceled {
+		t.Fatalf("runWithContext() exit = %d, want %d; stderr=%q", code, dimsecli.ExitCanceled, stderr.String())
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "context canceled") || strings.Contains(stderr.String(), path) || ctx.checkCount() < 2 {
+		t.Fatalf("stderr = %q, want PHI-safe cancellation", stderr.String())
 	}
 }
 
@@ -159,6 +220,102 @@ func TestRunStoreSendsFixtureToLocalSCP(t *testing.T) {
 	}
 }
 
+func TestRunWithContextCancellationDuringTransferAbortsAssociation(t *testing.T) {
+	serverCtx, stopServer := context.WithTimeout(context.Background(), 3*time.Second)
+	defer stopServer()
+	data, err := dicomtest.ExplicitVRFile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := tempDICOMFile(t, data)
+	secondPath := tempDICOMFile(t, data)
+	listener, err := ul.Listen(ul.ListenOptions{Address: "127.0.0.1:0", Context: serverCtx})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = listener.Close() }()
+
+	requestReceived := make(chan struct{})
+	serverDone := make(chan error, 1)
+	go func() {
+		assoc, err := listener.AcceptAssociation(ul.AcceptOptions{
+			AETitle: "STORESCP", Context: serverCtx,
+			AcceptAnyAbstractSyntax:   true,
+			SupportedTransferSyntaxes: []string{transfer.ExplicitVRLittleEndian.UID},
+		})
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		defer func() { _ = assoc.Close() }()
+		pc, err := dimse.AcceptedContextForSOPClass(assoc, dicomtest.TestSOPClassUID)
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		if _, err := dimse.ReceiveCStoreRequest(assoc, pc.ID); err != nil {
+			serverDone <- err
+			return
+		}
+		if _, err := dimse.ReceiveDataSet(assoc, pc.ID, transfer.ExplicitVRLittleEndian); err != nil {
+			serverDone <- err
+			return
+		}
+		close(requestReceived)
+		pdu, err := assoc.ReadPDU()
+		if errors.Is(err, ul.ErrAssociationAborted) {
+			err = nil
+		}
+		if err == nil && pdu != nil {
+			if _, ok := pdu.(*ul.AbortRQ); !ok {
+				err = errors.New("server expected A-ABORT-RQ")
+			}
+		}
+		serverDone <- err
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	var stdout, stderr bytes.Buffer
+	result := make(chan int, 1)
+	go func() {
+		result <- runWithContext(ctx, []string{
+			"-called", "STORESCP",
+			"-calling", "STORESCU",
+			"-timeout", "2s",
+			listener.Addr().String(),
+			path,
+			secondPath,
+		}, &stdout, &stderr)
+	}()
+	select {
+	case <-requestReceived:
+	case <-time.After(time.Second):
+		t.Fatal("server did not receive C-STORE payload")
+	}
+	cancel()
+	select {
+	case code := <-result:
+		if code != dimsecli.ExitCanceled {
+			t.Fatalf("runWithContext() exit = %d, want %d; stderr=%q", code, dimsecli.ExitCanceled, stderr.String())
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("storescu did not finish bounded cancellation")
+	}
+	if err := <-serverDone; err != nil {
+		t.Fatalf("SCP error = %v", err)
+	}
+	if !strings.Contains(stdout.String(), "C-STORE source=1 outcome=unknown") {
+		t.Fatalf("stdout = %q, want partial unknown outcome", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "C-STORE source=2 outcome=canceled") {
+		t.Fatalf("stdout = %q, want remaining canceled outcome", stdout.String())
+	}
+	if strings.Contains(stdout.String(), path) || strings.Contains(stderr.String(), path) || strings.Contains(stdout.String(), secondPath) || strings.Contains(stderr.String(), secondPath) ||
+		strings.Contains(stdout.String(), dicomtest.TestSOPInstanceUID) || strings.Contains(stderr.String(), dicomtest.TestSOPInstanceUID) {
+		t.Fatalf("output disclosed source path or SOP Instance UID: stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
+}
+
 func TestParseArgsAcceptsMultipleInputs(t *testing.T) {
 	opts, err := parseArgs([]string{"127.0.0.1:104", "one.dcm", "two.dcm", "directory"}, &bytes.Buffer{})
 	if err != nil {
@@ -194,9 +351,7 @@ func TestExpandStoreInputsWalksDirectoriesDeterministicallyAndRejectsSymlinks(t 
 	}
 
 	link := filepath.Join(root, "LINK.DCM")
-	if err := os.Symlink(first, link); err != nil {
-		t.Skipf("symlink unavailable: %v", err)
-	}
+	testutil.SymlinkOrSkip(t, first, link)
 	if _, err := expandStoreInputs(context.Background(), []string{root}, 3); err == nil {
 		t.Fatal("expandStoreInputs(symlink) error = nil, want rejection")
 	}
@@ -264,9 +419,7 @@ func TestExpandedStoreSourceRejectsAncestorSymlinkSwap(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(external, name), data, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Symlink(external, sub); err != nil {
-		t.Skipf("symlink unavailable: %v", err)
-	}
+	testutil.SymlinkOrSkip(t, external, sub)
 	source := dimse.NewRootedPathStoreSource(expanded[0].root, expanded[0].relative)
 	if _, err := source.Inspect(context.Background()); !errors.Is(err, dimse.ErrStoreInvalidSource) {
 		t.Fatalf("Inspect() error = %v, want ErrStoreInvalidSource after ancestor swap", err)
@@ -306,9 +459,7 @@ func TestExpandedStoreSourceRejectsRootParentSymlinkSwap(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(externalRoot, name), data, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Symlink(externalParent, parent); err != nil {
-		t.Skipf("symlink unavailable: %v", err)
-	}
+	testutil.SymlinkOrSkip(t, externalParent, parent)
 	source := dimse.NewRootedPathStoreSource(expanded[0].root, expanded[0].relative)
 	if _, err := source.Inspect(context.Background()); !errors.Is(err, dimse.ErrStoreInvalidSource) {
 		t.Fatalf("Inspect() error = %v, want ErrStoreInvalidSource after root parent swap", err)
@@ -328,4 +479,44 @@ func tempDICOMFile(t *testing.T, data []byte) string {
 		t.Fatalf("Close() error = %v", err)
 	}
 	return f.Name()
+}
+
+// cancelOnErrCheckContext deterministically cancels at a cooperative context
+// checkpoint. It lets the expansion test enter traversal without depending on
+// filesystem speed or sleeps.
+type cancelOnErrCheckContext struct {
+	context.Context
+	mu        sync.Mutex
+	remaining int
+	checks    int
+	canceled  bool
+	done      chan struct{}
+}
+
+func newCancelOnErrCheckContext(parent context.Context, checks int) *cancelOnErrCheckContext {
+	return &cancelOnErrCheckContext{Context: parent, remaining: checks, done: make(chan struct{})}
+}
+
+func (ctx *cancelOnErrCheckContext) Done() <-chan struct{} { return ctx.done }
+
+func (ctx *cancelOnErrCheckContext) Err() error {
+	ctx.mu.Lock()
+	defer ctx.mu.Unlock()
+	ctx.checks++
+	if ctx.canceled {
+		return context.Canceled
+	}
+	ctx.remaining--
+	if ctx.remaining <= 0 {
+		ctx.canceled = true
+		close(ctx.done)
+		return context.Canceled
+	}
+	return nil
+}
+
+func (ctx *cancelOnErrCheckContext) checkCount() int {
+	ctx.mu.Lock()
+	defer ctx.mu.Unlock()
+	return ctx.checks
 }

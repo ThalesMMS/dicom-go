@@ -28,6 +28,20 @@ type Stats struct {
 	HistogramBinWidth float64
 }
 
+// SummaryStats describes the finite rescaled-value distribution inside a 2D
+// ROI without quantiles, higher moments, histogram bins, or retained samples.
+// Variance and StdDev use the population definition, matching Stats.
+type SummaryStats struct {
+	Count int
+	Sum   float64
+	Min   float64
+	Max   float64
+	Mean  float64
+
+	Variance float64
+	StdDev   float64
+}
+
 func LengthMM(a, b image.Point, spacing MeasureSpacing) (float64, bool) {
 	return LengthMMWith(a, b, spacing)
 }
@@ -89,6 +103,50 @@ func DeviationMM(lineA, lineB, point image.Point, spacing MeasureSpacing) (float
 
 func Stats2D(mask *RasterMask, valueAt func(x, y int) (float64, bool)) Stats {
 	return Stats2DWithHistogram(mask, valueAt, 0)
+}
+
+// Stats2DSummary computes count, sum, range, mean, population variance, and
+// standard deviation in one pass and O(1) auxiliary memory. It intentionally
+// does not retain or sort individual samples; use Stats2D when an exact median
+// or higher distribution moments are required.
+func Stats2DSummary(mask *RasterMask, valueAt func(x, y int) (float64, bool)) SummaryStats {
+	var summary SummaryStats
+	if mask == nil || valueAt == nil {
+		return summary
+	}
+	min, max := math.Inf(1), math.Inf(-1)
+	var m2 float64
+	mask.ForEachPixel(func(x, y int) {
+		value, ok := valueAt(x, y)
+		if !ok || math.IsNaN(value) || math.IsInf(value, 0) {
+			return
+		}
+		previousCount := float64(summary.Count)
+		summary.Count++
+		count := float64(summary.Count)
+		delta := value - summary.Mean
+		deltaOverCount := delta / count
+		m2 += delta * deltaOverCount * previousCount
+		summary.Mean += deltaOverCount
+		summary.Sum += value
+		if value < min {
+			min = value
+		}
+		if value > max {
+			max = value
+		}
+	})
+	if summary.Count == 0 {
+		return SummaryStats{}
+	}
+	summary.Min = min
+	summary.Max = max
+	summary.Variance = m2 / float64(summary.Count)
+	if summary.Variance < 0 {
+		summary.Variance = 0
+	}
+	summary.StdDev = math.Sqrt(summary.Variance)
+	return summary
 }
 
 // Stats2DWithHistogram computes distribution statistics over mask. bins > 0

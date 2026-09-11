@@ -8,16 +8,15 @@
 //
 // The Modality transform is either a linear Rescale Slope/Intercept or a
 // Modality LUT Sequence; the VOI transform is either a Window Center/Width with
-// a window function or a VOI LUT Sequence. Presentation-stage behavior
-// (MONOCHROME1 inversion, Presentation LUT, overlays, shutters) and color paths
-// (palette, YBR) are layered on top of this package by later work; this first
-// slice covers grayscale modality and VOI handling with MONOCHROME2 output.
+// a window function or a VOI LUT Sequence. The package also provides
+// presentation-stage helpers for inversion, LUTs, overlays, and shutters.
+// RenderColor supplies shared RGB, palette, and YBR conversion alongside the
+// grayscale modality and VOI pipeline.
 package display
 
 import (
 	"encoding/binary"
 	"errors"
-	"fmt"
 	"image"
 	"math"
 )
@@ -35,7 +34,34 @@ var (
 	// ErrDestinationTooShort reports a caller-provided modality buffer that
 	// cannot hold one value for every frame pixel.
 	ErrDestinationTooShort = errors.New("dicom/display: modality destination too short")
+	// ErrFrameSizeOverflow reports frame dimensions whose pixel, stride, source,
+	// or destination size cannot be represented safely by an int.
+	ErrFrameSizeOverflow = errors.New("dicom/display: frame size overflow")
 )
+
+// FrameValidationError identifies the rejected frame field without including
+// caller-controlled metadata or pixel payload in the error message.
+type FrameValidationError struct {
+	Field string
+	Err   error
+}
+
+func (e *FrameValidationError) Error() string {
+	if e == nil || e.Err == nil {
+		return ErrInvalidFrame.Error()
+	}
+	if e.Field == "" {
+		return e.Err.Error()
+	}
+	return e.Err.Error() + ": " + e.Field
+}
+
+func (e *FrameValidationError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
 
 // PixelFormat describes how to read a single stored sample from a frame's pixel
 // bytes. It mirrors the DICOM Image Pixel module attributes that govern stored
@@ -97,19 +123,20 @@ func (pipeline) RenderColor(frame ColorFrame) (*image.RGBA, error) {
 // is brighter). MONOCHROME1 inversion is a presentation-stage concern handled
 // by callers/later pipeline stages.
 func RenderGray(frame Frame) (*image.Gray, error) {
-	rows, cols := frame.Rows, frame.Columns
-	if rows <= 0 || cols <= 0 {
-		return nil, fmt.Errorf("%w: Rows=%d Columns=%d", ErrInvalidFrame, rows, cols)
+	if err := validateFrameDimensions(frame.Rows, frame.Columns); err != nil {
+		return nil, err
 	}
 	bitsAllocated := frame.Format.BitsAllocated
 	if bitsAllocated != 8 && bitsAllocated != 16 {
-		return nil, fmt.Errorf("%w: %d", ErrUnsupportedBitsAllocated, bitsAllocated)
+		return nil, frameValidationError("BitsAllocated", ErrUnsupportedBitsAllocated)
 	}
-
 	bytesPerSample := bitsAllocated / 8
-	expected := rows * cols * bytesPerSample
-	if len(frame.Pixels) < expected {
-		return nil, fmt.Errorf("%w: got %d bytes, want %d", ErrPixelDataTooShort, len(frame.Pixels), expected)
+	layout, err := checkedFrameLayout(frame.Rows, frame.Columns, 1, bytesPerSample, 1)
+	if err != nil {
+		return nil, err
+	}
+	if len(frame.Pixels) < layout.sourceBytes {
+		return nil, frameValidationError("Pixels", ErrPixelDataTooShort)
 	}
 
 	order := frame.Format.ByteOrder
@@ -124,10 +151,10 @@ func RenderGray(frame Frame) (*image.Gray, error) {
 	}
 	mapper := NewVOIByteMapper(voi)
 
-	out := image.NewGray(image.Rect(0, 0, cols, rows))
+	out := image.NewGray(image.Rect(0, 0, frame.Columns, frame.Rows))
 	reader := newStoredPixelReader(frame.Format, order)
 	if frame.Modality.LUT != nil {
-		for pixelIndex := 0; pixelIndex < rows*cols; pixelIndex++ {
+		for pixelIndex := 0; pixelIndex < layout.pixels; pixelIndex++ {
 			offset := pixelIndex * bytesPerSample
 			modality := float64(frame.Modality.LUT.lookupInt64(reader.value(frame.Pixels[offset:])))
 			out.Pix[pixelIndex] = mapper.Byte(modality)
@@ -138,7 +165,7 @@ func RenderGray(frame Frame) (*image.Gray, error) {
 			slope = 1
 		}
 		intercept := frame.Modality.Intercept
-		for pixelIndex := 0; pixelIndex < rows*cols; pixelIndex++ {
+		for pixelIndex := 0; pixelIndex < layout.pixels; pixelIndex++ {
 			offset := pixelIndex * bytesPerSample
 			modality := float64(reader.value(frame.Pixels[offset:]))*slope + intercept
 			out.Pix[pixelIndex] = mapper.Byte(modality)
@@ -153,42 +180,42 @@ func RenderGray(frame Frame) (*image.Gray, error) {
 // render caches) that window the same modality values repeatedly without
 // re-extracting stored pixels.
 func DecodeModality(frame Frame) ([]float64, error) {
-	return decodeModality[float64](frame)
+	return decodeModality[float64](frame, 8)
 }
 
 // DecodeModalityFloat32 is DecodeModality with float32 output. It is intended
 // for memory-sensitive render caches whose downstream calculations already use
 // float32 precision, avoiding a transient float64 buffer and conversion pass.
 func DecodeModalityFloat32(frame Frame) ([]float32, error) {
-	return decodeModality[float32](frame)
+	return decodeModality[float32](frame, 4)
 }
 
 // DecodeModalityFloat32Into is DecodeModalityFloat32 without an output
 // allocation. It writes Rows*Columns values into destination and leaves any
 // remaining capacity untouched.
 func DecodeModalityFloat32Into(destination []float32, frame Frame) error {
-	return decodeModalityInto(destination, frame)
+	return decodeModalityInto(destination, frame, 4)
 }
 
-func decodeModality[T ~float32 | ~float64](frame Frame) ([]T, error) {
-	count, err := modalitySampleCount(frame)
+func decodeModality[T ~float32 | ~float64](frame Frame, outputBytesPerPixel int) ([]T, error) {
+	count, err := modalitySampleCount(frame, outputBytesPerPixel)
 	if err != nil {
 		return nil, err
 	}
 	out := make([]T, count)
-	if err := decodeModalityInto(out, frame); err != nil {
+	if err := decodeModalityInto(out, frame, outputBytesPerPixel); err != nil {
 		return nil, err
 	}
 	return out, nil
 }
 
-func decodeModalityInto[T ~float32 | ~float64](out []T, frame Frame) error {
-	count, err := modalitySampleCount(frame)
+func decodeModalityInto[T ~float32 | ~float64](out []T, frame Frame, outputBytesPerPixel int) error {
+	count, err := modalitySampleCount(frame, outputBytesPerPixel)
 	if err != nil {
 		return err
 	}
 	if len(out) < count {
-		return fmt.Errorf("%w: got %d values, want %d", ErrDestinationTooShort, len(out), count)
+		return frameValidationError("Destination", ErrDestinationTooShort)
 	}
 	out = out[:count]
 	bitsAllocated := frame.Format.BitsAllocated
@@ -217,21 +244,84 @@ func decodeModalityInto[T ~float32 | ~float64](out []T, frame Frame) error {
 	return nil
 }
 
-func modalitySampleCount(frame Frame) (int, error) {
-	rows, cols := frame.Rows, frame.Columns
-	if rows <= 0 || cols <= 0 {
-		return 0, fmt.Errorf("%w: Rows=%d Columns=%d", ErrInvalidFrame, rows, cols)
+func modalitySampleCount(frame Frame, outputBytesPerPixel int) (int, error) {
+	if err := validateFrameDimensions(frame.Rows, frame.Columns); err != nil {
+		return 0, err
 	}
 	bitsAllocated := frame.Format.BitsAllocated
 	if bitsAllocated != 8 && bitsAllocated != 16 && bitsAllocated != 32 {
-		return 0, fmt.Errorf("%w: %d", ErrUnsupportedBitsAllocated, bitsAllocated)
+		return 0, frameValidationError("BitsAllocated", ErrUnsupportedBitsAllocated)
 	}
 	bytesPerSample := bitsAllocated / 8
-	expected := rows * cols * bytesPerSample
-	if len(frame.Pixels) < expected {
-		return 0, fmt.Errorf("%w: got %d bytes, want %d", ErrPixelDataTooShort, len(frame.Pixels), expected)
+	layout, err := checkedFrameLayout(frame.Rows, frame.Columns, 1, bytesPerSample, outputBytesPerPixel)
+	if err != nil {
+		return 0, err
 	}
-	return rows * cols, nil
+	if len(frame.Pixels) < layout.sourceBytes {
+		return 0, frameValidationError("Pixels", ErrPixelDataTooShort)
+	}
+	return layout.pixels, nil
+}
+
+type frameLayout struct {
+	pixels      int
+	sourceBytes int
+}
+
+func checkedFrameLayout(rows, columns, samplesPerPixel, bytesPerSample, outputBytesPerPixel int) (frameLayout, error) {
+	if err := validateFrameDimensions(rows, columns); err != nil {
+		return frameLayout{}, err
+	}
+	if samplesPerPixel <= 0 {
+		return frameLayout{}, frameValidationError("SamplesPerPixel", ErrInvalidFrame)
+	}
+	if bytesPerSample <= 0 {
+		return frameLayout{}, frameValidationError("BytesPerSample", ErrInvalidFrame)
+	}
+	if outputBytesPerPixel <= 0 {
+		return frameLayout{}, frameValidationError("OutputBytesPerPixel", ErrInvalidFrame)
+	}
+
+	pixels, ok := checkedDisplayMul(rows, columns)
+	if !ok {
+		return frameLayout{}, frameValidationError("PixelCount", ErrFrameSizeOverflow)
+	}
+	samples, ok := checkedDisplayMul(pixels, samplesPerPixel)
+	if !ok {
+		return frameLayout{}, frameValidationError("SourceStride", ErrFrameSizeOverflow)
+	}
+	sourceBytes, ok := checkedDisplayMul(samples, bytesPerSample)
+	if !ok {
+		return frameLayout{}, frameValidationError("SourceBytes", ErrFrameSizeOverflow)
+	}
+	if _, ok := checkedDisplayMul(pixels, outputBytesPerPixel); !ok {
+		return frameLayout{}, frameValidationError("OutputBytes", ErrFrameSizeOverflow)
+	}
+	return frameLayout{pixels: pixels, sourceBytes: sourceBytes}, nil
+}
+
+func validateFrameDimensions(rows, columns int) error {
+	if rows <= 0 {
+		return frameValidationError("Rows", ErrInvalidFrame)
+	}
+	if columns <= 0 {
+		return frameValidationError("Columns", ErrInvalidFrame)
+	}
+	return nil
+}
+
+func checkedDisplayMul(left, right int) (int, bool) {
+	if left < 0 || right < 0 {
+		return 0, false
+	}
+	if left != 0 && right > int(^uint(0)>>1)/left {
+		return 0, false
+	}
+	return left * right, true
+}
+
+func frameValidationError(field string, err error) error {
+	return &FrameValidationError{Field: field, Err: err}
 }
 
 // scaleToByte linearly maps a VOI LUT output value in [min, min+span] to the

@@ -7,8 +7,7 @@ import (
 
 	"github.com/ThalesMMS/dicom-go/object"
 	"github.com/ThalesMMS/dicom-go/pixeldata"
-	jpegcodec "github.com/ThalesMMS/dicom-go/pixeldata/jpeg"
-	"github.com/ThalesMMS/dicom-go/pixeldata/rle"
+	"github.com/ThalesMMS/dicom-go/pixeldata/builtin"
 )
 
 func main() {
@@ -47,9 +46,10 @@ func main() {
 	}
 
 	// Native frame extraction covers uncompressed pixel data. Encapsulated
-	// transfer syntaxes require a registered codec; this example registers JPEG
-	// Baseline and RLE Lossless. JPEG-LS, JPEG 2000, JPEG XL, MPEG and HEVC are
-	// recognized in the transfer registry but are not decoded.
+	// transfer syntaxes require a registered codec; this example registers the
+	// built-in JPEG Baseline/Extended, JPEG Lossless, and RLE Lossless baseline.
+	// JPEG-LS, JPEG 2000, JPEG XL, MPEG and HEVC are recognized in the transfer
+	// registry but are not decoded.
 	native, err := pixeldata.ExtractNativeFrames(file.Dataset)
 	if err == nil {
 		for i, frame := range native.Data {
@@ -62,12 +62,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err := jpegcodec.RegisterDefault(); err != nil {
-		fmt.Fprintf(os.Stderr, "register JPEG Baseline codec: %v\n", err)
-		os.Exit(1)
-	}
-	if err := rle.RegisterDefault(); err != nil {
-		fmt.Fprintf(os.Stderr, "register RLE codec: %v\n", err)
+	if err := builtin.RegisterDefault(); err != nil {
+		fmt.Fprintf(os.Stderr, "register built-in pixel codecs: %v\n", err)
 		os.Exit(1)
 	}
 	pixels, err := pixeldata.Extract(file.Dataset)

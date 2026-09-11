@@ -3,7 +3,6 @@ package display
 import (
 	"encoding/binary"
 	"errors"
-	"fmt"
 	"image"
 	"math"
 	"strings"
@@ -50,8 +49,8 @@ type ColorFrame struct {
 // a typed error rather than a misleading image.
 func RenderColor(frame ColorFrame) (*image.RGBA, error) {
 	rows, cols := frame.Rows, frame.Columns
-	if rows <= 0 || cols <= 0 {
-		return nil, fmt.Errorf("%w: Rows=%d Columns=%d", ErrInvalidFrame, rows, cols)
+	if err := validateFrameDimensions(rows, cols); err != nil {
+		return nil, err
 	}
 	switch normalizePhotometric(frame.Photometric) {
 	case "PALETTE COLOR":
@@ -63,7 +62,7 @@ func RenderColor(frame ColorFrame) (*image.RGBA, error) {
 	case "YBR_FULL_422":
 		return renderYBR422(frame, rows, cols)
 	default:
-		return nil, fmt.Errorf("%w: %q", ErrUnsupportedColorPhotometric, frame.Photometric)
+		return nil, frameValidationError("PhotometricInterpretation", ErrUnsupportedColorPhotometric)
 	}
 }
 
@@ -71,24 +70,30 @@ func RenderColor(frame ColorFrame) (*image.RGBA, error) {
 // per-pixel sample conversion (identity for RGB, YBR conversion for YBR_FULL).
 func renderThreeSample(frame ColorFrame, rows, cols int, convert func(a, b, c uint8) (uint8, uint8, uint8)) (*image.RGBA, error) {
 	if frame.SamplesPerPixel != 3 {
-		return nil, fmt.Errorf("%w: SamplesPerPixel=%d, want 3", ErrUnsupportedColorLayout, frame.SamplesPerPixel)
+		return nil, frameValidationError("SamplesPerPixel", ErrUnsupportedColorLayout)
 	}
 	if frame.Format.BitsAllocated != 8 {
-		return nil, fmt.Errorf("%w: BitsAllocated=%d, want 8", ErrUnsupportedColorLayout, frame.Format.BitsAllocated)
+		return nil, frameValidationError("BitsAllocated", ErrUnsupportedColorLayout)
 	}
-	n := rows * cols
-	if len(frame.Pixels) < n*3 {
-		return nil, fmt.Errorf("%w: got %d bytes, want %d", ErrPixelDataTooShort, len(frame.Pixels), n*3)
+	if frame.PlanarConfiguration != 0 && frame.PlanarConfiguration != 1 {
+		return nil, frameValidationError("PlanarConfiguration", ErrUnsupportedColorLayout)
+	}
+	layout, err := checkedFrameLayout(rows, cols, 3, 1, 4)
+	if err != nil {
+		return nil, err
+	}
+	if len(frame.Pixels) < layout.sourceBytes {
+		return nil, frameValidationError("Pixels", ErrPixelDataTooShort)
 	}
 
 	planar := frame.PlanarConfiguration == 1
 	out := image.NewRGBA(image.Rect(0, 0, cols, rows))
-	for i := 0; i < n; i++ {
+	for i := 0; i < layout.pixels; i++ {
 		var s0, s1, s2 uint8
 		if planar {
 			s0 = frame.Pixels[i]
-			s1 = frame.Pixels[n+i]
-			s2 = frame.Pixels[2*n+i]
+			s1 = frame.Pixels[layout.pixels+i]
+			s2 = frame.Pixels[2*layout.pixels+i]
 		} else {
 			s0 = frame.Pixels[i*3]
 			s1 = frame.Pixels[i*3+1]
@@ -107,15 +112,24 @@ func renderThreeSample(frame ColorFrame, rows, cols int, convert func(a, b, c ui
 // renderYBR422 renders interleaved YBR_FULL_422 data, where chroma is subsampled
 // horizontally by two and each pixel pair is stored as Y0 Y1 Cb Cr.
 func renderYBR422(frame ColorFrame, rows, cols int) (*image.RGBA, error) {
+	if frame.SamplesPerPixel != 3 {
+		return nil, frameValidationError("SamplesPerPixel", ErrUnsupportedColorLayout)
+	}
 	if frame.Format.BitsAllocated != 8 {
-		return nil, fmt.Errorf("%w: BitsAllocated=%d, want 8", ErrUnsupportedColorLayout, frame.Format.BitsAllocated)
+		return nil, frameValidationError("BitsAllocated", ErrUnsupportedColorLayout)
+	}
+	if frame.PlanarConfiguration != 0 {
+		return nil, frameValidationError("PlanarConfiguration", ErrUnsupportedColorLayout)
 	}
 	if cols%2 != 0 {
-		return nil, fmt.Errorf("%w: YBR_FULL_422 requires an even column count, got %d", ErrUnsupportedColorLayout, cols)
+		return nil, frameValidationError("Columns", ErrUnsupportedColorLayout)
 	}
-	expected := rows * cols * 2 // 4 bytes per 2 pixels
-	if len(frame.Pixels) < expected {
-		return nil, fmt.Errorf("%w: got %d bytes, want %d", ErrPixelDataTooShort, len(frame.Pixels), expected)
+	layout, err := checkedFrameLayout(rows, cols, 2, 1, 4) // 4 source bytes per 2 pixels.
+	if err != nil {
+		return nil, err
+	}
+	if len(frame.Pixels) < layout.sourceBytes {
+		return nil, frameValidationError("Pixels", ErrPixelDataTooShort)
 	}
 
 	out := image.NewRGBA(image.Rect(0, 0, cols, rows))
@@ -142,14 +156,20 @@ func renderPalette(frame ColorFrame, rows, cols int) (*image.RGBA, error) {
 	if frame.Palette == nil || frame.Palette.Red == nil || frame.Palette.Green == nil || frame.Palette.Blue == nil {
 		return nil, ErrMissingPalette
 	}
+	if frame.SamplesPerPixel != 1 {
+		return nil, frameValidationError("SamplesPerPixel", ErrUnsupportedColorLayout)
+	}
 	bits := frame.Format.BitsAllocated
 	if bits != 8 && bits != 16 {
-		return nil, fmt.Errorf("%w: %d", ErrUnsupportedBitsAllocated, bits)
+		return nil, frameValidationError("BitsAllocated", ErrUnsupportedBitsAllocated)
 	}
 	bytesPerSample := bits / 8
-	n := rows * cols
-	if len(frame.Pixels) < n*bytesPerSample {
-		return nil, fmt.Errorf("%w: got %d bytes, want %d", ErrPixelDataTooShort, len(frame.Pixels), n*bytesPerSample)
+	layout, err := checkedFrameLayout(rows, cols, 1, bytesPerSample, 4)
+	if err != nil {
+		return nil, err
+	}
+	if len(frame.Pixels) < layout.sourceBytes {
+		return nil, frameValidationError("Pixels", ErrPixelDataTooShort)
 	}
 	order := frame.Format.ByteOrder
 	if order == nil {
@@ -158,7 +178,7 @@ func renderPalette(frame ColorFrame, rows, cols int) (*image.RGBA, error) {
 
 	out := image.NewRGBA(image.Rect(0, 0, cols, rows))
 	reader := newStoredPixelReader(frame.Format, order)
-	for i := 0; i < n; i++ {
+	for i := 0; i < layout.pixels; i++ {
 		stored := int(reader.value(frame.Pixels[i*bytesPerSample:]))
 		r := paletteChannel(frame.Palette.Red, stored)
 		g := paletteChannel(frame.Palette.Green, stored)

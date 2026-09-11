@@ -192,8 +192,9 @@ func TestJPEGLSStillImageSyntaxFieldValues(t *testing.T) {
 		if syntax.MediaPayload {
 			t.Fatalf("expected JPEG-LS syntax %q to not be classified as media payload", syntax.UID)
 		}
-		if syntax.CodecAvailable {
-			t.Fatalf("expected JPEG-LS syntax %q to have no default decoder adapter", syntax.UID)
+		wantCodecAvailable := syntax.UID == JPEGLSLossless.UID
+		if syntax.CodecAvailable != wantCodecAvailable {
+			t.Fatalf("JPEG-LS syntax %q CodecAvailable = %v, want %v", syntax.UID, syntax.CodecAvailable, wantCodecAvailable)
 		}
 		if !syntax.RequiresCodec() {
 			t.Fatalf("expected JPEG-LS syntax %q to remain a still-image codec target", syntax.UID)

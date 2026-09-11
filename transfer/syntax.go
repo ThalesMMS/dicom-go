@@ -90,9 +90,10 @@ var (
 		"JPEG Lossless, Non-Hierarchical, First-Order Prediction",
 		true,
 	)
-	JPEGLSLossless = newJPEGLSSyntax(
+	JPEGLSLossless = newSupportedEncapsulatedSyntax(
 		"1.2.840.10008.1.2.4.80",
 		"JPEG-LS Lossless Image Compression",
+		true,
 	)
 	JPEGLSNearLossless = newJPEGLSSyntax(
 		"1.2.840.10008.1.2.4.81",

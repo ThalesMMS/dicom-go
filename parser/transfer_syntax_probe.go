@@ -94,8 +94,12 @@ const (
 	defaultTransferSyntaxProbeTokens            = 1024
 	defaultTransferSyntaxProbeDuration          = time.Second
 	defaultTransferSyntaxCandidateProbeDuration = 250 * time.Millisecond
-	defaultTransferSyntaxProbeConfidence        = 0.75
-	defaultTransferSyntaxProbeGap               = 0.10
+	// Durations below the cross-platform monotonic clock resolution are treated
+	// as already expired. This keeps tiny safety budgets deterministic on hosts
+	// whose time.Now readings can remain equal throughout a short probe.
+	minimumTransferSyntaxProbeDuration   = time.Microsecond
+	defaultTransferSyntaxProbeConfidence = 0.75
+	defaultTransferSyntaxProbeGap        = 0.10
 )
 
 // TransferSyntaxProbeOptions bounds and configures inference over an in-memory
@@ -219,7 +223,7 @@ func ProbeTransferSyntax(data []byte, options TransferSyntaxProbeOptions) (Trans
 	if sharedTruncated {
 		report.Warnings = append(report.Warnings, TransferSyntaxProbeWarningInputTruncated)
 	}
-	sharedDeadline := time.Now().Add(opts.MaxDuration)
+	sharedDeadline := probeDeadline(opts.MaxDuration)
 	for _, syntax := range opts.Candidates {
 		candidateTruncated := sharedTruncated
 		candidateLimit := minInt64(int64(len(shared)), opts.MaxCandidateBytes)
@@ -373,6 +377,14 @@ func canonicalProbeCandidate(candidate transfer.Syntax) transfer.Syntax {
 	return candidate
 }
 
+func probeDeadline(duration time.Duration) time.Time {
+	now := time.Now()
+	if duration < minimumTransferSyntaxProbeDuration {
+		return now
+	}
+	return now.Add(duration)
+}
+
 func probeTransferSyntaxCandidate(
 	data []byte,
 	syntax transfer.Syntax,
@@ -392,7 +404,7 @@ func probeTransferSyntaxCandidate(
 		SkipPixelData:       true,
 	})
 	reader.stopBeforePixelData = true
-	candidateDeadline := time.Now().Add(opts.MaxCandidateDuration)
+	candidateDeadline := probeDeadline(opts.MaxCandidateDuration)
 	if sharedDeadline.Before(candidateDeadline) {
 		candidateDeadline = sharedDeadline
 	}

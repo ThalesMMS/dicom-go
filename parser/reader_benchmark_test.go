@@ -2,6 +2,7 @@ package parser
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"io"
 	"testing"
@@ -157,6 +158,109 @@ func BenchmarkReadDefinedValueBytes(b *testing.B) {
 }
 
 var benchmarkDefinedValue []byte
+var benchmarkWaveformLocations []ValueLocation
+
+func BenchmarkDeferredWaveformLocations1K(b *testing.B) {
+	benchmarkDeferredWaveformLocations(b, 1_000)
+}
+
+func BenchmarkDeferredWaveformLocations10K(b *testing.B) {
+	benchmarkDeferredWaveformLocations(b, 10_000)
+}
+
+func BenchmarkDeferredWaveformLocationsReparse1K(b *testing.B) {
+	benchmarkDeferredWaveformLocationsReparse(b, 1_000)
+}
+
+func BenchmarkDeferredWaveformLocationsReparse10K(b *testing.B) {
+	benchmarkDeferredWaveformLocationsReparse(b, 10_000)
+}
+
+func benchmarkDeferredWaveformLocations(b *testing.B, itemCount int) {
+	b.Helper()
+	data := benchmarkWaveformSequence(itemCount)
+	b.ReportAllocs()
+	b.SetBytes(int64(len(data)))
+	b.ResetTimer()
+	for iteration := 0; iteration < b.N; iteration++ {
+		reader := NewReader(bytes.NewReader(data), transfer.ExplicitVRLittleEndian, ReaderOptions{
+			Dictionary:        std.Dictionary,
+			DeferWaveformData: true,
+			MaxElements:       itemCount + 1,
+		})
+		if _, err := reader.ReadDataSet(); err != nil {
+			b.Fatal(err)
+		}
+		locations := reader.ValueLocations(tagWaveformData)
+		if len(locations) != itemCount {
+			b.Fatalf("ValueLocations count = %d, want %d", len(locations), itemCount)
+		}
+		benchmarkWaveformLocations = locations
+	}
+}
+
+func benchmarkDeferredWaveformLocationsReparse(b *testing.B, itemCount int) {
+	b.Helper()
+	targetTag := core.NewTag(0x0010, 0x0020)
+	data := benchmarkWaveformSequence(itemCount)
+	data = append(data, dicomtest.EncodeElement(core.NewRawElement(targetTag, core.VRLO, []byte("TARGET")), transfer.ExplicitVRLittleEndian)...)
+	b.ReportAllocs()
+	b.SetBytes(int64(len(data)))
+	b.ResetTimer()
+	for iteration := 0; iteration < b.N; iteration++ {
+		b.StopTimer()
+		reader := NewReader(bytes.NewReader(data), transfer.ExplicitVRLittleEndian, ReaderOptions{
+			Dictionary:        std.Dictionary,
+			DeferWaveformData: true,
+			MaxElements:       itemCount + 2,
+		})
+		if _, err := reader.ReadDataSet(); err != nil {
+			b.Fatal(err)
+		}
+		b.StartTimer()
+		copied, err := reader.CopyElementValueTo(targetTag, io.Discard)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if copied != int64(len("TARGET")) {
+			b.Fatalf("CopyElementValueTo copied %d bytes, want %d", copied, len("TARGET"))
+		}
+	}
+}
+
+func benchmarkWaveformSequence(itemCount int) []byte {
+	const itemValueLength = uint32(14)
+	data := make([]byte, 0, 12+itemCount*(8+int(itemValueLength))+8)
+	appendUint16 := func(value uint16) {
+		var encoded [2]byte
+		binary.LittleEndian.PutUint16(encoded[:], value)
+		data = append(data, encoded[:]...)
+	}
+	appendUint32 := func(value uint32) {
+		var encoded [4]byte
+		binary.LittleEndian.PutUint32(encoded[:], value)
+		data = append(data, encoded[:]...)
+	}
+	appendTag := func(tag core.Tag) {
+		appendUint16(tag.Group)
+		appendUint16(tag.Element)
+	}
+
+	appendTag(core.NewTag(0x5400, 0x0100))
+	data = append(data, 'S', 'Q', 0, 0)
+	appendUint32(uint32(core.UndefinedLength))
+	for item := 0; item < itemCount; item++ {
+		appendTag(core.TagItem)
+		appendUint32(itemValueLength)
+		appendTag(tagWaveformData)
+		data = append(data, 'O', 'W', 0, 0)
+		appendUint32(2)
+		appendUint16(uint16(item))
+	}
+	appendTag(core.TagSequenceDelimitationItem)
+	appendUint32(0)
+	return data
+}
 
 type readerBenchmarkFixture struct {
 	name   string

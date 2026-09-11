@@ -419,6 +419,31 @@ func TestWriterEncodesStringValuesWithDerivedLength(t *testing.T) {
 	}
 }
 
+func TestWriterEncodesISO2022PersonNameWithDICOMPadding(t *testing.T) {
+	characterSet, err := dicomenc.ParseCharacterSet("", "ISO 2022 IR 58")
+	if err != nil {
+		t.Fatalf("ParseCharacterSet() error = %v", err)
+	}
+	opts := defaultWriterOptions()
+	opts.CharacterSet = characterSet
+	element := core.Element{
+		Header: core.ElementHeader{Tag: core.NewTag(0x0010, 0x0010), VR: core.VRPN},
+		Value:  core.StringValue{"Zhang^XiaoDong=张^小东="},
+	}
+	want := []byte("Zhang^XiaoDong=\x1b$)A\xd5\xc5^\x1b$)A\xd0\xa1\xb6\xab= ")
+
+	var got bytes.Buffer
+	if err := NewWriterWithOptions(&got, transfer.ExplicitVRLittleEndian, opts).WriteElement(element); err != nil {
+		t.Fatalf("WriteElement() error = %v", err)
+	}
+	if gotLength := binary.LittleEndian.Uint16(got.Bytes()[6:8]); gotLength != uint16(len(want)) {
+		t.Fatalf("encoded length = %d, want %d", gotLength, len(want))
+	}
+	if !bytes.Equal(got.Bytes()[8:], want) {
+		t.Fatalf("encoded PN = % X, want % X", got.Bytes()[8:], want)
+	}
+}
+
 func TestEncodeTypedNumericValuesUsesTransferSyntaxByteOrder(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -466,6 +491,7 @@ func TestEncodeTypedNumericValuesUsesTransferSyntaxByteOrder(t *testing.T) {
 
 func TestWriterTypedNumericVRCompatibility(t *testing.T) {
 	valid := []core.Element{
+		{Header: core.ElementHeader{VR: core.VROW}, Value: core.Uint16Value{1}},
 		{Header: core.ElementHeader{VR: core.VROL}, Value: core.Uint32Value{1}},
 		{Header: core.ElementHeader{VR: core.VROV}, Value: core.Uint64Value{1}},
 		{Header: core.ElementHeader{VR: core.VROF}, Value: core.Float32Value{1}},

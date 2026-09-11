@@ -4,10 +4,11 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"math"
 
 	"github.com/ThalesMMS/dicom-go/core"
+	"github.com/ThalesMMS/dicom-go/dictionary"
 	dicomenc "github.com/ThalesMMS/dicom-go/encoding"
+	"github.com/ThalesMMS/dicom-go/internal/valueencode"
 	"github.com/ThalesMMS/dicom-go/transfer"
 	"github.com/ThalesMMS/dicom-go/validation"
 )
@@ -26,6 +27,10 @@ type WriterOptions struct {
 	// CharacterSet encodes Unicode StringValue content for VRs governed by
 	// Specific Character Set. Its zero value uses the DICOM default repertoire.
 	CharacterSet dicomenc.SpecificCharacterSet
+	// BulkDataResolver opens the byte source for a core.BulkDataValue. The
+	// writer takes ownership of every non-nil source Reader returned by the
+	// resolver and closes it exactly once, including on failures.
+	BulkDataResolver BulkDataResolver
 }
 
 func defaultWriterOptions() WriterOptions {
@@ -78,6 +83,12 @@ func (w *Writer) WriteElement(el core.Element) error {
 		}
 		return w.writeFragmentSequence(el)
 	}
+	if value, ok := el.Value.(core.BulkDataValue); ok {
+		if err := w.validateElement(el); err != nil {
+			return err
+		}
+		return w.writeBulkDataValue(el, value)
+	}
 	if err := w.validateElement(el); err != nil {
 		return err
 	}
@@ -118,6 +129,12 @@ func (w *Writer) writeElementValidated(el core.Element, path validation.Path) er
 			return err
 		}
 		return w.writeFragmentSequence(el)
+	}
+	if value, ok := el.Value.(core.BulkDataValue); ok {
+		if err := w.validateElement(el); err != nil {
+			return err
+		}
+		return w.writeBulkDataValue(el, value)
 	}
 	if err := w.validateElement(el); err != nil {
 		return err
@@ -191,7 +208,11 @@ func (w *Writer) encodeValue(el core.Element) ([]byte, core.Length, error) {
 		if el.Header.HasLength() && el.Header.Length.IsUndefined() {
 			return nil, 0, w.wrapWriteError(OpWriteLength, el.Tag(), el.VR(), el.Header.Length, fmt.Errorf("dicom: undefined length is only supported for sequence and fragment values"))
 		}
-		encoded, length, err := encodeStringValueWithCharacterSet(el.VR(), value, w.characterSet)
+		characterSet := w.characterSet
+		if dictionary.IsPrivateCreatorTag(el.Tag()) {
+			characterSet = dicomenc.DefaultCharacterSet
+		}
+		encoded, length, err := encodeStringValueWithCharacterSet(el.VR(), value, characterSet)
 		if err != nil {
 			return nil, 0, w.wrapWriteError(OpWriteLength, el.Tag(), el.VR(), 0, err)
 		}
@@ -202,7 +223,7 @@ func (w *Writer) encodeValue(el core.Element) ([]byte, core.Length, error) {
 		if el.Header.HasLength() && el.Header.Length.IsUndefined() {
 			return nil, 0, w.wrapWriteError(OpWriteLength, el.Tag(), el.VR(), el.Header.Length, fmt.Errorf("dicom: undefined length is only supported for sequence and fragment values"))
 		}
-		encoded, length, err := w.encodeNumericValue(value)
+		encoded, length, err := valueencode.Numeric(value, w.enc.Endianness().ByteOrder())
 		if err != nil {
 			return nil, 0, w.wrapWriteError(OpWriteLength, el.Tag(), el.VR(), 0, err)
 		}
@@ -222,52 +243,6 @@ func padRawValueToEvenLength(vr core.VR, data []byte) []byte {
 	return padded
 }
 
-func (w *Writer) encodeNumericValue(value core.Value) ([]byte, core.Length, error) {
-	order := w.enc.Endianness().ByteOrder()
-	switch values := value.(type) {
-	case core.Uint16Value:
-		return encodeFixedWidthValues(values, 2, func(dst []byte, value uint16) { order.PutUint16(dst, value) })
-	case core.Int16Value:
-		return encodeFixedWidthValues(values, 2, func(dst []byte, value int16) { order.PutUint16(dst, uint16(value)) })
-	case core.Uint32Value:
-		return encodeFixedWidthValues(values, 4, func(dst []byte, value uint32) { order.PutUint32(dst, value) })
-	case core.Int32Value:
-		return encodeFixedWidthValues(values, 4, func(dst []byte, value int32) { order.PutUint32(dst, uint32(value)) })
-	case core.Uint64Value:
-		return encodeFixedWidthValues(values, 8, func(dst []byte, value uint64) { order.PutUint64(dst, value) })
-	case core.Int64Value:
-		return encodeFixedWidthValues(values, 8, func(dst []byte, value int64) { order.PutUint64(dst, uint64(value)) })
-	case core.Float32Value:
-		return encodeFixedWidthValues(values, 4, func(dst []byte, value float32) { order.PutUint32(dst, math.Float32bits(value)) })
-	case core.Float64Value:
-		return encodeFixedWidthValues(values, 8, func(dst []byte, value float64) { order.PutUint64(dst, math.Float64bits(value)) })
-	case core.TagValue:
-		return encodeFixedWidthValues(values, 4, func(dst []byte, value core.Tag) {
-			order.PutUint16(dst[:2], value.Group)
-			order.PutUint16(dst[2:], value.Element)
-		})
-	default:
-		return nil, 0, fmt.Errorf("dicom: unsupported numeric value type %T", value)
-	}
-}
-
-func encodeFixedWidthValues[T any](values []T, width int, encode func([]byte, T)) ([]byte, core.Length, error) {
-	total := uint64(len(values)) * uint64(width)
-	if total >= uint64(core.UndefinedLength) {
-		return nil, 0, fmt.Errorf("dicom: numeric value length %d exceeds maximum defined DICOM length: %w", total, dicomenc.ErrLengthOverflow)
-	}
-	length := core.Length(total)
-	size, err := intLength(length)
-	if err != nil {
-		return nil, 0, err
-	}
-	encoded := make([]byte, size)
-	for i, value := range values {
-		encode(encoded[i*width:(i+1)*width], value)
-	}
-	return encoded, length, nil
-}
-
 func encodeStringValue(vr core.VR, value core.StringValue) ([]byte, core.Length, error) {
 	return encodeStringValueWithCharacterSet(vr, value, dicomenc.DefaultCharacterSet)
 }
@@ -285,6 +260,8 @@ func encodeStringValueWithCharacterSet(vr core.VR, value core.StringValue, chara
 			encoded = []byte(component)
 		case vr == core.VRPN:
 			encoded, err = characterSet.EncodePersonName(component)
+		case !vr.UsesTextValueDelimiter():
+			encoded, err = characterSet.EncodeSingleValue(component)
 		default:
 			encoded, err = characterSet.Encode(component)
 		}
@@ -356,30 +333,32 @@ func intLengthWithMax(length core.Length, maxInt int) (int, error) {
 }
 
 func (w *Writer) validateElement(el core.Element) error {
+	if _, ok := el.Value.(core.DiscardedValue); ok {
+		return core.ErrDiscardedValue
+	}
 	if el.Tag().IsSequenceDelimiting() {
 		return w.wrapWriteError(OpWriteValue, el.Tag(), el.VR(), core.UndefinedLength, fmt.Errorf("dicom: items and delimiters cannot be written as standalone elements"))
 	}
 
 	switch el.Value.(type) {
 	case nil, core.RawValue, core.StringValue:
-	case core.Uint16Value:
-		return w.validateNumericVR(el, core.VRUS)
-	case core.Int16Value:
-		return w.validateNumericVR(el, core.VRSS)
-	case core.Uint32Value:
-		return w.validateNumericVR(el, core.VRUL, core.VROL)
-	case core.Int32Value:
-		return w.validateNumericVR(el, core.VRSL)
-	case core.Uint64Value:
-		return w.validateNumericVR(el, core.VRUV, core.VROV)
-	case core.Int64Value:
-		return w.validateNumericVR(el, core.VRSV)
-	case core.Float32Value:
-		return w.validateNumericVR(el, core.VRFL, core.VROF)
-	case core.Float64Value:
-		return w.validateNumericVR(el, core.VRFD, core.VROD)
-	case core.TagValue:
-		return w.validateNumericVR(el, core.VRAT)
+	case core.BulkDataValue:
+		if w.opts.BulkDataResolver == nil {
+			return w.wrapWriteError(OpWriteValue, el.Tag(), el.VR(), el.Length(), fmt.Errorf("dicom: core.BulkDataValue requires a BulkDataResolver"))
+		}
+		if el.VR() == core.VRSQ {
+			return w.wrapWriteError(OpWriteValue, el.Tag(), el.VR(), el.Length(), fmt.Errorf("dicom: core.BulkDataValue cannot encode an SQ value"))
+		}
+		if el.Header.HasLength() && el.Header.Length.IsUndefined() {
+			return w.wrapWriteError(OpWriteLength, el.Tag(), el.VR(), el.Header.Length, fmt.Errorf("dicom: core.BulkDataValue requires a defined length"))
+		}
+		if el.Tag() == core.TagPixelData && w.syntax.Encapsulated {
+			return w.wrapWriteError(OpWriteValue, el.Tag(), el.VR(), el.Length(), fmt.Errorf("dicom: core.BulkDataValue cannot synthesize encapsulated Pixel Data"))
+		}
+	case core.Uint16Value, core.Int16Value, core.Uint32Value, core.Int32Value, core.Uint64Value, core.Int64Value, core.Float32Value, core.Float64Value, core.TagValue:
+		if err := valueencode.ValidateNumeric(el.VR(), el.Value); err != nil {
+			return w.wrapWriteError(OpWriteValue, el.Tag(), el.VR(), el.Length(), err)
+		}
 	case core.SequenceValue:
 		if el.VR() != core.VRSQ && (el.VR() != core.VRUN || w.syntax.ExplicitVR) {
 			return w.wrapWriteError(OpWriteValue, el.Tag(), el.VR(), el.Length(), fmt.Errorf("dicom: core.SequenceValue requires SQ VR, or UN in Implicit VR"))
@@ -400,15 +379,6 @@ func (w *Writer) validateElement(el core.Element) error {
 func isSequenceValue(value core.Value) bool {
 	_, ok := value.(core.SequenceValue)
 	return ok
-}
-
-func (w *Writer) validateNumericVR(el core.Element, allowed ...core.VR) error {
-	for _, vr := range allowed {
-		if el.VR() == vr {
-			return nil
-		}
-	}
-	return w.wrapWriteError(OpWriteValue, el.Tag(), el.VR(), el.Length(), fmt.Errorf("dicom: numeric value type %T is incompatible with VR %s", el.Value, el.VR()))
 }
 
 func (w *Writer) writeItem(ds core.DataSet) error {

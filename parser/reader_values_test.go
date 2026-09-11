@@ -4,11 +4,14 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"io"
+	"reflect"
+	"testing"
+
 	"github.com/ThalesMMS/dicom-go/core"
 	"github.com/ThalesMMS/dicom-go/dictionary/std"
 	"github.com/ThalesMMS/dicom-go/internal/dicomtest"
 	"github.com/ThalesMMS/dicom-go/transfer"
-	"testing"
 )
 
 func TestNextReadsZeroLengthDefinedValueAcrossTransferSyntaxes(t *testing.T) {
@@ -525,4 +528,117 @@ func TestReadDataSetDefersNestedWaveformDataAndRecordsAllLocations(t *testing.T)
 	if fresh[0].Length != int64(len(groupData[0])) {
 		t.Fatalf("ValueLocations returned aliased storage: first length = %d", fresh[0].Length)
 	}
+}
+
+func TestDeferredWaveformLocationIndexPreservesOrderReplayAndReparseDeduplication(t *testing.T) {
+	const itemCount = 1_000
+	data := benchmarkWaveformSequence(itemCount)
+	targetTag := core.NewTag(0x0010, 0x0020)
+	data = append(data, dicomtest.EncodeElement(core.NewRawElement(targetTag, core.VRLO, []byte("TARGET")), transfer.ExplicitVRLittleEndian)...)
+	reader := NewReader(bytes.NewReader(data), transfer.ExplicitVRLittleEndian, ReaderOptions{
+		Dictionary:        std.Dictionary,
+		DeferWaveformData: true,
+		MaxElements:       itemCount + 2,
+	})
+	if _, err := reader.ReadDataSet(); err != nil {
+		t.Fatal(err)
+	}
+	locations := reader.ValueLocations(tagWaveformData)
+	if len(locations) != itemCount {
+		t.Fatalf("ValueLocations count = %d, want %d", len(locations), itemCount)
+	}
+	for _, index := range []int{0, itemCount / 2, itemCount - 1} {
+		location := locations[index]
+		if !location.ItemOffsetSet || (index > 0 && location.ValueOffset <= locations[index-1].ValueOffset) {
+			t.Fatalf("location %d is unordered or missing item offset: %+v", index, location)
+		}
+		var replay bytes.Buffer
+		if _, err := reader.CopyElementValueAt(location, &replay); err != nil {
+			t.Fatalf("CopyElementValueAt(%d): %v", index, err)
+		}
+		if got := binary.LittleEndian.Uint16(replay.Bytes()); got != uint16(index) {
+			t.Fatalf("replayed item %d = %d", index, got)
+		}
+	}
+	if reader.valueLocationGeneration != 0 {
+		t.Fatalf("direct replay advanced generation to %d, want initial generation", reader.valueLocationGeneration)
+	}
+
+	for generation := uint64(1); generation <= 2; generation++ {
+		var copied bytes.Buffer
+		if _, err := reader.CopyElementValueTo(targetTag, &copied); err != nil {
+			t.Fatalf("CopyElementValueTo generation %d: %v", generation, err)
+		}
+		if copied.String() != "TARGET" {
+			t.Fatalf("CopyElementValueTo generation %d = %q, want TARGET", generation, copied.String())
+		}
+		if reader.valueLocationGeneration != generation {
+			t.Fatalf("location generation = %d, want %d", reader.valueLocationGeneration, generation)
+		}
+		if got := reader.ValueLocations(tagWaveformData); !reflect.DeepEqual(got, locations) {
+			t.Fatalf("generation %d changed locations\ngot:  %#v\nwant: %#v", generation, got, locations)
+		}
+	}
+	if _, ok := reader.ValueLocation(tagWaveformData); ok {
+		t.Fatal("reparse made duplicate WaveformData tag lookup unambiguous")
+	}
+}
+
+func TestDeferredWaveformLocationGenerationMergesPartialInitialParse(t *testing.T) {
+	const (
+		itemCount    = 100
+		partialCount = 25
+	)
+	targetTag := core.NewTag(0x0010, 0x0020)
+	data := benchmarkWaveformSequence(itemCount)
+	data = append(data, dicomtest.EncodeElement(core.NewRawElement(targetTag, core.VRLO, []byte("TARGET")), transfer.ExplicitVRLittleEndian)...)
+	reader := NewReader(bytes.NewReader(data), transfer.ExplicitVRLittleEndian, ReaderOptions{
+		Dictionary:        std.Dictionary,
+		DeferWaveformData: true,
+		MaxElements:       itemCount + 2,
+	})
+	for len(reader.ValueLocations(tagWaveformData)) < partialCount {
+		if _, err := reader.Next(); err != nil {
+			t.Fatalf("partial Next: %v", err)
+		}
+	}
+	partial := reader.ValueLocations(tagWaveformData)
+	if len(partial) != partialCount {
+		t.Fatalf("partial locations = %d, want %d", len(partial), partialCount)
+	}
+
+	var copied bytes.Buffer
+	if _, err := reader.CopyElementValueTo(targetTag, &copied); err != nil {
+		t.Fatalf("CopyElementValueTo after partial parse: %v", err)
+	}
+	if copied.String() != "TARGET" {
+		t.Fatalf("CopyElementValueTo = %q, want TARGET", copied.String())
+	}
+	locations := reader.ValueLocations(tagWaveformData)
+	if len(locations) != itemCount {
+		t.Fatalf("merged locations = %d, want %d", len(locations), itemCount)
+	}
+	for index, location := range locations {
+		if index < partialCount && location != partial[index] {
+			t.Fatalf("initial location %d changed from %+v to %+v", index, partial[index], location)
+		}
+		if index > 0 && location.ValueOffset <= locations[index-1].ValueOffset {
+			t.Fatalf("merged locations are not in source order at %d: %#v", index, locations)
+		}
+	}
+}
+
+func FuzzCopyElementValueAtInvalidLocation(f *testing.F) {
+	f.Add(int64(-1), int64(2))
+	f.Add(int64(0), int64(-1))
+	f.Add(int64(1<<62), int64(1<<62))
+	f.Fuzz(func(t *testing.T, offset, length int64) {
+		data := benchmarkWaveformSequence(3)
+		reader := NewReader(bytes.NewReader(data), transfer.ExplicitVRLittleEndian, ReaderOptions{})
+		_, _ = reader.CopyElementValueAt(ValueLocation{
+			Tag:         tagWaveformData,
+			ValueOffset: offset,
+			Length:      length,
+		}, io.Discard)
+	})
 }

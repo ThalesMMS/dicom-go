@@ -196,6 +196,146 @@ func TestReaderLimitsRejectMaxElementBytes(t *testing.T) {
 	}
 }
 
+func TestReaderLimitsRejectNativePixelDataBytesBeforePayloadRead(t *testing.T) {
+	buf := definedElementBytes(transfer.ExplicitVRLittleEndian, core.TagPixelData, core.VROB, 4, []byte{1, 2})
+	reader := NewReader(bytes.NewReader(buf), transfer.ExplicitVRLittleEndian, ReaderOptions{
+		Dictionary:        std.Dictionary,
+		MaxElementBytes:   1,
+		MaxPixelDataBytes: 3,
+	})
+
+	_, err := reader.Next()
+	if !errors.Is(err, ErrMaxPixelDataBytesExceeded) {
+		t.Fatalf("pixel limit error = %v, want ErrMaxPixelDataBytesExceeded", err)
+	}
+	if errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("pixel limit was checked after reading the rejected payload: %v", err)
+	}
+}
+
+func TestReaderLimitsAllowPixelDataOverrideAboveGeneralElementLimit(t *testing.T) {
+	buf := definedElementBytes(transfer.ExplicitVRLittleEndian, core.TagPixelData, core.VROB, 4, []byte{1, 2, 3, 4})
+	reader := NewReader(bytes.NewReader(buf), transfer.ExplicitVRLittleEndian, ReaderOptions{
+		Dictionary:        std.Dictionary,
+		MaxElementBytes:   2,
+		MaxPixelDataBytes: 4,
+	})
+	if _, err := reader.Next(); err != nil {
+		t.Fatalf("pixel override error = %v", err)
+	}
+}
+
+func TestReaderLimitsRejectDeformableVectorGridBeforeNestedPayloadRead(t *testing.T) {
+	grid := dicomtest.NewSequenceElement(
+		core.NewTag(0x0064, 0x0005),
+		core.DataSet{Elements: []core.Element{
+			dicomtest.BytesElement(tagVectorGridData, core.VROF, make([]byte, 8)),
+		}},
+	)
+	stream := dicomtest.EncodeElement(grid, transfer.ExplicitVRLittleEndian)
+	stream = stream[:len(stream)-2]
+	reader := NewReader(bytes.NewReader(stream), transfer.ExplicitVRLittleEndian, ReaderOptions{
+		Dictionary:                   std.Dictionary,
+		MaxDeformableVectorGridBytes: 4,
+	})
+
+	_, err := reader.ReadDataSet()
+	if !errors.Is(err, ErrMaxDeformableVectorGridBytesExceeded) {
+		t.Fatalf("vector grid limit error = %v, want ErrMaxDeformableVectorGridBytesExceeded", err)
+	}
+	if errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("vector grid limit was checked after reading the rejected payload: %v", err)
+	}
+}
+
+func TestReaderLimitsAllowVectorGridOverrideAboveGeneralElementLimit(t *testing.T) {
+	grid := dicomtest.BytesElement(tagVectorGridData, core.VROF, make([]byte, 12))
+	reader := NewReader(
+		bytes.NewReader(dicomtest.EncodeElement(grid, transfer.ExplicitVRLittleEndian)),
+		transfer.ExplicitVRLittleEndian,
+		ReaderOptions{
+			Dictionary:                   std.Dictionary,
+			MaxElementBytes:              4,
+			MaxDeformableVectorGridBytes: 12,
+		},
+	)
+	if _, err := reader.Next(); err != nil {
+		t.Fatalf("vector grid override error = %v", err)
+	}
+}
+
+func TestReaderElementBudgetsDisableWholeDatasetSlurp(t *testing.T) {
+	prefix := dicomtest.EncodeElement(
+		dicomtest.NewPNElement(core.NewTag(0x0010, 0x0010), "OK"),
+		transfer.ExplicitVRLittleEndian,
+	)
+	tests := []struct {
+		name    string
+		element core.Element
+		opts    ReaderOptions
+		wantErr error
+	}{
+		{
+			name:    "general element",
+			element: dicomtest.BytesElement(core.NewTag(0x0011, 0x1010), core.VROB, make([]byte, 8)),
+			opts:    ReaderOptions{MaxElementBytes: 4},
+			wantErr: ErrMaxElementBytesExceeded,
+		},
+		{
+			name:    "pixel data",
+			element: dicomtest.BytesElement(core.TagPixelData, core.VROB, make([]byte, 8)),
+			opts:    ReaderOptions{MaxPixelDataBytes: 4},
+			wantErr: ErrMaxPixelDataBytesExceeded,
+		},
+		{
+			name:    "deformable vector grid",
+			element: dicomtest.BytesElement(tagVectorGridData, core.VROF, make([]byte, 12)),
+			opts:    ReaderOptions{MaxDeformableVectorGridBytes: 8},
+			wantErr: ErrMaxDeformableVectorGridBytesExceeded,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			stream := append(append([]byte(nil), prefix...), dicomtest.EncodeElement(test.element, transfer.ExplicitVRLittleEndian)...)
+			source := &countingSizedReadSeeker{Reader: *bytes.NewReader(stream)}
+			test.opts.Dictionary = std.Dictionary
+			reader := NewReader(source, transfer.ExplicitVRLittleEndian, test.opts)
+			if _, err := reader.Next(); err != nil {
+				t.Fatalf("prefix: %v", err)
+			}
+			if source.bytesRead >= len(stream) {
+				t.Fatalf("first element read %d of %d bytes; remaining dataset was materialized before its budget check", source.bytesRead, len(stream))
+			}
+			if _, err := reader.Next(); !errors.Is(err, test.wantErr) {
+				t.Fatalf("error = %v, want %v", err, test.wantErr)
+			}
+		})
+	}
+}
+
+type countingSizedReadSeeker struct {
+	bytes.Reader
+	bytesRead int
+}
+
+func (r *countingSizedReadSeeker) Read(p []byte) (int, error) {
+	n, err := r.Reader.Read(p)
+	r.bytesRead += n
+	return n, err
+}
+
+func TestReaderLimitsRejectCumulativeEncapsulatedPixelDataBytes(t *testing.T) {
+	reader := NewReader(
+		bytes.NewReader(encapsulatedPixelDataBytes(nil, []byte{1, 2}, []byte{3, 4})),
+		transfer.JPEGBaseline,
+		ReaderOptions{Dictionary: std.Dictionary, MaxPixelDataBytes: 3},
+	)
+	_, err := reader.ReadDataSet()
+	if !errors.Is(err, ErrMaxPixelDataBytesExceeded) {
+		t.Fatalf("encapsulated pixel limit error = %v, want ErrMaxPixelDataBytesExceeded", err)
+	}
+}
+
 func TestReaderLimitsRejectPartialElementEOF(t *testing.T) {
 	buf := dicomtest.EncodeElement(
 		dicomtest.NewPNElement(core.NewTag(0x0010, 0x0010), "TEST"),

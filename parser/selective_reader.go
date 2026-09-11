@@ -7,6 +7,7 @@ import (
 	"io"
 
 	"github.com/ThalesMMS/dicom-go/core"
+	"github.com/ThalesMMS/dicom-go/dictionary"
 	"github.com/ThalesMMS/dicom-go/transfer"
 	"github.com/ThalesMMS/dicom-go/validation"
 )
@@ -90,6 +91,9 @@ func (r *selectiveContextReadSeeker) Seek(offset int64, whence int) (int64, erro
 // skip, or stop at each data element header. NewReader remains the default fast
 // path and does not allocate selective-reader state.
 func NewSelectiveReader(ctx context.Context, source io.Reader, syntax transfer.Syntax, readerOpts ReaderOptions, opts SelectiveReaderOptions) (*Reader, error) {
+	if readerOpts.EncapsulatedSink != nil {
+		return nil, fmt.Errorf("%w: encoded frame streaming requires the ordinary Reader", ErrSelectiveReaderOptions)
+	}
 	if source == nil || opts.Select == nil {
 		return nil, ErrSelectiveReaderOptions
 	}
@@ -163,6 +167,9 @@ func (r *Reader) nextSelective() (Token, error) {
 		state.stopped = true
 		return Token{Kind: TokenStop, Header: header, Offset: headerOffset}, nil
 	case SelectiveSkip:
+		if r.privateRoot != nil && dictionary.IsPrivateCreatorTag(header.Tag) {
+			return Token{}, dictionary.ErrPrivateCreator
+		}
 		if isEncapsulatedPixelDataHeader(header) {
 			tok, err := r.readSelectiveSkippedPixelSequenceToken(header, headerOffset)
 			tok.Offset = headerOffset

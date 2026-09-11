@@ -109,7 +109,10 @@ type frameChannelSink struct {
 }
 
 // NewFrameChannelSink returns a sink that sends frames to ch and closes ch when
-// parsing finalizes.
+// parsing finalizes. Delivery blocks until a consumer receives or buffer space
+// becomes available. The producer must finish HandleFrame before calling Close;
+// consumers must never close ch. Use NewFrameChannelSinkContext when consumers
+// may abandon delivery or finalization can race with an active send.
 func NewFrameChannelSink(ch chan Frame) FrameSink {
 	return &frameChannelSink{ch: ch}
 }
@@ -196,8 +199,16 @@ func (s frameMetadataState) complete() (FrameMetadata, error) {
 }
 
 func (r *Reader) captureFrameMetadata(header core.ElementHeader, data []byte) error {
-	if r.frameSink == nil || len(r.seqDelimiters) != 0 {
+	if (r.frameSink == nil && r.encapsulatedSink == nil) || len(r.seqDelimiters) != 0 {
 		return nil
+	}
+	if r.encodedPixelSeen {
+		switch header.Tag {
+		case tagFrameRows, tagFrameColumns, tagFrameSamplesPerPixel, tagFrameBitsAllocated,
+			tagFrameBitsStored, tagFrameHighBit, tagFramePixelRep, tagFramePlanarConfig,
+			tagFrameNumberOfFrames, tagFramePhotometric:
+			return fmt.Errorf("%w: image metadata after streamed Pixel Data", ErrInvalidFrameMetadata)
+		}
 	}
 
 	switch header.Tag {

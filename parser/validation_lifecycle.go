@@ -5,8 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 
 	"github.com/ThalesMMS/dicom-go/core"
+	"github.com/ThalesMMS/dicom-go/dictionary"
 	"github.com/ThalesMMS/dicom-go/transfer"
 	"github.com/ThalesMMS/dicom-go/validation"
 )
@@ -32,6 +34,9 @@ type readerValidationLifecycle struct {
 // iterating tokens; complete item/sequence/dataset phases and dataset rules
 // require ReadDataSet, which owns the materialized hierarchy.
 func NewReaderWithValidation(ctx context.Context, source io.Reader, syntax transfer.Syntax, readerOpts ReaderOptions, validationOpts validation.Options) (*Reader, error) {
+	if readerOpts.EncapsulatedSink != nil {
+		return nil, fmt.Errorf("%w: encoded streaming requires the ordinary Reader without lifecycle hooks", ErrFrameSink)
+	}
 	maxElements := validationOpts.MaxElements
 	if maxElements == 0 {
 		maxElements = validation.DefaultMaxElements
@@ -93,10 +98,14 @@ func (r *Reader) handleLifecycleHeader(header core.ElementHeader, offset int64, 
 		})
 		r.lastReservedNonZero = false
 	}
-	return r.validationLifecycle.operation.Handle(validation.HookEvent{
+	result, err := r.validationLifecycle.operation.Handle(validation.HookEvent{
 		Point: validation.HookElementHeaderRead, Path: path, Header: &header,
 		Offset: offset, OffsetSet: true,
 	})
+	if err == nil && r.privateRoot != nil && dictionary.IsPrivateCreatorTag(header.Tag) && (result.SkipValue || result.DeferValue || result.Filter) {
+		return result, dictionary.ErrPrivateCreator
+	}
+	return result, err
 }
 
 func (r *Reader) finishLifecycleToken(tok Token, err error, requested bool) (Token, error) {
@@ -122,6 +131,12 @@ func (r *Reader) finishLifecycleToken(tok Token, err error, requested bool) (Tok
 		}
 	}
 	if tok.Kind == TokenElement && !tok.Header.Tag.IsSequenceDelimiting() {
+		creator := r.privateRoot != nil && dictionary.IsPrivateCreatorTag(tok.Element.Tag())
+		var creatorValues []string
+		if creator {
+			creatorValues = tok.Element.StringValues()
+		}
+		creatorTag, creatorVR := tok.Element.Tag(), tok.Element.VR()
 		path := r.lifecycleElementPath(tok.Element.Tag())
 		result, hookErr := r.validationLifecycle.operation.Handle(validation.HookEvent{
 			Point: validation.HookAfterElement, Path: path, Header: &tok.Header, Element: &tok.Element,
@@ -129,6 +144,9 @@ func (r *Reader) finishLifecycleToken(tok Token, err error, requested bool) (Tok
 		})
 		if hookErr != nil {
 			return Token{}, hookErr
+		}
+		if creator && (result.Filter || result.Element != nil && (result.Element.Tag() != creatorTag || result.Element.VR() != creatorVR || !slices.Equal(creatorValues, result.Element.StringValues()))) {
+			return Token{}, dictionary.ErrPrivateCreator
 		}
 		if result.Filter {
 			return Token{}, errLifecycleFiltered
@@ -255,11 +273,8 @@ func (r *Reader) readLifecycleSkippedValueToken(header core.ElementHeader, defer
 			Err: fmt.Errorf("%w: got %d, limit %d", ErrMaxElementsExceeded, r.elementCount+1, r.maxElements),
 		}
 	}
-	if r.maxElementBytes > 0 && int64(header.Length) > r.maxElementBytes {
-		return Token{}, &ParseError{
-			Op: OpReadValue, Offset: r.Position(), Tag: header.Tag, VR: header.VR, Length: header.Length,
-			Err: fmt.Errorf("%w: element %s length %d exceeds limit %d", ErrMaxElementBytesExceeded, header.Tag, header.Length, r.maxElementBytes),
-		}
+	if err := r.checkElementByteLimit(header); err != nil {
+		return Token{}, err
 	}
 	if deferValue {
 		for _, frame := range r.validationLifecycle.frames {

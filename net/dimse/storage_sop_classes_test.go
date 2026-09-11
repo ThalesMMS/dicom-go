@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/ThalesMMS/dicom-go/seg"
+	"github.com/ThalesMMS/dicom-go/spatialreg"
 	"github.com/ThalesMMS/dicom-go/waveform"
 )
 
@@ -12,6 +13,8 @@ func TestDefaultStorageSOPClassUIDsIncludesCurrentStorageClasses(t *testing.T) {
 	for _, uid := range []string{
 		"1.2.840.10008.5.1.4.1.1.7", // Secondary Capture Image Storage
 		seg.SegmentationStorage,
+		spatialreg.SpatialRegistrationStorage,
+		spatialreg.DeformableSpatialRegistrationStorage,
 		waveform.SupportedStorageSOPClassUIDs()[0],
 	} {
 		if !containsUID(got, uid) {

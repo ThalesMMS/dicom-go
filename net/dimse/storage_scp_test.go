@@ -2,6 +2,7 @@ package dimse
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -124,6 +125,45 @@ func TestServeStorageAssociationMapsStoreHandlerErrorToFailureStatus(t *testing.
 	}
 }
 
+func TestServeStorageAssociationUsesTypedStoreStatusAndErrorComment(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	handlerErr := errors.New("archive unavailable")
+	var observedStatus uint16
+	addr, done := startStorageSCP(t, ctx, StorageSCPOptions{
+		StoreHandler: CStoreHandlerFunc(func(context.Context, CStoreRequestContext) (uint16, error) {
+			return StatusSuccess, NewCStoreSCPError(StatusCStoreOutOfResources, "temporary archive failure", handlerErr)
+		}),
+		OnCStoreResponse: func(_ context.Context, _ CStoreRequestContext, status uint16) {
+			observedStatus = status
+		},
+	})
+	file := readIntegrationFixture(t)
+	rsp := sendIntegrationCStore(t, ctx, addr, file, CStoreRequest{
+		AffectedSOPClassUID:    dicomtest.TestSOPClassUID,
+		MessageID:              15,
+		AffectedSOPInstanceUID: dicomtest.TestSOPInstanceUID,
+	})
+	if rsp.Status != StatusCStoreOutOfResources {
+		t.Fatalf("C-STORE status = 0x%04X, want 0x%04X", rsp.Status, StatusCStoreOutOfResources)
+	}
+	if rsp.ErrorComment != "temporary archive failure" {
+		t.Fatalf("C-STORE ErrorComment = %q, want temporary archive failure", rsp.ErrorComment)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("ServeStorageAssociation() error = %v", err)
+	}
+	if observedStatus != StatusCStoreOutOfResources {
+		t.Fatalf("observed status = 0x%04X, want 0x%04X", observedStatus, StatusCStoreOutOfResources)
+	}
+
+	typed := NewCStoreSCPError(StatusCStoreOutOfResources, "temporary archive failure", handlerErr)
+	if !errors.Is(typed, handlerErr) {
+		t.Fatalf("CStoreSCPError does not unwrap handler error: %v", typed)
+	}
+}
+
 func TestServeStorageAssociationReturnsOutOfResourcesForDataSetLimit(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -148,11 +188,49 @@ func TestServeStorageAssociationReturnsOutOfResourcesForDataSetLimit(t *testing.
 	if rsp.Status != StatusCStoreOutOfResources {
 		t.Fatalf("C-STORE status = 0x%04X, want 0x%04X", rsp.Status, StatusCStoreOutOfResources)
 	}
+	if err := <-done; err != nil {
+		t.Fatalf("ServeStorageAssociation() error = %v", err)
+	}
 	if observedStatus != StatusCStoreOutOfResources {
 		t.Fatalf("observed status = 0x%04X, want 0x%04X", observedStatus, StatusCStoreOutOfResources)
 	}
-	if err := <-done; err != nil {
-		t.Fatalf("ServeStorageAssociation() error = %v", err)
+}
+
+func TestServeStorageAssociationPropagatesParserLimits(t *testing.T) {
+	tests := []struct {
+		name   string
+		adjust func(*StorageSCPOptions)
+	}{
+		{name: "elements", adjust: func(o *StorageSCPOptions) { o.MaxElements = 1 }},
+		{name: "pixel bytes", adjust: func(o *StorageSCPOptions) { o.MaxPixelDataBytes = 1 }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			opts := StorageSCPOptions{
+				StoreHandler: CStoreHandlerFunc(func(context.Context, CStoreRequestContext) (uint16, error) {
+					t.Fatal("handler should not be called when parser limit is exceeded")
+					return StatusSuccess, nil
+				}),
+			}
+			tt.adjust(&opts)
+			addr, done := startStorageSCP(t, ctx, opts)
+			file := readIntegrationFixture(t)
+			if tt.name == "pixel bytes" {
+				file.Dataset.Put(core.NewRawElement(core.TagPixelData, core.VROB, []byte{1, 2, 3, 4}))
+			}
+			rsp := sendIntegrationCStore(t, ctx, addr, file, CStoreRequest{
+				AffectedSOPClassUID: dicomtest.TestSOPClassUID, MessageID: 31,
+				AffectedSOPInstanceUID: dicomtest.TestSOPInstanceUID,
+			})
+			if rsp.Status != StatusCStoreOutOfResources {
+				t.Fatalf("C-STORE status = 0x%04X, want 0x%04X", rsp.Status, StatusCStoreOutOfResources)
+			}
+			if err := <-done; err != nil {
+				t.Fatalf("ServeStorageAssociation() error = %v", err)
+			}
+		})
 	}
 }
 

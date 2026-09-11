@@ -302,7 +302,7 @@ func AcceptedContextForSOPClass(assoc *ul.Association, sopClassUID string) (ul.A
 			return pc, nil
 		}
 	}
-	return ul.AcceptedContext{}, fmt.Errorf("dicom dimse: no accepted presentation context for SOP Class UID %q", sopClassUID)
+	return ul.AcceptedContext{}, ExplainMissingPresentationContext(assoc, sopClassUID)
 }
 
 // AcceptedContextForSOPClassTransferSyntaxes returns the accepted presentation
@@ -323,7 +323,7 @@ func AcceptedContextForSOPClassTransferSyntaxes(assoc *ul.Association, sopClassU
 			}
 		}
 	}
-	return ul.AcceptedContext{}, fmt.Errorf("dicom dimse: no accepted presentation context for SOP Class UID %q and transfer syntax UIDs %v", sopClassUID, wanted)
+	return ul.AcceptedContext{}, fmt.Errorf("%w: transfer syntax UIDs %v", ExplainMissingPresentationContext(assoc, sopClassUID), wanted)
 }
 
 func normalizedTransferSyntaxUIDs(transferSyntaxUIDs []string) []string {
@@ -341,9 +341,12 @@ func normalizedTransferSyntaxUIDs(transferSyntaxUIDs []string) []string {
 }
 
 func commandUID(command *object.Object, tag core.Tag) (string, error) {
-	uid, ok := command.GetUID(tag)
-	if !ok || uid == "" {
+	uids, ok := command.GetUIDs(tag)
+	if !ok || len(uids) == 0 {
 		return "", fmt.Errorf("dicom dimse: missing command UID element %s", tag)
 	}
-	return uid, nil
+	if len(uids) != 1 {
+		return "", fmt.Errorf("dicom dimse: command UID element %s requires one value", tag)
+	}
+	return uids[0], nil
 }

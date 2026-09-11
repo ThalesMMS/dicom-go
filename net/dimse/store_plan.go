@@ -3,6 +3,7 @@ package dimse
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"strings"
 
@@ -227,7 +228,11 @@ func newStoreError(stage string, sourceIndex int, cause error, uncertain bool) e
 	case errors.Is(cause, ErrStoreTransferSyntax):
 		safe = ErrStoreTransferSyntax
 	case errors.Is(cause, ErrStorePresentationContextRejected):
-		safe = ErrStorePresentationContextRejected
+		if safeCause := sanitizedPresentationContextCause(cause); safeCause != nil {
+			safe = safeCause
+		} else {
+			safe = ErrStorePresentationContextRejected
+		}
 	case errors.Is(cause, ErrStoreAssociation):
 		safe = ErrStoreAssociation
 	case errors.Is(cause, ErrStoreRemoteFailure):
@@ -242,4 +247,20 @@ func newStoreError(stage string, sourceIndex int, cause error, uncertain bool) e
 		safe = ErrStoreInvalidSource
 	}
 	return &StoreError{Stage: stage, SourceIndex: sourceIndex, Uncertain: uncertain, err: safe}
+}
+
+func sanitizedPresentationContextCause(cause error) error {
+	var missing *MissingPresentationContextError
+	if errors.As(cause, &missing) && missing != nil {
+		cloned := &MissingPresentationContextError{
+			SOPClassUID: missing.SOPClassUID,
+			Outcomes:    append([]ul.PresentationContextOutcome(nil), missing.Outcomes...),
+		}
+		return fmt.Errorf("%w: %w", ErrStorePresentationContextRejected, cloned)
+	}
+	var none *ul.NoAcceptedPresentationContextsError
+	if errors.As(cause, &none) && none != nil {
+		return fmt.Errorf("%w: %w", ErrStorePresentationContextRejected, &ul.NoAcceptedPresentationContextsError{Outcomes: none.Rejected()})
+	}
+	return nil
 }

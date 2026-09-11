@@ -115,6 +115,18 @@ type cStoreResponseReceiver func(context.Context, *ul.Association, byte) (*CStor
 type CStoreDataSetWriter func(context.Context, io.Writer, transfer.Syntax) error
 
 func (c *StoreClient) storeWithOptions(ctx context.Context, dataset *object.Object, opts CStoreOptions, receiveResponse cStoreResponseReceiver) (CStoreResult, error) {
+	return c.storeWithOptionsOperation(ctx, dataset, opts, receiveResponse, true)
+}
+
+// storeWithinAssociationOperation executes a C-STORE sub-operation while the
+// caller already owns the association's operation guard. It is intentionally
+// private: only compound DIMSE services such as C-GET may nest C-STORE on the
+// same association.
+func (c *StoreClient) storeWithinAssociationOperation(ctx context.Context, dataset *object.Object, opts CStoreOptions, receiveResponse cStoreResponseReceiver) (CStoreResult, error) {
+	return c.storeWithOptionsOperation(ctx, dataset, opts, receiveResponse, false)
+}
+
+func (c *StoreClient) storeWithOptionsOperation(ctx context.Context, dataset *object.Object, opts CStoreOptions, receiveResponse cStoreResponseReceiver, acquireOperation bool) (CStoreResult, error) {
 	if c == nil {
 		return CStoreResult{}, fmt.Errorf("dicom dimse: store client is nil")
 	}
@@ -151,9 +163,9 @@ func (c *StoreClient) storeWithOptions(ctx context.Context, dataset *object.Obje
 	}
 	opts.AffectedSOPClassUID = sopClassUID
 	opts.AffectedSOPInstanceUID = sopInstanceUID
-	return c.storeEncodedWithOptions(ctx, func(_ context.Context, destination io.Writer, syntax transfer.Syntax) error {
+	return c.storeEncodedWithOptionsOperation(ctx, func(_ context.Context, destination io.Writer, syntax transfer.Syntax) error {
 		return object.WriteDataSet(destination, dataset, syntax)
-	}, opts, receiveResponse)
+	}, opts, receiveResponse, acquireOperation)
 }
 
 // StoreEncodedWithOptions executes C-STORE for a caller-supplied data set
@@ -164,6 +176,10 @@ func (c *StoreClient) StoreEncodedWithOptions(ctx context.Context, writeDataSet 
 }
 
 func (c *StoreClient) storeEncodedWithOptions(ctx context.Context, writeDataSet CStoreDataSetWriter, opts CStoreOptions, receiveResponse cStoreResponseReceiver) (CStoreResult, error) {
+	return c.storeEncodedWithOptionsOperation(ctx, writeDataSet, opts, receiveResponse, true)
+}
+
+func (c *StoreClient) storeEncodedWithOptionsOperation(ctx context.Context, writeDataSet CStoreDataSetWriter, opts CStoreOptions, receiveResponse cStoreResponseReceiver, acquireOperation bool) (CStoreResult, error) {
 	if c == nil {
 		return CStoreResult{}, fmt.Errorf("dicom dimse: store client is nil")
 	}
@@ -190,9 +206,13 @@ func (c *StoreClient) storeEncodedWithOptions(ctx context.Context, writeDataSet 
 	if sopInstanceUID == "" {
 		return CStoreResult{}, fmt.Errorf("dicom dimse: missing C-STORE Affected SOP Instance UID")
 	}
-	finishOperation, err := beginAssociationOperation(c.Assoc)
-	if err != nil {
-		return CStoreResult{}, err
+	finishOperation := func() {}
+	var err error
+	if acquireOperation {
+		finishOperation, err = beginAssociationOperation(c.Assoc)
+		if err != nil {
+			return CStoreResult{}, err
+		}
 	}
 	defer finishOperation()
 

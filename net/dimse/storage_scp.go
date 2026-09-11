@@ -44,10 +44,52 @@ func (f CStoreHandlerFunc) Store(ctx context.Context, req CStoreRequestContext) 
 	return f(ctx, req)
 }
 
+// CStoreSCPError lets handlers choose the C-STORE response status and Error
+// Comment while retaining an underlying application error for errors.Is and
+// errors.As. A zero Status leaves the handler's separately returned status in
+// effect.
+type CStoreSCPError struct {
+	Status       uint16
+	ErrorComment string
+	Err          error
+}
+
+func NewCStoreSCPError(status uint16, comment string, err error) *CStoreSCPError {
+	return &CStoreSCPError{Status: status, ErrorComment: comment, Err: err}
+}
+
+func (e *CStoreSCPError) Error() string {
+	if e == nil {
+		return "<nil>"
+	}
+	if e.Err != nil && e.ErrorComment != "" {
+		return fmt.Sprintf("dicom dimse: C-STORE SCP status 0x%04X: %s: %v", e.Status, e.ErrorComment, e.Err)
+	}
+	if e.Err != nil {
+		return fmt.Sprintf("dicom dimse: C-STORE SCP status 0x%04X: %v", e.Status, e.Err)
+	}
+	if e.ErrorComment != "" {
+		return fmt.Sprintf("dicom dimse: C-STORE SCP status 0x%04X: %s", e.Status, e.ErrorComment)
+	}
+	return fmt.Sprintf("dicom dimse: C-STORE SCP status 0x%04X", e.Status)
+}
+
+func (e *CStoreSCPError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
 type StorageSCPOptions struct {
-	StoreHandler     CStoreHandler
-	MaxDataSetBytes  int64
-	OnCStoreResponse func(context.Context, CStoreRequestContext, uint16)
+	StoreHandler          CStoreHandler
+	MaxDataSetBytes       int64
+	MaxElementBytes       int64
+	MaxElements           int
+	MaxSequenceDepth      int
+	MaxPixelDataBytes     int64
+	MaxPixelDataFragments int
+	OnCStoreResponse      func(context.Context, CStoreRequestContext, uint16)
 }
 
 // ServeStorageAssociation handles C-ECHO and C-STORE commands on one accepted
@@ -216,12 +258,13 @@ func serveStorageCStore(ctx context.Context, assoc *ul.Association, pcID byte, c
 		if opts.OnCStoreResponse != nil {
 			opts.OnCStoreResponse(ctx, reqCtx, StatusCStoreCannotUnderstand)
 		}
-		return sendStorageCStoreResponse(ctx, assoc, pcID, req, StatusCStoreCannotUnderstand)
+		return sendStorageCStoreResponse(ctx, assoc, pcID, req, StatusCStoreCannotUnderstand, "")
 	}
 	reqCtx.DataSetSyntax = syntax
 
-	status := StatusSuccess
-	dataset, err := receiveStorageDataSet(ctx, assoc, pcID, syntax, opts.MaxDataSetBytes)
+	var status uint16
+	errorComment := ""
+	dataset, err := receiveStorageDataSet(ctx, assoc, pcID, syntax, opts)
 	if err != nil {
 		if !shouldDrainDataSetPDataOnError(err) {
 			return err
@@ -233,6 +276,13 @@ func serveStorageCStore(ctx context.Context, assoc *ul.Association, pcID byte, c
 	} else {
 		reqCtx.DataSet = dataset
 		status, err = opts.StoreHandler.Store(ctx, reqCtx)
+		var scpErr *CStoreSCPError
+		if errors.As(err, &scpErr) && scpErr != nil {
+			if scpErr.Status != 0 {
+				status = scpErr.Status
+			}
+			errorComment = scpErr.ErrorComment
+		}
 		if err != nil && (status == 0 || status == StatusSuccess) {
 			status = StatusCStoreCannotUnderstand
 		} else if status == 0 {
@@ -243,15 +293,27 @@ func serveStorageCStore(ctx context.Context, assoc *ul.Association, pcID byte, c
 		opts.OnCStoreResponse(ctx, reqCtx, status)
 	}
 
-	return sendStorageCStoreResponse(ctx, assoc, pcID, req, status)
+	return sendStorageCStoreResponse(ctx, assoc, pcID, req, status, errorComment)
 }
 
-func receiveStorageDataSet(ctx context.Context, assoc *ul.Association, pcID byte, syntax transfer.Syntax, maxBytes int64) (*object.Object, error) {
+func receiveStorageDataSet(ctx context.Context, assoc *ul.Association, pcID byte, syntax transfer.Syntax, opts StorageSCPOptions) (*object.Object, error) {
 	ctx = dataSetReadContext(ctx, assoc)
 	reader := newTypedPDataReaderWithContext(ctx, assoc, pcID, false)
+	maxElementBytes := opts.MaxElementBytes
+	if maxElementBytes == 0 {
+		maxElementBytes = opts.MaxDataSetBytes
+	}
+	maxPixelDataBytes := opts.MaxPixelDataBytes
+	if maxPixelDataBytes == 0 {
+		maxPixelDataBytes = opts.MaxDataSetBytes
+	}
 	dataset, err := object.ReadDataSetWithOptions(reader, syntax, object.ReadFileOptions{
-		MaxElementBytes: maxBytes,
-		MaxTotalBytes:   maxBytes,
+		MaxElementBytes:   maxElementBytes,
+		MaxTotalBytes:     opts.MaxDataSetBytes,
+		MaxElements:       opts.MaxElements,
+		MaxSequenceDepth:  opts.MaxSequenceDepth,
+		MaxPixelDataBytes: maxPixelDataBytes,
+		MaxFragments:      opts.MaxPixelDataFragments,
 	})
 	if err != nil {
 		if shouldDrainDataSetPDataOnError(err) {
@@ -281,19 +343,25 @@ func shouldDrainDataSetPDataOnError(err error) bool {
 }
 
 func storageDataSetErrorStatus(err error) uint16 {
-	if errors.Is(err, parser.ErrMaxElementBytesExceeded) || errors.Is(err, parser.ErrMaxTotalBytesExceeded) {
+	if errors.Is(err, parser.ErrMaxElementBytesExceeded) ||
+		errors.Is(err, parser.ErrMaxTotalBytesExceeded) ||
+		errors.Is(err, parser.ErrMaxElementsExceeded) ||
+		errors.Is(err, parser.ErrMaxDepthExceeded) ||
+		errors.Is(err, parser.ErrMaxPixelDataBytesExceeded) ||
+		errors.Is(err, parser.ErrMaxFragmentsExceeded) {
 		return StatusCStoreOutOfResources
 	}
 	return StatusCStoreCannotUnderstand
 }
 
-func sendStorageCStoreResponse(ctx context.Context, assoc *ul.Association, pcID byte, req *CStoreRequest, status uint16) error {
+func sendStorageCStoreResponse(ctx context.Context, assoc *ul.Association, pcID byte, req *CStoreRequest, status uint16, errorComment string) error {
 	return sendWithSCPResponseContext(ctx, assoc, func(responseCtx context.Context) error {
 		return SendCommandSetWithContext(responseCtx, assoc, pcID, CStoreResponse{
 			AffectedSOPClassUID:       req.AffectedSOPClassUID,
 			MessageIDBeingRespondedTo: req.MessageID,
 			AffectedSOPInstanceUID:    req.AffectedSOPInstanceUID,
 			Status:                    status,
+			ErrorComment:              errorComment,
 		}.CommandSet())
 	})
 }

@@ -15,6 +15,7 @@ import (
 	"github.com/ThalesMMS/dicom-go/core"
 	"github.com/ThalesMMS/dicom-go/dictionary/tags"
 	"github.com/ThalesMMS/dicom-go/internal/dicomtest"
+	"github.com/ThalesMMS/dicom-go/internal/testutil"
 	"github.com/ThalesMMS/dicom-go/net/ul"
 	"github.com/ThalesMMS/dicom-go/object"
 	"github.com/ThalesMMS/dicom-go/transfer"
@@ -131,6 +132,7 @@ func TestPlanStoreBatchRejectsMalformedUIDs(t *testing.T) {
 		testStoreDescriptor("1.02.3", "1.2.3.1", transfer.ExplicitVRLittleEndian.UID),
 		testStoreDescriptor("1.2.3", "1.2..3", transfer.ExplicitVRLittleEndian.UID),
 		testStoreDescriptor("3.2.3", "1.2.3.1", transfer.ExplicitVRLittleEndian.UID),
+		testStoreDescriptor("1.40.3", "1.2.3.1", transfer.ExplicitVRLittleEndian.UID),
 	}
 	for i, descriptor := range tests {
 		plan, err := PlanStoreBatch(context.Background(), []StoreSource{descriptorStoreSource{descriptor: descriptor}}, StorePlanOptions{})
@@ -468,9 +470,7 @@ func TestPathStoreSourceRejectsSymbolicLinks(t *testing.T) {
 		t.Fatal(err)
 	}
 	link := filepath.Join(t.TempDir(), "link.dcm")
-	if err := os.Symlink(target, link); err != nil {
-		t.Skipf("symlink unavailable: %v", err)
-	}
+	testutil.SymlinkOrSkip(t, target, link)
 	_, err = NewPathStoreSource(link).Inspect(context.Background())
 	if !errors.Is(err, ErrStoreInvalidSource) {
 		t.Fatalf("Inspect() error = %v, want ErrStoreInvalidSource", err)
@@ -1159,6 +1159,9 @@ func TestStoreSessionReportsRejectedContextWithoutOpeningPayload(t *testing.T) {
 	}
 	if result.Succeeded != 1 || result.Failed != 1 || !errors.Is(result.Items[1].Err, ErrStorePresentationContextRejected) {
 		t.Fatalf("StoreBatch() result = %#v", result)
+	}
+	if diagnostic := FormatPresentationContextDiagnostic(result.Items[1].Err); !strings.Contains(diagnostic, "transfer-syntaxes-not-supported") {
+		t.Fatalf("rejected item diagnostic = %q, err = %v", diagnostic, result.Items[1].Err)
 	}
 	if jpeg.openCount != 0 || jpeg.closeCount != 0 {
 		t.Fatalf("rejected source opened/closed = %d/%d, want 0/0", jpeg.openCount, jpeg.closeCount)

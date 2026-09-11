@@ -3,6 +3,7 @@ package dimse
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"sync"
 	"time"
@@ -72,6 +73,11 @@ type StoreSessionOptions struct {
 	MaxAssociationAttempts int
 	MaxStoreAttempts       int
 	MaxInFlightBytes       int64
+	// MaxInvokedOperations caps outstanding C-STORE operations on one
+	// association. Zero or one keeps the serial StoreClient loop. Values
+	// greater than one opt into AsyncSession pipelining when the peer also
+	// negotiates a window greater than one.
+	MaxInvokedOperations int
 
 	Priority                     uint16
 	MoveOriginatorAETitle        string
@@ -84,7 +90,9 @@ type StoreSessionOptions struct {
 type storeDialFunc func(context.Context, string, ul.DialOptions) (*ul.Association, error)
 
 // StoreSession owns associations created for one or more StoreBatch calls.
-// Calls are serialized; each association carries one outstanding operation.
+// Calls are serialized. The default path keeps one outstanding C-STORE per
+// association; MaxInvokedOperations greater than one opts into pipelining
+// when the peer negotiates a matching window.
 type StoreSession struct {
 	address string
 	options StoreSessionOptions
@@ -101,7 +109,7 @@ func NewStoreSession(address string, options StoreSessionOptions) (*StoreSession
 		return nil, ErrStoreInvalidOptions
 	}
 	options = cloneStoreSessionOptions(options)
-	if options.Priority > 2 || options.MaxAssociationAttempts < 0 || options.MaxStoreAttempts < 0 || options.MaxInFlightBytes < 0 || options.ReleaseTimeout < 0 || options.CleanupTimeout < 0 {
+	if options.Priority > 2 || options.MaxAssociationAttempts < 0 || options.MaxStoreAttempts < 0 || options.MaxInFlightBytes < 0 || options.MaxInvokedOperations < 0 || options.ReleaseTimeout < 0 || options.CleanupTimeout < 0 {
 		return nil, ErrStoreInvalidOptions
 	}
 	if options.MaxAssociationAttempts == 0 {
@@ -224,7 +232,7 @@ func (s *StoreSession) StoreBatch(ctx context.Context, sources []StoreSource) (r
 					item.Outcome = StoreOutcomeFailure
 					cause := error(ErrStoreAssociation)
 					if errors.Is(dialErr, ul.ErrNoAcceptedPresentationContexts) {
-						cause = ErrStorePresentationContextRejected
+						cause = fmt.Errorf("%w: %w", ErrStorePresentationContextRejected, dialErr)
 					}
 					item.Err = newStoreError("associate", planned.SourceIndex, cause, false)
 					result.Failed++
@@ -245,6 +253,32 @@ func (s *StoreSession) StoreBatch(ctx context.Context, sources []StoreSource) (r
 			result.Associations++
 			s.setActive(assoc)
 			associationUsable := true
+			if invoked := effectiveStoreInvoked(storeSessionPipelineOptIn(s.options), s.options.MaxInvokedOperations, assoc.EffectiveAsynchronousOperationsWindow()); invoked > 1 {
+				nextPos, nextCompleted, usable, pipeErr := s.storeAssociationPipelined(ctx, assoc, invoked, associationPlan, &result, sources, associationIndex, position, completed, &remainingTotalBytes)
+				position = nextPos
+				completed = nextCompleted
+				associationUsable = usable
+				if pipeErr != nil {
+					return result, pipeErr
+				}
+				if !associationUsable {
+					if s.options.DisableReconnect || position >= len(associationPlan.Items) {
+						for _, remaining := range associationPlan.Items[position:] {
+							remainingResult := &result.Items[remaining.SourceIndex]
+							if remainingResult.Outcome != StoreOutcomeNotSent {
+								continue
+							}
+							remainingResult.Descriptor = cloneStoreDescriptor(remaining.Descriptor)
+							remainingResult.Outcome = StoreOutcomeFailure
+							remainingResult.Err = newStoreError("reconnect", remaining.SourceIndex, ErrStoreAssociation, false)
+							result.Failed++
+							completed++
+						}
+						position = len(associationPlan.Items)
+					}
+				}
+				continue
+			}
 			client := NewStoreClient(assoc)
 			for position < len(associationPlan.Items) {
 				planned := associationPlan.Items[position]
@@ -262,7 +296,7 @@ func (s *StoreSession) StoreBatch(ctx context.Context, sources []StoreSource) (r
 				}
 				if !storeContextAccepted(assoc, planned) {
 					item.Outcome = StoreOutcomeFailure
-					item.Err = newStoreError("negotiate", planned.SourceIndex, ErrStorePresentationContextRejected, false)
+					item.Err = newStoreError("negotiate", planned.SourceIndex, fmt.Errorf("%w: %w", ErrStorePresentationContextRejected, ExplainMissingPresentationContext(assoc, planned.Descriptor.SOPClassUID)), false)
 					result.Failed++
 					completed++
 					position++
@@ -438,6 +472,13 @@ func (s *StoreSession) dialAssociation(ctx context.Context, contexts []ul.Presen
 		opts := cloneStoreDialOptions(s.options.DialOptions)
 		opts.Context = ctx
 		opts.Contexts = cloneStorePresentationContexts(contexts)
+		if storeSessionPipelineOptIn(s.options) && opts.AsynchronousOperationsWindow == nil {
+			invoked := uint16(s.options.MaxInvokedOperations)
+			opts.AsynchronousOperationsWindow = &ul.AsynchronousOperationsWindow{
+				MaximumInvoked:   invoked,
+				MaximumPerformed: 1,
+			}
+		}
 		assoc, err := s.dial(ctx, s.address, opts)
 		if err == nil {
 			return assoc, attempt, nil

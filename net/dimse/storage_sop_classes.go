@@ -4,6 +4,7 @@ import (
 	"github.com/ThalesMMS/dicom-go/gsps"
 	"github.com/ThalesMMS/dicom-go/rtstruct"
 	"github.com/ThalesMMS/dicom-go/seg"
+	"github.com/ThalesMMS/dicom-go/spatialreg"
 	"github.com/ThalesMMS/dicom-go/sr"
 	"github.com/ThalesMMS/dicom-go/vps"
 	"github.com/ThalesMMS/dicom-go/waveform"
@@ -34,6 +35,8 @@ var defaultStorageSOPClassUIDs = append([]string{
 	sr.Comprehensive3DSRStorage,
 	gsps.GrayscaleSoftcopyPresentationStateStorage,
 	rtstruct.RTStructureSetStorage,
+	spatialreg.SpatialRegistrationStorage,
+	spatialreg.DeformableSpatialRegistrationStorage,
 	vps.GrayscalePlanarMPRVolumetricPresentationStateStorage,
 	vps.CompositingPlanarMPRVolumetricPresentationStateStorage,
 	vps.VolumeRenderingVolumetricPresentationStateStorage,

@@ -467,7 +467,7 @@ func normalizeStoreDescriptor(descriptor StoreDescriptor) (StoreDescriptor, erro
 	descriptor.SOPClassUID = strings.TrimSpace(descriptor.SOPClassUID)
 	descriptor.SOPInstanceUID = strings.TrimSpace(descriptor.SOPInstanceUID)
 	descriptor.TransferSyntaxUID = transfer.NormalizeUID(descriptor.TransferSyntaxUID)
-	if !validStoreUID(descriptor.SOPClassUID) || !validStoreUID(descriptor.SOPInstanceUID) || !validStoreUID(descriptor.TransferSyntaxUID) || descriptor.Size < 0 {
+	if !core.IsValidUID(descriptor.SOPClassUID) || !core.IsValidUID(descriptor.SOPInstanceUID) || !core.IsValidUID(descriptor.TransferSyntaxUID) || descriptor.Size < 0 {
 		return StoreDescriptor{}, ErrStoreInvalidSource
 	}
 	if _, ok := transfer.DefaultRegistry.Get(descriptor.TransferSyntaxUID); !ok {
@@ -496,29 +496,7 @@ func normalizeStoreDescriptor(descriptor StoreDescriptor) (StoreDescriptor, erro
 	return descriptor, nil
 }
 
-func validStoreUID(value string) bool {
-	if value == "" || len(value) > 64 || value[0] == '.' || value[len(value)-1] == '.' {
-		return false
-	}
-	components := strings.Split(value, ".")
-	if len(components) < 2 || components[0] != "0" && components[0] != "1" && components[0] != "2" {
-		return false
-	}
-	for _, component := range components {
-		if component == "" || len(component) > 1 && component[0] == '0' {
-			return false
-		}
-		for i := range component {
-			if component[i] < '0' || component[i] > '9' {
-				return false
-			}
-		}
-	}
-	if components[0] != "2" && (len(components[1]) > 2 || len(components[1]) == 2 && components[1] > "39") {
-		return false
-	}
-	return true
-}
+func validStoreUID(value string) bool { return core.IsValidUID(value) }
 
 func cloneStoreDescriptor(descriptor StoreDescriptor) StoreDescriptor {
 	descriptor.WritableTransferSyntaxUIDs = append([]string(nil), descriptor.WritableTransferSyntaxUIDs...)

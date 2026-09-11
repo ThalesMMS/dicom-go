@@ -1,5 +1,91 @@
 package roi
 
+import (
+	"errors"
+	"fmt"
+)
+
+// RasterMaskPixelLimit bounds checked dense-mask inputs before any row storage
+// is allocated. The run-length representation remains sparse, but callers that
+// provide a dense buffer still need an explicit resource limit at the API
+// boundary.
+const RasterMaskPixelLimit = 1 << 30
+
+var (
+	// ErrInvalidRasterMaskDimensions reports zero or negative mask dimensions.
+	ErrInvalidRasterMaskDimensions = errors.New("roi: invalid raster mask dimensions")
+	// ErrRasterMaskDimensionOverflow reports an unrepresentable columns*rows
+	// product.
+	ErrRasterMaskDimensionOverflow = errors.New("roi: raster mask dimensions overflow")
+	// ErrRasterMaskTooLarge reports a checked mask larger than the supported
+	// dense-input resource limit.
+	ErrRasterMaskTooLarge = errors.New("roi: raster mask exceeds pixel limit")
+	// ErrRasterMaskBufferLength reports a dense buffer that does not describe
+	// exactly one byte per pixel of the requested mask.
+	ErrRasterMaskBufferLength = errors.New("roi: raster mask buffer length mismatch")
+)
+
+// RasterMaskPixelCount validates positive dimensions and returns columns*rows
+// without allowing integer overflow or an unbounded dense input.
+func RasterMaskPixelCount(columns, rows int) (int, error) {
+	if columns <= 0 || rows <= 0 {
+		return 0, ErrInvalidRasterMaskDimensions
+	}
+	maxInt := int(^uint(0) >> 1)
+	if columns > maxInt/rows {
+		return 0, ErrRasterMaskDimensionOverflow
+	}
+	pixels := columns * rows
+	if pixels > RasterMaskPixelLimit {
+		return 0, ErrRasterMaskTooLarge
+	}
+	return pixels, nil
+}
+
+// ValidateRasterMaskBuffer validates a dense, one-byte-per-pixel mask payload.
+// It performs every dimension and length check before a RasterMask allocation.
+func ValidateRasterMaskBuffer(columns, rows int, buffer []byte) error {
+	pixels, err := RasterMaskPixelCount(columns, rows)
+	if err != nil {
+		return err
+	}
+	if len(buffer) != pixels {
+		return fmt.Errorf("%w: got %d bytes, want %d", ErrRasterMaskBufferLength, len(buffer), pixels)
+	}
+	return nil
+}
+
+// NewRasterMaskFromBuffer builds a run-length RasterMask from a dense
+// one-byte-per-pixel buffer. Any non-zero byte sets a pixel. The input is
+// validated before allocation, and the returned error is one of the exported
+// RasterMask validation sentinels.
+func NewRasterMaskFromBuffer(columns, rows int, buffer []byte) (*RasterMask, error) {
+	if err := ValidateRasterMaskBuffer(columns, rows, buffer); err != nil {
+		return nil, err
+	}
+	mask := NewRasterMask(columns, rows)
+	for y := 0; y < rows; y++ {
+		rowStart := y * columns
+		for x := 0; x < columns; {
+			if buffer[rowStart+x] == 0 {
+				x++
+				continue
+			}
+			start := x
+			for x < columns && buffer[rowStart+x] != 0 {
+				x++
+			}
+			mask.SetRun(y, start, x)
+		}
+	}
+	return mask, nil
+}
+
+// NewRasterMaskFromBytes is a descriptive alias for NewRasterMaskFromBuffer.
+func NewRasterMaskFromBytes(columns, rows int, buffer []byte) (*RasterMask, error) {
+	return NewRasterMaskFromBuffer(columns, rows, buffer)
+}
+
 // MaskRun is a half-open horizontal span [Start, End) of set pixels within one
 // row of a RasterMask.
 type MaskRun struct {

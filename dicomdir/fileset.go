@@ -265,7 +265,7 @@ func NewFileSet(root string, options Options) (*FileSet, error) {
 			return nil, err
 		}
 	}
-	if !validUID(uid) {
+	if !core.IsValidUID(uid) {
 		return nil, ErrInvalidOptions
 	}
 	return &FileSet{
@@ -347,29 +347,7 @@ func portableOptionalLabel(value string) bool {
 	return true
 }
 
-func validUID(uid string) bool {
-	if uid == "" || len(uid) > 64 || uid[0] == '.' || uid[len(uid)-1] == '.' {
-		return false
-	}
-	components := strings.Split(uid, ".")
-	if len(components) < 2 || components[0] != "0" && components[0] != "1" && components[0] != "2" {
-		return false
-	}
-	for _, component := range components {
-		if component == "" || len(component) > 1 && component[0] == '0' {
-			return false
-		}
-		for i := 0; i < len(component); i++ {
-			if component[i] < '0' || component[i] > '9' {
-				return false
-			}
-		}
-	}
-	if components[0] != "2" && (len(components[1]) > 2 || len(components[1]) == 2 && components[1] > "39") {
-		return false
-	}
-	return true
-}
+func validUID(uid string) bool { return core.IsValidUID(uid) }
 
 func mintFileSetUID() (string, error) {
 	var raw [16]byte
@@ -861,7 +839,7 @@ func validateFileRecord(record FileRecord) error {
 		return ErrInvalidRecord
 	}
 	for _, uid := range []string{record.StudyInstanceUID, record.SeriesInstanceUID, record.SOPClassUID, record.SOPInstanceUID, record.TransferSyntaxUID} {
-		if !validUID(core.NormalizeUID(uid)) {
+		if !core.IsValidUID(core.NormalizeUID(uid)) {
 			return ErrInvalidRecord
 		}
 	}
@@ -873,7 +851,7 @@ func validateFileRecord(record FileRecord) error {
 	validatedRecord.RelatedGeneralSOPClassUIDs = append([]string(nil), record.RelatedGeneralSOPClassUIDs...)
 	for index, uid := range validatedRecord.RelatedGeneralSOPClassUIDs {
 		normalized := core.NormalizeUID(uid)
-		if !validUID(normalized) {
+		if !core.IsValidUID(normalized) {
 			return ErrInvalidRecord
 		}
 		validatedRecord.RelatedGeneralSOPClassUIDs[index] = normalized

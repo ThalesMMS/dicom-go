@@ -110,7 +110,7 @@ func Test_VolumetricPresentationState_round_trips_supported_sop_classes(t *testi
 	}
 }
 
-func TestVolumetricPresentationStateRejectsUnrepresentedStandardPayload(t *testing.T) {
+func TestVolumetricPresentationStateRejectsIncompleteStandardPayload(t *testing.T) {
 	dataset := derivedio.Object(
 		derivedio.UI(derivedio.TagSOPClassUID, VolumeRenderingVolumetricPresentationStateStorage),
 		derivedio.UI(derivedio.TagSOPInstanceUID, "1.2.826.0.1.3680043.9.7433.312.1"),
@@ -118,8 +118,8 @@ func TestVolumetricPresentationStateRejectsUnrepresentedStandardPayload(t *testi
 	)
 
 	_, err := Read(dataset)
-	if !errors.Is(err, ErrUnsupportedPayload) {
-		t.Fatalf("Read standard VPS error = %v, want ErrUnsupportedPayload", err)
+	if !errors.Is(err, ErrInvalidObject) {
+		t.Fatalf("Read standard VPS error = %v, want ErrInvalidObject", err)
 	}
 }
 

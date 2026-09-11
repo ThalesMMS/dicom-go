@@ -48,9 +48,85 @@ type ReferencedInstance struct {
 }
 
 type Input struct {
-	Number              int
-	InputSetUID         string
-	ReferencedInstances []ReferencedInstance
+	Number                   int
+	InputSetUID              string
+	ReferencedInstances      []ReferencedInstance
+	CropSpecificationNumbers []int
+	VOI                      *VOI
+	RenderingMethod          string
+}
+
+// VOI describes the Window Center/Width transform attached to one VPS input.
+// LUT-based VOI is deliberately not represented because applying it as WC/WW
+// would change the presentation.
+type VOI struct {
+	WindowCenter float64
+	WindowWidth  float64
+}
+
+// CroppingSpecification is one standard Volume Cropping Sequence item. The
+// supported method is BOUNDING_BOX; other standard methods fail closed on read.
+type CroppingSpecification struct {
+	Number      int
+	Method      string
+	BoundingBox [6]float64
+}
+
+// MPRGeometry is the standard PLANAR MPR geometry in VPS-RCS coordinates.
+type MPRGeometry struct {
+	ThicknessType   string
+	SlabThickness   float64
+	TopLeft         render.Vec3
+	WidthDirection  render.Vec3
+	Width           float64
+	HeightDirection render.Vec3
+	Height          float64
+}
+
+// VolumeRenderGeometry is the standard viewpoint and field-of-view geometry.
+type VolumeRenderGeometry struct {
+	Projection  string
+	Position    render.Vec3
+	LookAt      render.Vec3
+	Up          render.Vec3
+	FieldOfView [6]float64
+}
+
+// ClassificationComponent is the supported one-input scalar-to-RGBA
+// classification. Palette data is retained as 16-bit table entries.
+type ClassificationComponent struct {
+	InputNumbers          []int
+	RGBTransferFunction   string
+	AlphaTransferFunction string
+	// PaletteDescriptor contains entry count, first mapped value, and bits per
+	// entry. VPS TABLE classifications require a first mapped value of zero.
+	PaletteDescriptor [3]uint16
+	RedPalette        []uint16
+	GreenPalette      []uint16
+	BluePalette       []uint16
+	AlphaPalette      []uint16
+	Description       string
+}
+
+// Display describes the standard presentation output pipeline.
+type Display struct {
+	PixelPresentation    string
+	PresentationLUTShape string
+	InputSetUID          string
+	Classification       []ClassificationComponent
+	ICCProfile           []byte
+	ColorSpace           string
+}
+
+// Shading describes the standard Render Shading module. The current viewer
+// applies its enabled state; numeric Phong parameters are retained losslessly.
+type Shading struct {
+	Style          string
+	Ambient        float64
+	LightDirection render.Vec3
+	Diffuse        float64
+	Specular       float64
+	Shininess      float64
 }
 
 type Camera struct {
@@ -67,15 +143,31 @@ type State struct {
 	SOPInstanceUID    string
 	StudyInstanceUID  string
 	SeriesInstanceUID string
-	Inputs            []Input
-	RenderPresetName  string
-	Camera            Camera
+	// FrameOfReferenceUID identifies the patient coordinate system used by the
+	// authored standard VPS geometry and all of its referenced inputs.
+	FrameOfReferenceUID            string
+	Inputs                         []Input
+	GlobalCropSpecificationNumbers []int
+	CroppingSpecifications         []CroppingSpecification
+	MPRGeometry                    *MPRGeometry
+	VolumeRenderGeometry           *VolumeRenderGeometry
+	RenderingMethod                string
+	Display                        *Display
+	Shading                        *Shading
+	RenderPresetName               string
+	Camera                         Camera
 }
 
 type AppliedState struct {
-	Inputs []Input
-	Preset render.VRPreset
-	Camera Camera
+	Inputs                         []Input
+	Preset                         render.VRPreset
+	Camera                         Camera
+	GlobalCropSpecificationNumbers []int
+	CroppingSpecifications         []CroppingSpecification
+	MPRGeometry                    *MPRGeometry
+	VolumeRenderGeometry           *VolumeRenderGeometry
+	VOI                            *VOI
+	Shading                        *Shading
 }
 
 // Write encodes the volumetric presentation state into a DICOM file suitable for storage or transmission. It returns ErrInvalidObject if state is nil, or ErrUnsupportedSOPClass if the SOP class UID is not supported.
@@ -86,17 +178,25 @@ func Write(state *State) (*object.File, error) {
 	if !supportedSOPClass(state.SOPClassUID) {
 		return nil, fmt.Errorf("%w: %s", ErrUnsupportedSOPClass, state.SOPClassUID)
 	}
+	if hasStandardState(state) {
+		return writeStandard(state)
+	}
 	for i, input := range state.Inputs {
 		if input.Number <= 0 || input.Number > 1<<16-1 {
 			return nil, fmt.Errorf("%w: input %d number %d is outside US", ErrInvalidObject, i, input.Number)
 		}
 	}
-	dataset := derivedio.Object(
+	elements := []core.Element{
 		derivedio.UI(derivedio.TagSOPClassUID, state.SOPClassUID),
 		derivedio.UI(derivedio.TagSOPInstanceUID, state.SOPInstanceUID),
 		derivedio.CS(derivedio.TagModality, "PR"),
 		derivedio.UI(derivedio.TagStudyInstanceUID, state.StudyInstanceUID),
 		derivedio.UI(derivedio.TagSeriesInstanceUID, state.SeriesInstanceUID),
+	}
+	if state.FrameOfReferenceUID != "" {
+		elements = append(elements, derivedio.UI(derivedio.TagFrameOfReferenceUID, state.FrameOfReferenceUID))
+	}
+	elements = append(elements,
 		inputSetSequence(state.Inputs),
 		inputSequence(state.Inputs),
 		derivedio.CS(tagGlobalCrop, "NO"),
@@ -106,13 +206,13 @@ func Write(state *State) (*object.File, error) {
 		derivedio.DS(tagCameraAngles, state.Camera.Yaw, state.Camera.Pitch, state.Camera.Roll),
 		derivedio.DS(tagCameraDistanceFov, state.Camera.Distance, state.Camera.FovY),
 	)
+	dataset := derivedio.Object(elements...)
 	return derivedio.File(state.SOPClassUID, state.SOPInstanceUID, dataset)
 }
 
-// Read reconstructs the private renderer extension used by this package from a
-// Volumetric Presentation State object. Standard VPS geometry, cropping and
-// display pipelines are deliberately rejected with ErrUnsupportedPayload until
-// they can be represented without silently substituting local renderer state.
+// Read reconstructs either the supported standard VPS modules or the legacy
+// private renderer extension used by this package. Unsupported standard
+// pipelines fail closed with ErrUnsupportedPayload.
 func Read(obj *object.Object) (*State, error) {
 	if obj == nil {
 		return nil, fmt.Errorf("%w: dataset is nil", ErrInvalidObject)
@@ -127,18 +227,37 @@ func Read(obj *object.Object) (*State, error) {
 		return nil, fmt.Errorf("%w: private creator is present without renderer payload", ErrInvalidObject)
 	}
 	legacyPrivatePayload := creator == "" && hasRendererPayload
+	if hasStandardGeometry(obj, sopClassUID) {
+		return readStandard(obj, sopClassUID)
+	}
 	if creator != privateCreator && !legacyPrivatePayload {
 		return nil, fmt.Errorf("%w: SOP class %s requires standard VPS geometry, crop, VOI, and display modules", ErrUnsupportedPayload, sopClassUID)
 	}
 	return &State{
-		SOPClassUID:       sopClassUID,
-		SOPInstanceUID:    derivedio.CleanUID(obj, derivedio.TagSOPInstanceUID),
-		StudyInstanceUID:  derivedio.CleanUID(obj, derivedio.TagStudyInstanceUID),
-		SeriesInstanceUID: derivedio.CleanUID(obj, derivedio.TagSeriesInstanceUID),
-		Inputs:            readInputs(obj),
-		RenderPresetName:  derivedio.CleanString(obj, tagRenderPresetName),
-		Camera:            readCamera(obj),
+		SOPClassUID:         sopClassUID,
+		SOPInstanceUID:      derivedio.CleanUID(obj, derivedio.TagSOPInstanceUID),
+		StudyInstanceUID:    derivedio.CleanUID(obj, derivedio.TagStudyInstanceUID),
+		SeriesInstanceUID:   derivedio.CleanUID(obj, derivedio.TagSeriesInstanceUID),
+		FrameOfReferenceUID: derivedio.CleanUID(obj, derivedio.TagFrameOfReferenceUID),
+		Inputs:              readInputs(obj),
+		RenderPresetName:    derivedio.CleanString(obj, tagRenderPresetName),
+		Camera:              readCamera(obj),
 	}, nil
+}
+
+// Validate verifies that state can be written without silently omitting any
+// represented standard VPS module.
+func Validate(state *State) error {
+	if state == nil {
+		return fmt.Errorf("%w: state is nil", ErrInvalidObject)
+	}
+	if !supportedSOPClass(state.SOPClassUID) {
+		return fmt.Errorf("%w: %s", ErrUnsupportedSOPClass, state.SOPClassUID)
+	}
+	if hasStandardState(state) {
+		return validateStandardState(state)
+	}
+	return nil
 }
 
 func hasPrivateRendererPayload(obj *object.Object) bool {
@@ -150,14 +269,33 @@ func Apply(state *State) (AppliedState, error) {
 	if state == nil {
 		return AppliedState{}, fmt.Errorf("%w: state is nil", ErrInvalidObject)
 	}
-	preset, ok := render.VRPresetByName(presetName(state.RenderPresetName))
-	if !ok {
-		preset = render.DefaultVRPreset()
+	if hasStandardState(state) {
+		if err := validateStandardState(state); err != nil {
+			return AppliedState{}, err
+		}
+	}
+	preset, err := appliedPreset(state)
+	if err != nil {
+		return AppliedState{}, err
+	}
+	var voi *VOI
+	for _, input := range state.Inputs {
+		if input.VOI != nil {
+			copyVOI := *input.VOI
+			voi = &copyVOI
+			break
+		}
 	}
 	return AppliedState{
-		Inputs: append([]Input(nil), state.Inputs...),
-		Preset: preset,
-		Camera: state.Camera,
+		Inputs:                         append([]Input(nil), state.Inputs...),
+		Preset:                         preset,
+		Camera:                         state.Camera,
+		GlobalCropSpecificationNumbers: append([]int(nil), state.GlobalCropSpecificationNumbers...),
+		CroppingSpecifications:         append([]CroppingSpecification(nil), state.CroppingSpecifications...),
+		MPRGeometry:                    cloneMPRGeometry(state.MPRGeometry),
+		VolumeRenderGeometry:           cloneVolumeRenderGeometry(state.VolumeRenderGeometry),
+		VOI:                            voi,
+		Shading:                        cloneShading(state.Shading),
 	}, nil
 }
 

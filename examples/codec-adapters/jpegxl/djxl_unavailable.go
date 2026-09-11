@@ -2,9 +2,22 @@
 
 package jpegxladapter
 
-import "github.com/ThalesMMS/dicom-go/pixeldata"
+import (
+	"context"
 
-func (djxlDecoder) DecodeFrame([]byte, pixeldata.Metadata) ([]byte, error) {
+	"github.com/ThalesMMS/dicom-go/pixeldata"
+)
+
+func (decoder djxlDecoder) DecodeFrame(fragment []byte, metadata pixeldata.Metadata) ([]byte, error) {
+	return decoder.DecodeFrameContext(context.Background(), fragment, metadata)
+}
+
+func (djxlDecoder) DecodeFrameContext(ctx context.Context, _ []byte, _ pixeldata.Metadata) ([]byte, error) {
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+	}
 	return nil, ErrDjxlUnavailable
 }
 

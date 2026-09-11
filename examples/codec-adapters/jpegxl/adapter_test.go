@@ -27,6 +27,22 @@ var (
 	tagPixelRepresentation       = core.NewTag(0x0028, 0x0103)
 )
 
+func TestRegisterWithDecoderUsesInjectedDecoder(t *testing.T) {
+	registry := pixeldata.NewMemoryRegistry()
+	decoder := &fakeDecoder{outputs: [][]byte{{1, 2}}}
+	if err := RegisterWithDecoder(registry, decoder); err != nil {
+		t.Fatal(err)
+	}
+	obj, pixel := jpegxlObject(t, jpegxlMetadataOptions{}, []byte("encoded"))
+	frames, err := registry.DecodeFrames(transfer.JPEGXL.UID, pixel, obj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(frames.Data) != 1 || !slices.Equal(frames.Data[0], []byte{1, 2}) {
+		t.Fatalf("RegisterWithDecoder frames = %#v", frames)
+	}
+}
+
 func TestRegisterRegistersOnlyJPEGXLStillImageSyntaxes(t *testing.T) {
 	registry := pixeldata.NewMemoryRegistry()
 
@@ -48,7 +64,11 @@ func TestRegisterRegistersOnlyJPEGXLStillImageSyntaxes(t *testing.T) {
 
 func TestDecodeFramesJPEGXLDelegatesOneFragmentPerFrame(t *testing.T) {
 	obj, pixel := jpegxlObject(t, jpegxlMetadataOptions{numberOfFrames: 2}, []byte("frame-1"), []byte("frame-2"))
-	decoder := &fakeDecoder{outputs: [][]byte{{1, 2}, {3, 4}}}
+	decoder := &borrowedJPEGXLDecoder{
+		source:   pixel.Sequence.Fragments,
+		outputs:  [][]byte{{1, 2}, {3, 4}},
+		allViews: true,
+	}
 
 	frames, err := NewWithDecoder(decoder).Decode(pixel, obj)
 	if err != nil {
@@ -57,13 +77,11 @@ func TestDecodeFramesJPEGXLDelegatesOneFragmentPerFrame(t *testing.T) {
 	if frames.Rows != 1 || frames.Columns != 2 || !equalFrames(frames.Data, [][]byte{{1, 2}, {3, 4}}) {
 		t.Fatalf("Decode() = %#v, want rows=1 columns=2 data=[[1 2] [3 4]]", frames)
 	}
-	if len(decoder.fragments) != 2 ||
-		!slices.Equal(decoder.fragments[0], []byte("frame-1")) ||
-		!slices.Equal(decoder.fragments[1], []byte("frame-2")) {
-		t.Fatalf("decoder fragments = %#v, want copied frame fragments", decoder.fragments)
+	if !decoder.allViews || decoder.next != 2 {
+		t.Fatal("decoder received copied frame fragments, want borrowed read-only views")
 	}
-	if len(decoder.metadata) != 2 || decoder.metadata[0].Rows != 1 || decoder.metadata[0].Columns != 2 {
-		t.Fatalf("decoder metadata = %#v, want extracted DICOM metadata", decoder.metadata)
+	if decoder.lastMetadata.Rows != 1 || decoder.lastMetadata.Columns != 2 {
+		t.Fatalf("decoder metadata = %#v, want extracted DICOM metadata", decoder.lastMetadata)
 	}
 }
 
@@ -226,6 +244,24 @@ type fakeDecoder struct {
 	err       error
 	metadata  []pixeldata.Metadata
 	fragments [][]byte
+}
+
+type borrowedJPEGXLDecoder struct {
+	source       [][]byte
+	outputs      [][]byte
+	next         int
+	allViews     bool
+	lastMetadata pixeldata.Metadata
+}
+
+func (d *borrowedJPEGXLDecoder) DecodeFrame(fragment []byte, metadata pixeldata.Metadata) ([]byte, error) {
+	if d.next >= len(d.source) || len(fragment) == 0 || len(d.source[d.next]) == 0 || &fragment[0] != &d.source[d.next][0] {
+		d.allViews = false
+	}
+	d.lastMetadata = metadata
+	output := append([]byte(nil), d.outputs[d.next]...)
+	d.next++
+	return output, nil
 }
 
 func (d *fakeDecoder) DecodeFrame(fragment []byte, metadata pixeldata.Metadata) ([]byte, error) {

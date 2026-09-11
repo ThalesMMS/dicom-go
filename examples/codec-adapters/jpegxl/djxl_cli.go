@@ -32,8 +32,22 @@ type ppmImage struct {
 }
 
 func (decoder djxlDecoder) DecodeFrame(fragment []byte, metadata pixeldata.Metadata) ([]byte, error) {
+	return decoder.DecodeFrameContext(context.Background(), fragment, metadata)
+}
+
+func (decoder djxlDecoder) DecodeFrameContext(ctx context.Context, fragment []byte, metadata pixeldata.Metadata) ([]byte, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	executable, err := decoder.resolveExecutable()
 	if err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 
@@ -42,27 +56,33 @@ func (decoder djxlDecoder) DecodeFrame(fragment []byte, metadata pixeldata.Metad
 		return nil, fmt.Errorf("%w: create temp directory: %w", ErrDjxlUnavailable, err)
 	}
 	defer os.RemoveAll(dir)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	inputPath := filepath.Join(dir, "frame.jxl")
 	outputPath := filepath.Join(dir, "frame"+djxlOutputExtension(metadata))
 	if err := os.WriteFile(inputPath, fragment, 0o600); err != nil {
 		return nil, fmt.Errorf("%w: write input codestream: %w", ErrDjxlUnavailable, err)
 	}
-
-	ctx := context.Background()
-	var cancel context.CancelFunc
-	if decoder.timeout > 0 {
-		ctx, cancel = context.WithTimeout(ctx, decoder.timeout)
-		defer cancel()
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
-	cmd := exec.CommandContext(ctx, executable, inputPath, outputPath, "--quiet")
+
+	runCtx, cancel := boundDecoderContext(ctx, decoder.timeout)
+	defer cancel()
+	cmd := exec.CommandContext(runCtx, executable, inputPath, outputPath, "--quiet")
+	configureExternalDecoderCommand(cmd)
 	var processOutput limitedProcessOutput
 	cmd.Stdout = &processOutput
 	cmd.Stderr = &processOutput
 	err = cmd.Run()
 	if err != nil {
-		if ctx.Err() == context.DeadlineExceeded {
-			return nil, fmt.Errorf("%w: djxl timed out after %s", ErrMalformedCodestream, decoder.timeout)
+		if mapped := mapBoundDecoderError(ctx, runCtx); mapped != nil {
+			if errors.Is(mapped, ErrDecoderTimeout) {
+				return nil, fmt.Errorf("%w: djxl timed out after %s", ErrDecoderTimeout, decoder.timeout)
+			}
+			return nil, mapped
 		}
 		detail := processOutput.String()
 		if detail == "" {
@@ -72,6 +92,9 @@ func (decoder djxlDecoder) DecodeFrame(fragment []byte, metadata pixeldata.Metad
 			return nil, fmt.Errorf("%w: djxl: %s", ErrDjxlUnavailable, detail)
 		}
 		return nil, fmt.Errorf("%w: djxl: %s", ErrMalformedCodestream, detail)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 
 	sizeLimit, err := djxlOutputSizeLimit(metadata)
@@ -90,10 +113,16 @@ func (decoder djxlDecoder) DecodeFrame(fragment []byte, metadata pixeldata.Metad
 			sizeLimit,
 		)
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	ppmBytes, err := os.ReadFile(outputPath)
 	if err != nil {
 		return nil, fmt.Errorf("%w: read djxl output: %w", ErrMalformedCodestream, err)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	return ppmToFrameBytes(ppmBytes, metadata)
 }

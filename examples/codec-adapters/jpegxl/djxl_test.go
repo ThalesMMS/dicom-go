@@ -3,6 +3,7 @@
 package jpegxladapter
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"os"
@@ -71,7 +72,7 @@ func TestDjxlDecoderRunsConfiguredExecutableAndParsesPGM(t *testing.T) {
 	}
 	path := writeExecutable(t, "fake-djxl", `#!/bin/sh
 out="${2}"
-printf 'P5\n2 1\n255\n\x00\xff' > "$out"
+printf 'P5\n2 1\n255\n\000\377' > "$out"
 `)
 
 	frame, err := NewDjxlDecoder(DjxlExecutable(path)).DecodeFrame([]byte("encoded"), grayMetadata())
@@ -90,8 +91,14 @@ func TestDjxlDecoderTimesOutExternalProcess(t *testing.T) {
 	path := writeExecutable(t, "slow-djxl", "#!/bin/sh\nwhile :; do :; done\n")
 
 	_, err := NewDjxlDecoder(DjxlExecutable(path), DjxlTimeout(50*time.Millisecond)).DecodeFrame([]byte("encoded"), grayMetadata())
-	if !errors.Is(err, ErrMalformedCodestream) {
-		t.Fatalf("DecodeFrame() error = %v, want ErrMalformedCodestream timeout", err)
+	if errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("codec timeout wrapped context.DeadlineExceeded: %v", err)
+	}
+	if !errors.Is(err, ErrDecoderTimeout) {
+		t.Fatalf("DecodeFrame() error = %v, want ErrDecoderTimeout", err)
+	}
+	if errors.Is(err, ErrMalformedCodestream) {
+		t.Fatalf("timeout presented as malformed codestream: %v", err)
 	}
 	if !strings.Contains(err.Error(), "timed out") {
 		t.Fatalf("DecodeFrame() error = %q, want timeout detail", err)

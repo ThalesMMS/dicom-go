@@ -101,7 +101,7 @@ func TestDecodeJPEGXLDefaultRegistryStillReportsMissingAdapter(t *testing.T) {
 	}
 }
 
-func TestDecodeJPEGXLUnsupportedPixelRepresentationNamesCondition(t *testing.T) {
+func TestDecodeJPEGXLUnsupportedPixelRepresentationPreservesTypedCondition(t *testing.T) {
 	registry := pixeldata.NewMemoryRegistry()
 	if err := Register(registry); err != nil {
 		t.Fatal(err)
@@ -112,8 +112,11 @@ func TestDecodeJPEGXLUnsupportedPixelRepresentationNamesCondition(t *testing.T) 
 	if !errors.Is(err, ErrUnsupportedMetadata) {
 		t.Fatalf("DecodeFrames() error = %v, want ErrUnsupportedMetadata", err)
 	}
-	if !strings.Contains(err.Error(), transfer.JPEGXL.UID) || !strings.Contains(err.Error(), "PixelRepresentation=2") {
-		t.Fatalf("DecodeFrames() error = %q, want syntax and unsupported condition", err)
+	if !strings.Contains(err.Error(), transfer.JPEGXL.UID) {
+		t.Fatalf("DecodeFrames() error = %q, want transfer syntax context", err)
+	}
+	if strings.Contains(err.Error(), "PixelRepresentation=2") {
+		t.Fatalf("DecodeFrames() error = %q, leaked redacted codec detail", err)
 	}
 }
 

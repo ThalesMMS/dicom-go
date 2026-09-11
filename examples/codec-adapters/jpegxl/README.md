@@ -8,6 +8,12 @@ The backend is enabled with the `jpegxl_djxl` build tag and calls the `djxl`
 command from the `libjxl` project at runtime. Without that tag, the adapter
 still builds but `NewDjxlDecoder()` returns `ErrDjxlUnavailable` from decode.
 
+When Twin (or another session owner) starts `jpegxl-helper`, decode uses a
+persistent libjxl worker over private versioned stdio (`JXLH` v1). The helper
+is opt-in, owned by the session, and falls back to `djxl` on crash, protocol
+failure, or memory-admission denial. Pipe/spawn-per-frame is not this backend.
+`Register()` keeps the CLI decoder so existing callers are unchanged.
+
 Supported boundaries:
 
 - registers only the DICOM JPEG XL still-image transfer syntax UIDs:
@@ -18,8 +24,16 @@ Supported boundaries:
 - validates common unsigned monochrome/RGB 8-bit and 16-bit DICOM pixel
   metadata before decode;
 - converts `djxl` PGM/PPM output to native DICOM little-endian frame bytes;
+- optionally decodes through a session-owned `jpegxl-helper` process using the
+  public libjxl C API, with request IDs, size limits, and CLI fallback;
 - returns typed errors for unavailable `djxl`, unsupported metadata,
-  unsupported fragment layouts, size mismatches, and malformed codestreams.
+  unsupported fragment layouts, size mismatches, and malformed codestreams;
+- propagates caller cancellation into `djxl`. A canceled or expired context is
+  returned as `context.Canceled` / `context.DeadlineExceeded` and is never
+  classified as a malformed codestream. Cancel before admission does not start a
+  process. An in-flight process is killed, waited on, and its temp directory is
+  removed. On Unix the process group is killed so descendants cannot leak; on
+  Windows `WaitDelay` still reaps the launched process.
 
 ## Runtime setup
 
@@ -67,8 +81,10 @@ non-executable, or cannot be launched, decoding also returns
 
 The adapter code follows the `dicom-go` repository license. `libjxl` is the JPEG
 XL reference implementation and is BSD-3-Clause with an upstream patent grant.
-This module invokes `djxl` as a runtime executable; it does not link or vendor
-`libjxl`, and the base `dicom-go` module does not import this adapter.
+This module invokes `djxl` as a runtime executable and may spawn an optional
+`jpegxl-helper` worker that links `libjxl` out of process. It does not link
+`libjxl` into the Go process, and the base `dicom-go` module does not import
+this adapter.
 
 ## Unsupported behavior
 
@@ -97,7 +113,7 @@ Run the full local JPEG XL fixture corpus when `../JPEGXL-Fixture` is available:
 DICOMGO_JPEGXL_FULL=1 CGO_ENABLED=0 go test -tags jpegxl_djxl ./...
 ```
 
-From the `dicom-go-dev` root:
+From the `dicom-go` root:
 
 ```sh
 make codec-jpegxl-djxl-check

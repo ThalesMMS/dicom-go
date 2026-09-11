@@ -8,6 +8,7 @@ package jpegxladapter
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -24,12 +25,22 @@ var (
 	ErrUnsupportedFragmentLayout = errors.New("jpegxladapter: unsupported JPEG XL fragment layout")
 	ErrImageSizeMismatch         = errors.New("jpegxladapter: decoded image size does not match metadata")
 	ErrMalformedCodestream       = errors.New("jpegxladapter: malformed JPEG XL codestream")
+	ErrDecoderTimeout            = errors.New("jpegxladapter: decoder timed out")
 )
 
 // Decoder decodes one JPEG XL codestream payload into native frame bytes
 // matching the supplied DICOM pixel metadata.
 type Decoder interface {
+	// DecodeFrame receives a borrowed, read-only compressed payload. It must not
+	// retain or mutate fragment after returning. The adapter defensively owns the
+	// decoded result before publishing it through pixeldata.Frames.
 	DecodeFrame(fragment []byte, metadata pixeldata.Metadata) ([]byte, error)
+}
+
+// ContextDecoder is an optional Decoder extension that honors caller
+// cancellation while decoding one frame.
+type ContextDecoder interface {
+	DecodeFrameContext(ctx context.Context, fragment []byte, metadata pixeldata.Metadata) ([]byte, error)
 }
 
 // Codec decodes JPEG XL encapsulated still-image pixel data.
@@ -52,10 +63,16 @@ func NewWithDecoder(decoder Decoder) *Codec {
 
 // Register registers supported JPEG XL transfer syntaxes in registry.
 func Register(registry pixeldata.Registry) error {
+	return RegisterWithDecoder(registry, NewDjxlDecoder())
+}
+
+// RegisterWithDecoder registers supported JPEG XL transfer syntaxes using
+// decoder. Callers that own a helper session pass session.Decoder().
+func RegisterWithDecoder(registry pixeldata.Registry, decoder Decoder) error {
 	if registry == nil {
 		return pixeldata.ErrCodecRegistryNil
 	}
-	codec := New()
+	codec := NewWithDecoder(decoder)
 	for _, uid := range supportedUIDs() {
 		if err := registry.RegisterCodec(uid, codec); err != nil {
 			return err
@@ -75,6 +92,20 @@ func RegisterDefault() error {
 
 // Decode decodes supported JPEG XL encapsulated still-image frames.
 func (c *Codec) Decode(pixel pixeldata.PixelData, obj *object.Object) (pixeldata.Frames, error) {
+	return c.DecodeContext(context.Background(), pixel, obj)
+}
+
+// DecodeContext decodes JPEG XL frames while honoring ctx. Cancelation or a
+// deadline is returned as the context error and is not classified as a
+// malformed codestream. Frames are published only after the full decode
+// completes with a still-active context.
+func (c *Codec) DecodeContext(ctx context.Context, pixel pixeldata.PixelData, obj *object.Object) (pixeldata.Frames, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return pixeldata.Frames{}, err
+	}
 	if !pixel.Encapsulated {
 		return pixeldata.Frames{}, fmt.Errorf("%w: JPEG XL requires encapsulated pixel data", pixeldata.ErrIncompatiblePixelData)
 	}
@@ -97,8 +128,14 @@ func (c *Codec) Decode(pixel pixeldata.PixelData, obj *object.Object) (pixeldata
 
 	frames := make([][]byte, len(payloads))
 	for i, payload := range payloads {
-		decoded, err := c.decoder.DecodeFrame(payload, metadata)
+		if err := ctx.Err(); err != nil {
+			return pixeldata.Frames{}, err
+		}
+		decoded, err := c.decodeFrame(ctx, payload, metadata)
 		if err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return pixeldata.Frames{}, err
+			}
 			if errors.Is(err, ErrDjxlUnavailable) {
 				if err != ErrDjxlUnavailable {
 					return pixeldata.Frames{}, fmt.Errorf("%w: frame %d: %w", ErrDjxlUnavailable, i, err)
@@ -109,10 +146,14 @@ func (c *Codec) Decode(pixel pixeldata.PixelData, obj *object.Object) (pixeldata
 				errors.Is(err, ErrUnsupportedMetadata) ||
 				errors.Is(err, pixeldata.ErrUnsupportedPhotometricInterpretation) ||
 				errors.Is(err, pixeldata.ErrUnsupportedPlanarConfiguration) ||
-				errors.Is(err, ErrImageSizeMismatch) {
+				errors.Is(err, ErrImageSizeMismatch) ||
+				errors.Is(err, ErrDecoderTimeout) {
 				return pixeldata.Frames{}, fmt.Errorf("frame %d: %w", i, err)
 			}
 			return pixeldata.Frames{}, fmt.Errorf("%w: frame %d: %w", ErrMalformedCodestream, i, err)
+		}
+		if err := ctx.Err(); err != nil {
+			return pixeldata.Frames{}, err
 		}
 		if got, want := int64(len(decoded)), decodedFrameSize(metadata); got != want {
 			return pixeldata.Frames{}, fmt.Errorf(
@@ -126,11 +167,24 @@ func (c *Codec) Decode(pixel pixeldata.PixelData, obj *object.Object) (pixeldata
 		frames[i] = append([]byte(nil), decoded...)
 	}
 
+	if err := ctx.Err(); err != nil {
+		return pixeldata.Frames{}, err
+	}
 	return pixeldata.Frames{
 		Rows:    int(metadata.Rows),
 		Columns: int(metadata.Columns),
 		Data:    frames,
 	}, nil
+}
+
+func (c *Codec) decodeFrame(ctx context.Context, payload []byte, metadata pixeldata.Metadata) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if ctxDec, ok := c.decoder.(ContextDecoder); ok {
+		return ctxDec.DecodeFrameContext(ctx, payload, metadata)
+	}
+	return c.decoder.DecodeFrame(payload, metadata)
 }
 
 func decodedFrameSize(metadata pixeldata.Metadata) int64 {
@@ -218,11 +272,7 @@ func framePayloads(pixel pixeldata.PixelData, numberOfFrames int) ([][]byte, err
 		return nil, fmt.Errorf("%w: no JPEG XL frame fragments", ErrUnsupportedFragmentLayout)
 	}
 	if len(fragments) == numberOfFrames {
-		payloads := make([][]byte, len(fragments))
-		for i := range fragments {
-			payloads[i] = append([]byte(nil), fragments[i]...)
-		}
-		return payloads, nil
+		return fragments, nil
 	}
 	if numberOfFrames == 1 {
 		return [][]byte{bytes.Join(fragments, nil)}, nil

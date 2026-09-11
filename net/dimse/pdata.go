@@ -128,6 +128,9 @@ type PDataReader struct {
 	expectedType  *bool
 	buf           []byte
 	bufOffset     int
+	fragments     [][]byte
+	fragmentIndex int
+	fragmentBytes int
 	lastReceived  bool
 	receivedBytes int
 }
@@ -161,22 +164,40 @@ func (r *PDataReader) Read(p []byte) (int, error) {
 		r.resetConsumedBuffer()
 		return 0, io.EOF
 	}
-	n := copy(p, r.buf[r.bufOffset:])
-	r.bufOffset += n
-	if r.bufOffset == len(r.buf) {
+	n := 0
+	for n < len(p) && r.bufferedLen() > 0 {
 		r.resetConsumedBuffer()
+		copied := copy(p[n:], r.buf[r.bufOffset:])
+		r.bufOffset += copied
+		n += copied
 	}
+	r.resetConsumedBuffer()
 	return n, nil
 }
 
 func (r *PDataReader) bufferedLen() int {
-	return len(r.buf) - r.bufOffset
+	return len(r.buf) - r.bufOffset + r.fragmentBytes
 }
 
 func (r *PDataReader) resetConsumedBuffer() {
-	if r.bufOffset == len(r.buf) {
-		r.buf = r.buf[:0]
-		r.bufOffset = 0
+	if r.bufOffset != len(r.buf) {
+		return
+	}
+	r.buf = nil
+	r.bufOffset = 0
+	for r.fragmentIndex < len(r.fragments) {
+		fragment := r.fragments[r.fragmentIndex]
+		r.fragments[r.fragmentIndex] = nil
+		r.fragmentIndex++
+		r.fragmentBytes -= len(fragment)
+		if len(fragment) > 0 {
+			r.buf = fragment
+			break
+		}
+	}
+	if r.fragmentIndex == len(r.fragments) {
+		r.fragments = nil
+		r.fragmentIndex = 0
 	}
 }
 
@@ -218,13 +239,27 @@ func (r *PDataReader) consumePDataValues(values []ul.PDataValue) error {
 			return fmt.Errorf("dicom dimse: P-DATA byte count overflow")
 		}
 		r.receivedBytes += len(value.Data)
-		r.buf = append(r.buf, value.Data...)
+		r.appendFragment(value.Data)
 		if value.IsLast {
 			r.lastReceived = true
 			return storePDataCarryoverWithContext(r.ctx, r.assoc, values[i+1:])
 		}
 	}
 	return nil
+}
+
+func (r *PDataReader) appendFragment(fragment []byte) {
+	if len(fragment) == 0 {
+		return
+	}
+	// UL owns each decoded PDV byte slice. Retain it until the consumer advances
+	// instead of copying the same payload into a second staging buffer.
+	if len(r.buf) == 0 && r.bufOffset == 0 && r.fragmentBytes == 0 {
+		r.buf = fragment
+		return
+	}
+	r.fragments = append(r.fragments, fragment)
+	r.fragmentBytes += len(fragment)
 }
 
 func appendCommandSetFragment(buf []byte, fragment []byte) ([]byte, error) {

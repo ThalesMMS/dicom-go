@@ -25,7 +25,7 @@ func EncodeCommandSet(elements []core.Element) ([]byte, error) {
 	if err := object.WriteDataSet(&command, obj, transfer.ImplicitVRLittleEndian); err != nil {
 		return nil, fmt.Errorf("dicom dimse: encode command set: %w", err)
 	}
-	if command.Len() > math.MaxUint32 {
+	if uint64(command.Len()) > math.MaxUint32 {
 		return nil, fmt.Errorf("dicom dimse: command group length %d exceeds uint32", command.Len())
 	}
 

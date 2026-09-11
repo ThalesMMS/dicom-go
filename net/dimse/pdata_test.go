@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"runtime"
 	"testing"
 	"time"
 
@@ -203,6 +204,69 @@ func BenchmarkPDataReaderByteAtATime(b *testing.B) {
 	}
 }
 
+func BenchmarkPDataReaderMultiPDVCStore32MiB(b *testing.B) {
+	benchmarkPDataReaderMultiPDVCStore(b, 32<<20)
+}
+
+func BenchmarkPDataReaderMultiPDVCStore256MiB(b *testing.B) {
+	benchmarkPDataReaderMultiPDVCStore(b, 256<<20)
+}
+
+var benchmarkPDataReaderBytes int
+
+func benchmarkPDataReaderMultiPDVCStore(b *testing.B, payloadBytes int) {
+	b.Helper()
+	const fragmentBytes = 64 << 10
+	fragment := bytes.Repeat([]byte{0xa5}, fragmentBytes)
+	fragmentCount := payloadBytes / fragmentBytes
+	values := make([]ul.PDataValue, fragmentCount)
+	for index := range values {
+		values[index] = ul.PDataValue{
+			PresentationContextID: 1,
+			IsCommand:             false,
+			IsLast:                index == len(values)-1,
+			Data:                  fragment,
+		}
+	}
+	consumerBuffer := make([]byte, 32<<10)
+	b.ReportAllocs()
+	b.SetBytes(int64(payloadBytes))
+	var peakHeapBytes uint64
+	b.ResetTimer()
+	for iteration := 0; iteration < b.N; iteration++ {
+		b.StopTimer()
+		runtime.GC()
+		var before runtime.MemStats
+		runtime.ReadMemStats(&before)
+		reader := newTypedPDataReader(nil, 1, false)
+		consumed := 0
+		b.StartTimer()
+		for index := range values {
+			if err := reader.consumePDataValues(values[index : index+1]); err != nil {
+				b.Fatal(err)
+			}
+			for reader.bufferedLen() > 0 {
+				n, err := reader.Read(consumerBuffer)
+				if err != nil {
+					b.Fatal(err)
+				}
+				consumed += n
+			}
+		}
+		b.StopTimer()
+		var after runtime.MemStats
+		runtime.ReadMemStats(&after)
+		if after.HeapAlloc > before.HeapAlloc {
+			peakHeapBytes = max(peakHeapBytes, after.HeapAlloc-before.HeapAlloc)
+		}
+		if consumed != payloadBytes || reader.receivedBytes != payloadBytes {
+			b.Fatalf("consumed/received = %d/%d, want %d", consumed, reader.receivedBytes, payloadBytes)
+		}
+		benchmarkPDataReaderBytes = consumed
+	}
+	b.ReportMetric(float64(peakHeapBytes), "peak_heap_B")
+}
+
 func TestPDataReaderAdvancesOffsetWithoutShiftingResidualBuffer(t *testing.T) {
 	reader := &PDataReader{buf: []byte("abcdef"), lastReceived: true}
 	out := make([]byte, 2)
@@ -221,6 +285,55 @@ func TestPDataReaderAdvancesOffsetWithoutShiftingResidualBuffer(t *testing.T) {
 	if len(reader.buf) != 0 || reader.bufOffset != 0 {
 		t.Fatalf("reader did not reset consumed buffer: len=%d offset=%d", len(reader.buf), reader.bufOffset)
 	}
+}
+
+func FuzzPDataReaderArbitraryReadSizes(f *testing.F) {
+	f.Add([]byte("command-and-dataset-fragments"), uint8(5), uint8(3))
+	f.Add([]byte{}, uint8(1), uint8(1))
+	f.Add(bytes.Repeat([]byte{0xa5}, 1024), uint8(63), uint8(31))
+	f.Fuzz(func(t *testing.T, payload []byte, fragmentSeed, readSeed uint8) {
+		if len(payload) > 64<<10 {
+			t.Skip()
+		}
+		fragmentSize := int(fragmentSeed%63) + 1
+		values := make([]ul.PDataValue, 0, max(1, (len(payload)+fragmentSize-1)/fragmentSize))
+		for offset := 0; offset < len(payload); {
+			end := min(len(payload), offset+fragmentSize)
+			values = append(values, ul.PDataValue{
+				PresentationContextID: 1,
+				IsCommand:             false,
+				Data:                  payload[offset:end],
+			})
+			offset = end
+		}
+		if len(values) == 0 {
+			values = append(values, ul.PDataValue{PresentationContextID: 1, IsCommand: false})
+		}
+		values[len(values)-1].IsLast = true
+
+		reader := newTypedPDataReader(nil, 1, false)
+		if err := reader.consumePDataValues(values); err != nil {
+			t.Fatalf("consumePDataValues() error = %v", err)
+		}
+		readBuffer := make([]byte, int(readSeed%31)+1)
+		var got bytes.Buffer
+		for {
+			n, err := reader.Read(readBuffer)
+			got.Write(readBuffer[:n])
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			if err != nil {
+				t.Fatalf("Read() error = %v", err)
+			}
+			if n == 0 {
+				t.Fatal("Read() returned no bytes without EOF")
+			}
+		}
+		if !bytes.Equal(got.Bytes(), payload) {
+			t.Fatalf("reassembled %d bytes, want %d", got.Len(), len(payload))
+		}
+	})
 }
 
 type pDataDiscardConn struct{}

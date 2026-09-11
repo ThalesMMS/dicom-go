@@ -76,7 +76,59 @@ func TestVerifyCEchoWithLocalSCP(t *testing.T) {
 	}
 }
 
-func TestPositiveElapsed(t *testing.T) {
+func TestVerifyCEchoUsesDeterministicClock(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	listener, err := ul.Listen(ul.ListenOptions{Address: "127.0.0.1:0", Context: ctx})
+	if err != nil {
+		t.Fatalf("Listen() error = %v", err)
+	}
+	defer closeOrFail(t, "listener", listener)
+
+	serverDone := make(chan error, 1)
+	go func() {
+		assoc, pc, err := acceptVerificationAssociation(ctx, listener)
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		defer closeOrFail(t, "server association", assoc)
+
+		messageID, err := ReceiveCEcho(assoc, pc.ID)
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		if err := SendCEchoResponse(assoc, pc.ID, messageID, StatusSuccess); err != nil {
+			serverDone <- err
+			return
+		}
+		serverDone <- respondToRelease(assoc)
+	}()
+
+	started := time.Date(2026, time.August, 24, 12, 0, 0, 0, time.FixedZone("test", -3*60*60))
+	clock := sequenceClock(t, started, started.Add(25*time.Millisecond))
+	result, err := verifyCEcho(ctx, CEchoVerificationOptions{
+		Address:        listener.Addr().String(),
+		CalledAETitle:  "ECHOSCP",
+		CallingAETitle: "ECHOSCU",
+	}, clock)
+	if err != nil {
+		t.Fatalf("verifyCEcho() error = %v", err)
+	}
+	if result.StartedAt != started.UTC() {
+		t.Fatalf("StartedAt = %s, want %s", result.StartedAt, started.UTC())
+	}
+	if result.Duration != 25*time.Millisecond {
+		t.Fatalf("Duration = %s, want 25ms", result.Duration)
+	}
+	if err := <-serverDone; err != nil {
+		t.Fatalf("server error = %v", err)
+	}
+}
+
+func TestElapsedTimer(t *testing.T) {
 	started := time.Unix(100, 0)
 	tests := []struct {
 		name     string
@@ -89,8 +141,55 @@ func TestPositiveElapsed(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := positiveElapsed(started, tt.finished); got != tt.want {
-				t.Fatalf("positiveElapsed() = %s, want %s", got, tt.want)
+			timer := startElapsedTimer(sequenceClock(t, started, tt.finished))
+			if got := timer.elapsed(); got != tt.want {
+				t.Fatalf("elapsed() = %s, want %s", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestVerifyCEchoCanceledOrTimedOutHasNoSuccessDuration(t *testing.T) {
+	tests := []struct {
+		name    string
+		context func() context.Context
+		wantErr error
+	}{
+		{
+			name: "canceled",
+			context: func() context.Context {
+				ctx, cancel := context.WithCancel(context.Background())
+				cancel()
+				return ctx
+			},
+			wantErr: context.Canceled,
+		},
+		{
+			name: "timed out",
+			context: func() context.Context {
+				ctx, cancel := context.WithDeadline(context.Background(), time.Unix(1, 0))
+				t.Cleanup(cancel)
+				return ctx
+			},
+			wantErr: ul.ErrAssociationTimeout,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			started := time.Unix(100, 0)
+			result, err := verifyCEcho(tt.context(), CEchoVerificationOptions{
+				Address:        "127.0.0.1:1",
+				CalledAETitle:  "ECHOSCP",
+				CallingAETitle: "ECHOSCU",
+			}, sequenceClock(t, started))
+			if !errors.Is(err, ErrCEchoAssociation) || !errors.Is(err, tt.wantErr) {
+				t.Fatalf("verifyCEcho() error = %v, want ErrCEchoAssociation and %v", err, tt.wantErr)
+			}
+			if result.Duration != 0 {
+				t.Fatalf("Duration = %s, want zero for failed verification", result.Duration)
+			}
+			if result.StartedAt != started.UTC() {
+				t.Fatalf("StartedAt = %s, want %s", result.StartedAt, started.UTC())
 			}
 		})
 	}
@@ -311,4 +410,18 @@ func respondToRelease(assoc *ul.Association) error {
 		return errors.New("server expected A-RELEASE-RQ")
 	}
 	return assoc.WritePDU(&ul.ReleaseRP{})
+}
+
+func sequenceClock(t testing.TB, values ...time.Time) func() time.Time {
+	t.Helper()
+	next := 0
+	return func() time.Time {
+		t.Helper()
+		if next >= len(values) {
+			t.Fatalf("clock called %d times, only %d values provided", next+1, len(values))
+		}
+		value := values[next]
+		next++
+		return value
+	}
 }

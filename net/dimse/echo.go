@@ -32,7 +32,7 @@ func SendCommandSet(assoc *ul.Association, pcID byte, elements []core.Element) e
 // SendCommandSetWithContext encodes and sends one command set while making all
 // fragmented P-DATA writes observe ctx.
 func SendCommandSetWithContext(ctx context.Context, assoc *ul.Association, pcID byte, elements []core.Element) error {
-	started := time.Now()
+	timer := startElapsedTimer(time.Now)
 	ctx = commandWriteContext(ctx)
 	data, err := EncodeCommandSet(elements)
 	if err != nil {
@@ -45,7 +45,7 @@ func SendCommandSetWithContext(ctx context.Context, assoc *ul.Association, pcID 
 	if err := writer.Finish(); err != nil {
 		return err
 	}
-	observeCommand(assoc, telemetry.Outbound, pcID, object.FromElements(elements, nil), time.Since(started))
+	observeCommand(assoc, telemetry.Outbound, pcID, object.FromElements(elements, nil), timer.elapsed())
 	return nil
 }
 

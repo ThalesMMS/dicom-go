@@ -36,7 +36,8 @@ type CEchoVerificationResult struct {
 	PresentationContext ul.AcceptedContext
 	// Duration covers association setup, the C-ECHO exchange, and association
 	// release. Successful operations shorter than the platform clock resolution
-	// are reported as one nanosecond instead of zero.
+	// are reported as one nanosecond instead of zero. Failed operations return a
+	// zero duration together with the error that identifies the failed phase.
 	Duration  time.Duration
 	StartedAt time.Time
 }
@@ -45,11 +46,15 @@ type CEchoVerificationResult struct {
 // releases the association. It returns structured errors for association,
 // presentation-context, request, and release failures.
 func VerifyCEcho(ctx context.Context, opts CEchoVerificationOptions) (CEchoVerificationResult, error) {
+	return verifyCEcho(ctx, opts, time.Now)
+}
+
+func verifyCEcho(ctx context.Context, opts CEchoVerificationOptions, now func() time.Time) (CEchoVerificationResult, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	started := time.Now()
-	result := CEchoVerificationResult{StartedAt: started.UTC()}
+	timer := startElapsedTimer(now)
+	result := CEchoVerificationResult{StartedAt: timer.started.UTC()}
 	if opts.Address == "" {
 		return result, fmt.Errorf("%w: address is required", ErrCEchoAssociation)
 	}
@@ -87,7 +92,7 @@ func VerifyCEcho(ctx context.Context, opts CEchoVerificationOptions) (CEchoVerif
 
 	pc, ok := AcceptedVerificationContext(assoc)
 	if !ok {
-		return result, fmt.Errorf("%w: %s", ErrCEchoNoAcceptedPresentationContext, opts.Address)
+		return result, fmt.Errorf("%w: %w", ErrCEchoNoAcceptedPresentationContext, ExplainMissingPresentationContext(assoc, VerificationSOPClassUID))
 	}
 	result.PresentationContext = pc
 
@@ -103,15 +108,8 @@ func VerifyCEcho(ctx context.Context, opts CEchoVerificationOptions) (CEchoVerif
 		return result, fmt.Errorf("%w: release association with %s: %w", ErrCEchoRelease, opts.Address, err)
 	}
 	released = true
-	result.Duration = positiveElapsed(started, time.Now())
+	result.Duration = timer.elapsed()
 	return result, nil
-}
-
-func positiveElapsed(started, finished time.Time) time.Duration {
-	if elapsed := finished.Sub(started); elapsed > 0 {
-		return elapsed
-	}
-	return time.Nanosecond
 }
 
 func verificationTransferSyntaxes(transferSyntaxUIDs []string) []string {

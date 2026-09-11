@@ -20,7 +20,7 @@ func WritePDU(w io.Writer, pdu PDU) error {
 	if err != nil {
 		return err
 	}
-	if body.Len() > math.MaxUint32 {
+	if uint64(body.Len()) > math.MaxUint32 {
 		return fmt.Errorf("%w: PDU body length %d exceeds uint32", ErrLengthOverflow, body.Len())
 	}
 
@@ -471,10 +471,10 @@ func writePDataTF(buf *bytes.Buffer, pdata *PDataTF) error {
 		if !validPresentationContextID(value.PresentationContextID) {
 			return fmt.Errorf("%w: %d", ErrInvalidPCID, value.PresentationContextID)
 		}
-		if len(value.Data) > math.MaxUint32-2 {
+		if uint64(len(value.Data)) > math.MaxUint32-2 {
 			return fmt.Errorf("%w: P-DATA value length %d exceeds uint32", ErrLengthOverflow, len(value.Data))
 		}
-		if err := enc.WriteU32(buf, uint32(len(value.Data)+2)); err != nil {
+		if err := enc.WriteU32(buf, uint32(len(value.Data))+2); err != nil {
 			return err
 		}
 		buf.WriteByte(value.PresentationContextID)

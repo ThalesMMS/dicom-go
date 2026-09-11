@@ -148,6 +148,9 @@ func compatibleRegion(frame FrameCalibration, points []image.Point, unitsX, unit
 			}
 		}
 		if containsAll {
+			if !validRegionCalibration(region) {
+				return Region{}, fmt.Errorf("%w: region %d", ErrInvalidCalibration, region.Index)
+			}
 			if candidateCount == 0 {
 				candidate = region
 			} else if !sameScaling(candidate, region, absoluteAxes) {

@@ -39,10 +39,11 @@ var (
 )
 
 var (
-	ErrUncalibrated     = errors.New("dicom/ultrasound: no compatible calibration")
-	ErrCrossRegion      = errors.New("dicom/ultrasound: measurement crosses incompatible regions")
-	ErrAmbiguousRegion  = errors.New("dicom/ultrasound: overlapping calibrations are ambiguous")
-	ErrUnsupportedUnits = errors.New("dicom/ultrasound: unsupported physical units")
+	ErrUncalibrated       = errors.New("dicom/ultrasound: no compatible calibration")
+	ErrCrossRegion        = errors.New("dicom/ultrasound: measurement crosses incompatible regions")
+	ErrAmbiguousRegion    = errors.New("dicom/ultrasound: overlapping calibrations are ambiguous")
+	ErrUnsupportedUnits   = errors.New("dicom/ultrasound: unsupported physical units")
+	ErrInvalidCalibration = errors.New("dicom/ultrasound: invalid region calibration")
 )
 
 // SpatialFormat is Region Spatial Format (0018,6012).

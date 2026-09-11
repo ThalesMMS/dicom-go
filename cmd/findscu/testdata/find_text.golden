@@ -1,0 +1,6 @@
+Information model=study-root
+(0010,0010) PN         8 PatientName                      Doe^Jane
+(0010,0020) LO         6 PatientID                        P-738
+(0011,1010) OB         4                                  01 02 03 04
+
+Final status=0x0000

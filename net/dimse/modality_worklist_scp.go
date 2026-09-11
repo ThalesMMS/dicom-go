@@ -407,7 +407,7 @@ func (writer *modalityWorklistLimitWriter) Write(value []byte) (int, error) {
 var _ io.Writer = (*modalityWorklistLimitWriter)(nil)
 
 func modalityWorklistHasMatchingKey(query ModalityWorklistQuery) bool {
-	keys := []MWLKey{query.PatientName, query.PatientID, query.AccessionNumber, query.RequestedProcedureID, query.RequestedProcedureDescription}
+	keys := []MWLKey{query.PatientName, query.PatientID, query.PatientBirthDate, query.PatientSex, query.AccessionNumber, query.RequestedProcedureID, query.RequestedProcedureDescription}
 	if query.ScheduledProcedureStep != nil {
 		step := query.ScheduledProcedureStep
 		keys = append(keys,

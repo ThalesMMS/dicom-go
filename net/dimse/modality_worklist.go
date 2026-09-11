@@ -31,6 +31,8 @@ var (
 	tagMWLModality                          = core.NewTag(0x0008, 0x0060)
 	tagMWLPatientName                       = core.NewTag(0x0010, 0x0010)
 	tagMWLPatientID                         = core.NewTag(0x0010, 0x0020)
+	tagMWLPatientBirthDate                  = core.NewTag(0x0010, 0x0030)
+	tagMWLPatientSex                        = core.NewTag(0x0010, 0x0040)
 	tagMWLRequestedProcedureDescription     = core.NewTag(0x0032, 0x1060)
 	tagMWLScheduledStationAETitle           = core.NewTag(0x0040, 0x0001)
 	tagMWLScheduledProcedureStepStartDate   = core.NewTag(0x0040, 0x0002)
@@ -86,6 +88,8 @@ type ModalityWorklistQuery struct {
 	TimezoneOffsetFromUTC         string
 	PatientName                   MWLKey
 	PatientID                     MWLKey
+	PatientBirthDate              MWLKey
+	PatientSex                    MWLKey
 	AccessionNumber               MWLKey
 	RequestedProcedureID          MWLKey
 	RequestedProcedureDescription MWLKey
@@ -127,6 +131,14 @@ func BuildModalityWorklistIdentifier(query ModalityWorklistQuery) (*object.Objec
 		return nil, err
 	}
 	elements, err = appendMWLKey(elements, tagMWLPatientID, core.VRLO, query.PatientID, false, mwlMatchSingle)
+	if err != nil {
+		return nil, err
+	}
+	elements, err = appendMWLKey(elements, tagMWLPatientBirthDate, core.VRDA, query.PatientBirthDate, false, mwlMatchDateRange)
+	if err != nil {
+		return nil, err
+	}
+	elements, err = appendMWLKey(elements, tagMWLPatientSex, core.VRCS, query.PatientSex, false, mwlMatchSingle)
 	if err != nil {
 		return nil, err
 	}
@@ -297,6 +309,8 @@ func MatchModalityWorklist(query ModalityWorklistQuery, candidate *object.Object
 	}{
 		{query.PatientName, tagMWLPatientName, mwlMatchWildcard},
 		{query.PatientID, tagMWLPatientID, mwlMatchSingle},
+		{query.PatientBirthDate, tagMWLPatientBirthDate, mwlMatchDateRange},
+		{query.PatientSex, tagMWLPatientSex, mwlMatchSingle},
 		{query.AccessionNumber, tagMWLAccessionNumber, mwlMatchSingle},
 		{query.RequestedProcedureID, tagMWLRequestedProcedureID, mwlMatchSingle},
 		{query.RequestedProcedureDescription, tagMWLRequestedProcedureDescription, mwlMatchSingle},

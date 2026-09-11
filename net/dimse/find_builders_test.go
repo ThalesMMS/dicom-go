@@ -38,6 +38,21 @@ func TestNewQueryRetrieveLevelElement(t *testing.T) {
 	}
 }
 
+func TestParseQueryRetrieveModel(t *testing.T) {
+	for input, want := range map[string]QueryRetrieveModel{
+		"study-root":   QueryRetrieveModelStudyRoot,
+		"STUDY_ROOT":   QueryRetrieveModelStudyRoot,
+		"patient root": QueryRetrieveModelPatientRoot,
+	} {
+		if got, err := ParseQueryRetrieveModel(input); err != nil || got != want {
+			t.Fatalf("ParseQueryRetrieveModel(%q) = %q, %v; want %q", input, got, err, want)
+		}
+	}
+	if _, err := ParseQueryRetrieveModel("retired"); err == nil {
+		t.Fatal("ParseQueryRetrieveModel(retired) error = nil")
+	}
+}
+
 func TestBuildStudyRootStudyFindKeys(t *testing.T) {
 	elems, err := BuildStudyRootStudyFindKeys(map[string]string{
 		"PatientID":        "P1",
@@ -78,12 +93,23 @@ func TestBuildStudyRootImageFindKeys(t *testing.T) {
 		"SeriesInstanceUID": "4.5.6",
 		"SOPInstanceUID":    "7.8.9",
 		"SOPClassUID":       "1.2.840.10008.5.1.4.1.1.2",
-	}, "InstanceNumber")
+	}, "InstanceNumber", "SOPInstanceUID")
 	if err != nil {
 		t.Fatalf("BuildStudyRootImageFindKeys() error = %v", err)
 	}
 	if got := elems[0].StringValue(); got != QueryRetrieveLevelImage {
 		t.Fatalf("QueryRetrieveLevel = %q, want %q", got, QueryRetrieveLevelImage)
+	}
+	var sopUID string
+	var sopCount int
+	for _, elem := range elems {
+		if elem.Tag() == core.NewTag(0x0008, 0x0018) {
+			sopCount++
+			sopUID = elem.StringValue()
+		}
+	}
+	if sopCount != 1 || sopUID != "7.8.9" {
+		t.Fatalf("SOPInstanceUID copies = %d value = %q, want one matching value", sopCount, sopUID)
 	}
 }
 

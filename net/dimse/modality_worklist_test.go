@@ -59,6 +59,41 @@ func TestBuildModalityWorklistIdentifierPreservesAbsentEmptyAndNestedKeys(t *tes
 	}
 }
 
+func TestModalityWorklistPatientDemographicReturnKeysRoundTrip(t *testing.T) {
+	identifier, err := BuildModalityWorklistIdentifier(ModalityWorklistQuery{
+		PatientName:      MWLReturnKey(),
+		PatientID:        MWLReturnKey(),
+		PatientBirthDate: MWLReturnKey(),
+		PatientSex:       MWLReturnKey(),
+	})
+	if err != nil {
+		t.Fatalf("BuildModalityWorklistIdentifier() error = %v", err)
+	}
+	if value, ok := identifier.GetString(core.NewTag(0x0010, 0x0030)); !ok || value != "" {
+		t.Fatalf("PatientBirthDate = %q, present %t", value, ok)
+	}
+	if value, ok := identifier.GetString(core.NewTag(0x0010, 0x0040)); !ok || value != "" {
+		t.Fatalf("PatientSex = %q, present %t", value, ok)
+	}
+	parsed, err := ParseModalityWorklistIdentifier(identifier)
+	if err != nil {
+		t.Fatalf("ParseModalityWorklistIdentifier() error = %v", err)
+	}
+	if !parsed.Query.PatientBirthDate.Present || !parsed.Query.PatientSex.Present {
+		t.Fatalf("parsed demographic return keys = %+v", parsed.Query)
+	}
+	candidate := object.FromElements([]core.Element{
+		{Header: core.ElementHeader{Tag: tagMWLPatientBirthDate, VR: core.VRDA}, Value: core.StringValue{"19800102"}},
+		{Header: core.ElementHeader{Tag: tagMWLPatientSex, VR: core.VRCS}, Value: core.StringValue{"F"}},
+	}, std.Dictionary)
+	matched, err := MatchModalityWorklist(ModalityWorklistQuery{
+		PatientBirthDate: MWLMatch("19790101-19801231"), PatientSex: MWLMatch("F"),
+	}, candidate)
+	if err != nil || !matched {
+		t.Fatalf("MatchModalityWorklist(demographics) = %t, %v", matched, err)
+	}
+}
+
 func TestParseAndProjectModalityWorklistTimezoneOffset(t *testing.T) {
 	identifier, err := BuildModalityWorklistIdentifier(ModalityWorklistQuery{
 		TimezoneOffsetFromUTC: "+0300",
@@ -946,17 +981,17 @@ func TestProjectModalityWorklistResultValidatesRawTextWithCandidateCharacterSet(
 	}
 	tests := []struct {
 		name          string
-		characterSet  string
+		characterSet  []string
 		encodedPerson []byte
 	}{
-		{name: "latin 1", characterSet: "ISO_IR 100", encodedPerson: []byte{'J', 'o', 's', 0xe9}},
-		{name: "iso 2022 seven bit", characterSet: "ISO 2022 IR 87"},
+		{name: "latin 1", characterSet: []string{"ISO_IR 100"}, encodedPerson: []byte{'J', 'o', 's', 0xe9}},
+		{name: "iso 2022 seven bit", characterSet: []string{"", "ISO 2022 IR 87"}},
 	}
-	charset, err := dicomencoding.ParseCharacterSet(tests[1].characterSet)
+	charset, err := dicomencoding.ParseCharacterSet(tests[1].characterSet...)
 	if err != nil {
 		t.Fatalf("ParseCharacterSet() error = %v", err)
 	}
-	tests[1].encodedPerson, err = charset.EncodePersonName("山田^太郎")
+	tests[1].encodedPerson, err = charset.EncodePersonName("=山田^太郎")
 	if err != nil {
 		t.Fatalf("EncodePersonName() error = %v", err)
 	}
@@ -966,7 +1001,7 @@ func TestProjectModalityWorklistResultValidatesRawTextWithCandidateCharacterSet(
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			candidate := object.FromElements([]core.Element{
-				{Header: core.ElementHeader{Tag: tagMWLSpecificCharacterSet, VR: core.VRCS}, Value: core.StringValue{test.characterSet}},
+				{Header: core.ElementHeader{Tag: tagMWLSpecificCharacterSet, VR: core.VRCS}, Value: core.StringValue(test.characterSet)},
 				{Header: core.ElementHeader{Tag: tagMWLPatientName, VR: core.VRPN}, Value: core.RawValue(test.encodedPerson)},
 			}, std.Dictionary)
 			projected, err := ProjectModalityWorklistResult(parsed, candidate)

@@ -146,6 +146,37 @@ func TestServeStudyRootCFindCanReturnCancelStatus(t *testing.T) {
 	}
 }
 
+func TestServeStudyRootCFindSupportsPerMatchPendingWarning(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	status, serverErr := runStudyRootCFindStatusTest(t, ctx, CFindMatchHandlerFunc(func(context.Context, CFindRequestContext) ([]CFindMatch, error) {
+		return []CFindMatch{{
+			Identifier: studyRootFindMatch("P1", "1.2.3.1"),
+			Status:     StatusPendingWarning,
+		}}, nil
+	}))
+	if status != StatusPendingWarning {
+		t.Fatalf("pending status = 0x%04X, want warning 0x%04X", status, StatusPendingWarning)
+	}
+	if serverErr != nil {
+		t.Fatalf("ServeStudyRootCFind() error = %v", serverErr)
+	}
+}
+
+func TestFindMatchesPreservesLegacyPendingDefault(t *testing.T) {
+	want := studyRootFindMatch("P1", "1.2.3.1")
+	matches, err := findMatches(context.Background(), CFindHandlerFunc(func(context.Context, CFindRequestContext) ([]*object.Object, error) {
+		return []*object.Object{want}, nil
+	}), CFindRequestContext{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 1 || matches[0].Identifier != want || matches[0].Status != StatusPending {
+		t.Fatalf("matches = %#v, want legacy identifier with StatusPending", matches)
+	}
+}
+
 func TestServeStudyRootCFindMapsDeadlineDuringMatchesToUnableToProcess(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()

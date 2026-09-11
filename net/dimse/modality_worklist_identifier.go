@@ -70,6 +70,20 @@ func ParseModalityWorklistIdentifier(identifier *object.Object) (ParsedModalityW
 			}
 			parsed.Query.PatientID = key
 			parsed.requestedTopLevel = append(parsed.requestedTopLevel, tag)
+		case tagMWLPatientBirthDate:
+			key, err := parseMWLKey(identifier, tag, core.VRDA, mwlMatchDateRange)
+			if err != nil {
+				return ParsedModalityWorklistIdentifier{}, err
+			}
+			parsed.Query.PatientBirthDate = key
+			parsed.requestedTopLevel = append(parsed.requestedTopLevel, tag)
+		case tagMWLPatientSex:
+			key, err := parseMWLKey(identifier, tag, core.VRCS, mwlMatchSingle)
+			if err != nil {
+				return ParsedModalityWorklistIdentifier{}, err
+			}
+			parsed.Query.PatientSex = key
+			parsed.requestedTopLevel = append(parsed.requestedTopLevel, tag)
 		case tagMWLAccessionNumber:
 			key, err := parseMWLKey(identifier, tag, core.VRSH, mwlMatchSingle)
 			if err != nil {
@@ -350,11 +364,12 @@ func projectModalityWorklistResultWithLimits(parsed ParsedModalityWorklistIdenti
 			elements = append([]core.Element{cloned}, elements...)
 		}
 	}
-	if modalityWorklistResponseNeedsCharacterSet(elements) {
-		if !characterSetPresent {
-			return nil, fmt.Errorf("%w", ErrModalityWorklistProvider)
-		}
-		cloned, err := budget.cloneElement(characterSet, 0)
+	requiredCharacterSet, required, err := requiredResponseCharacterSet(elements, candidate)
+	if err != nil {
+		return nil, fmt.Errorf("%w", ErrModalityWorklistProvider)
+	}
+	if required {
+		cloned, err := budget.cloneElement(requiredCharacterSet, 0)
 		if err != nil {
 			return nil, err
 		}
@@ -412,41 +427,6 @@ func modalityWorklistResponseContainsTemporalAttribute(elements []core.Element) 
 		if sequence, ok := element.Value.(core.SequenceValue); ok {
 			for _, item := range sequence.Items {
 				if modalityWorklistResponseContainsTemporalAttribute(item.Elements) {
-					return true
-				}
-			}
-		}
-	}
-	return false
-}
-
-func modalityWorklistResponseNeedsCharacterSet(elements []core.Element) bool {
-	for _, element := range elements {
-		if element.Tag() == tagMWLSpecificCharacterSet {
-			continue
-		}
-		switch value := element.Value.(type) {
-		case core.StringValue:
-			for _, text := range value {
-				var err error
-				if element.VR() == core.VRPN {
-					_, err = dicomencoding.DefaultCharacterSet.EncodePersonName(text)
-				} else {
-					_, err = dicomencoding.DefaultCharacterSet.Encode(text)
-				}
-				if err != nil {
-					return true
-				}
-			}
-		case core.RawValue:
-			for _, octet := range value {
-				if octet == 0x1b || octet >= 0x80 {
-					return true
-				}
-			}
-		case core.SequenceValue:
-			for _, item := range value.Items {
-				if modalityWorklistResponseNeedsCharacterSet(item.Elements) {
 					return true
 				}
 			}
@@ -786,6 +766,10 @@ func modalityWorklistResultRule(tag core.Tag) (core.VR, bool, bool) {
 		return core.VRPN, true, true
 	case tagMWLPatientID:
 		return core.VRLO, true, true
+	case tagMWLPatientBirthDate:
+		return core.VRDA, false, true
+	case tagMWLPatientSex:
+		return core.VRCS, false, true
 	case tagMWLAccessionNumber:
 		return core.VRSH, false, true
 	case tagMWLRequestedProcedureID:

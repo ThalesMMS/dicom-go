@@ -118,7 +118,14 @@ func buildFindKeys(level string, keys map[string]string, returnKeys ...string) (
 		return nil, err
 	}
 	elems = append(elems, k...)
-	ret, err := buildReturnKeyElements(returnKeys)
+	filteredReturn := make([]string, 0, len(returnKeys))
+	for _, keyword := range returnKeys {
+		if _, exists := keys[keyword]; exists {
+			continue
+		}
+		filteredReturn = append(filteredReturn, keyword)
+	}
+	ret, err := buildReturnKeyElements(filteredReturn)
 	if err != nil {
 		return nil, err
 	}

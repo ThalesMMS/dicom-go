@@ -38,6 +38,46 @@ func (f CFindHandlerFunc) Find(ctx context.Context, req CFindRequestContext) ([]
 	return f(ctx, req)
 }
 
+// CFindMatch describes one pending C-FIND response. Status may be
+// StatusPending or StatusPendingWarning; zero selects StatusPending.
+type CFindMatch struct {
+	Identifier *object.Object
+	Status     uint16
+}
+
+// CFindMatchHandler is the optional status-aware extension to CFindHandler.
+// ServeAssociation and the model-specific C-FIND servers use FindMatches when
+// the configured handler implements this interface, while existing handlers
+// continue to receive StatusPending responses.
+type CFindMatchHandler interface {
+	CFindHandler
+	FindMatches(context.Context, CFindRequestContext) ([]CFindMatch, error)
+}
+
+// CFindMatchHandlerFunc adapts a status-aware function to both CFindHandler and
+// CFindMatchHandler. Its Find method discards per-match statuses for callers
+// that explicitly use the legacy interface.
+type CFindMatchHandlerFunc func(context.Context, CFindRequestContext) ([]CFindMatch, error)
+
+func (f CFindMatchHandlerFunc) FindMatches(ctx context.Context, req CFindRequestContext) ([]CFindMatch, error) {
+	if f == nil {
+		return nil, fmt.Errorf("dicom dimse: nil C-FIND match handler")
+	}
+	return f(ctx, req)
+}
+
+func (f CFindMatchHandlerFunc) Find(ctx context.Context, req CFindRequestContext) ([]*object.Object, error) {
+	matches, err := f.FindMatches(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	identifiers := make([]*object.Object, len(matches))
+	for i, match := range matches {
+		identifiers[i] = match.Identifier
+	}
+	return identifiers, nil
+}
+
 // CFindSCPError lets handlers choose a final C-FIND status and Error Comment.
 type CFindSCPError struct {
 	Status       uint16
@@ -188,13 +228,14 @@ func serveCFindCommand(ctx context.Context, assoc *ul.Association, pcID byte, co
 	defer monitor.Stop()
 	operationCtx := monitor.Context()
 	_, err = runSCPHandler(operationCtx, assoc, scpControlsFromContext(ctx).CancelGrace, func(handlerCtx context.Context) (struct{}, error) {
-		matches, handlerErr := handler.Find(handlerCtx, CFindRequestContext{
+		requestContext := CFindRequestContext{
 			Request:               *req,
 			Identifier:            identifier,
 			QueryRetrieveLevel:    level,
 			PresentationContextID: pcID,
 			IdentifierSyntax:      syntax,
-		})
+		}
+		matches, handlerErr := findMatches(handlerCtx, handler, requestContext)
 		if handlerErr != nil {
 			return struct{}{}, handlerErr
 		}
@@ -202,8 +243,15 @@ func serveCFindCommand(ctx context.Context, assoc *ul.Association, pcID byte, co
 			if operationErr := monitor.OperationError(); operationErr != nil {
 				return struct{}{}, operationErr
 			}
-			if match == nil {
+			if match.Identifier == nil {
 				return struct{}{}, fmt.Errorf("dicom dimse: C-FIND handler returned nil match")
+			}
+			status := match.Status
+			if status == 0 {
+				status = StatusPending
+			}
+			if status != StatusPending && status != StatusPendingWarning {
+				return struct{}{}, fmt.Errorf("dicom dimse: C-FIND handler returned invalid pending status 0x%04X", status)
 			}
 			// Keep a command+dataset response on the association context so a
 			// C-CANCEL cannot interrupt it between the two wire messages. The
@@ -212,8 +260,8 @@ func serveCFindCommand(ctx context.Context, assoc *ul.Association, pcID byte, co
 				return SendCFindResponseWithContext(responseCtx, assoc, pcID, CFindResponse{
 					AffectedSOPClassUID:       model.SOPClassUID,
 					MessageIDBeingRespondedTo: req.MessageID,
-					Status:                    StatusPending,
-				}, match, syntax)
+					Status:                    status,
+				}, match.Identifier, syntax)
 			}); sendErr != nil {
 				return struct{}{}, sendErr
 			}
@@ -227,6 +275,21 @@ func serveCFindCommand(ctx context.Context, assoc *ul.Association, pcID byte, co
 		return sendCFindOperationError(operationCtx, assoc, pcID, *req, model.SOPClassUID, syntax, err)
 	}
 	return sendCFindFinal(ctx, assoc, pcID, *req, model.SOPClassUID, StatusSuccess, "", syntax)
+}
+
+func findMatches(ctx context.Context, handler CFindHandler, req CFindRequestContext) ([]CFindMatch, error) {
+	if statusAware, ok := handler.(CFindMatchHandler); ok {
+		return statusAware.FindMatches(ctx, req)
+	}
+	identifiers, err := handler.Find(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	matches := make([]CFindMatch, len(identifiers))
+	for i, identifier := range identifiers {
+		matches[i] = CFindMatch{Identifier: identifier, Status: StatusPending}
+	}
+	return matches, nil
 }
 
 func sendCFindOperationError(ctx context.Context, assoc *ul.Association, pcID byte, req CFindRequest, sopClassUID string, syntax transfer.Syntax, err error) error {

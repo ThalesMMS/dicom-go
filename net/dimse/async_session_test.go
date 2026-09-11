@@ -1,12 +1,15 @@
 package dimse
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -173,7 +176,7 @@ func TestAsyncSessionMessageIDWrapSkipsZero(t *testing.T) {
 		return session.Respond(ctx, message, (CEchoResponse{Status: StatusSuccess}).CommandSet(), nil)
 	})
 	client.mu.Lock()
-	client.nextMessageID = 65535
+	client.registry.nextMessageID = 65535
 	client.mu.Unlock()
 	first, err := client.StartCEcho(context.Background())
 	if err != nil {
@@ -510,27 +513,26 @@ func TestAsyncSessionStressSlowPeerRespectsWindow(t *testing.T) {
 
 func TestAsyncSessionStartedTerminalWriteBackpressuresFiniteWindow(t *testing.T) {
 	session := &AsyncSession{
-		incoming:       make(map[uint16]asyncIncomingOperation),
 		performedSlots: make(chan struct{}, 1),
-		stateChanged:   make(chan struct{}),
+		registry:       newAsyncOperationRegistry(),
 		done:           make(chan struct{}),
 	}
 	session.performedSlots <- struct{}{}
-	session.incoming[1] = asyncIncomingOperation{
+	session.registry.incoming[1] = asyncIncomingOperation{
 		requestField: CEchoRQ,
 		finishing:    true,
 		generation:   1,
 		slotHeld:     true,
 	}
-	session.metrics.ActivePerformed = 1
+	session.registry.metrics.ActivePerformed = 1
 
 	if session.acquirePerformedSlotForRequest() {
 		t.Fatal("terminal waiting for the writer gate excused a finite-window violation")
 	}
 	session.mu.Lock()
-	current := session.incoming[1]
+	current := session.registry.incoming[1]
 	current.writeStarted = true
-	session.incoming[1] = current
+	session.registry.incoming[1] = current
 	session.signalStateChangedLocked()
 	session.mu.Unlock()
 
@@ -560,21 +562,19 @@ func TestAsyncSessionReleaseWaitIncludesBackpressuredIncomingAdmission(t *testin
 		}}},
 		ctx:            context.Background(),
 		options:        AsyncSessionOptions{MaxPendingRequests: 2},
-		operations:     make(map[uint16]*AsyncOperation),
-		incoming:       make(map[uint16]asyncIncomingOperation),
 		performedSlots: make(chan struct{}, 1),
-		stateChanged:   make(chan struct{}),
+		registry:       newAsyncOperationRegistry(),
 		done:           make(chan struct{}),
 	}
 	session.performedSlots <- struct{}{}
-	session.incoming[1] = asyncIncomingOperation{
+	session.registry.incoming[1] = asyncIncomingOperation{
 		requestField: CEchoRQ,
 		finishing:    true,
 		writeStarted: true,
 		generation:   1,
 		slotHeld:     true,
 	}
-	session.metrics.ActivePerformed = 1
+	session.registry.metrics.ActivePerformed = 1
 
 	type prepareResult struct {
 		prepared   bool
@@ -591,7 +591,7 @@ func TestAsyncSessionReleaseWaitIncludesBackpressuredIncomingAdmission(t *testin
 	deadline := time.Now().Add(time.Second)
 	for {
 		session.mu.Lock()
-		pending := session.pendingIncoming
+		pending := session.registry.pendingIncoming
 		session.mu.Unlock()
 		if pending == 1 {
 			break
@@ -622,7 +622,7 @@ func TestAsyncSessionReleaseWaitIncludesBackpressuredIncomingAdmission(t *testin
 	case <-time.After(20 * time.Millisecond):
 	}
 	session.mu.Lock()
-	second := session.incoming[2]
+	second := session.registry.incoming[2]
 	session.mu.Unlock()
 	second.cancel()
 	if !session.finishIncomingOperation(2, CEchoRQ, got.generation) {
@@ -814,14 +814,13 @@ func TestAsyncSessionIncomingGenerationSeparatesDuplicateFromLegalReuse(t *testi
 		assoc:          assoc,
 		ctx:            context.Background(),
 		options:        AsyncSessionOptions{MaxPendingRequests: 2},
-		incoming:       make(map[uint16]asyncIncomingOperation),
 		performedSlots: make(chan struct{}, 1),
-		stateChanged:   make(chan struct{}),
+		registry:       newAsyncOperationRegistry(),
 		done:           make(chan struct{}),
-		nextIncomingID: 1,
 	}
+	session.registry.nextIncomingID = 1
 	const messageID = 7
-	session.incoming[messageID] = asyncIncomingOperation{
+	session.registry.incoming[messageID] = asyncIncomingOperation{
 		cancel:       func() {},
 		ctx:          context.Background(),
 		requestField: CEchoRQ,
@@ -829,7 +828,7 @@ func TestAsyncSessionIncomingGenerationSeparatesDuplicateFromLegalReuse(t *testi
 		finishing:    true,
 		generation:   1,
 	}
-	session.metrics.ActivePerformed = 1
+	session.registry.metrics.ActivePerformed = 1
 	command := object.FromElements((CEchoRequest{MessageID: messageID}).CommandSet(), nil)
 	prepared, status, generation, err := session.prepareIncomingRequest(1, command)
 	if err != nil || prepared || status != StatusDuplicateInvocation || generation != 0 {
@@ -837,9 +836,9 @@ func TestAsyncSessionIncomingGenerationSeparatesDuplicateFromLegalReuse(t *testi
 	}
 
 	session.mu.Lock()
-	current := session.incoming[messageID]
+	current := session.registry.incoming[messageID]
 	current.writeCompleted = true
-	session.incoming[messageID] = current
+	session.registry.incoming[messageID] = current
 	session.signalStateChangedLocked()
 	session.mu.Unlock()
 	type result struct {
@@ -1010,6 +1009,155 @@ func TestAsyncSessionRedactsHandlerPanicAndStopsCleanly(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("client operation remained blocked")
 	}
+}
+
+func TestAsyncSessionStartCStoreEncodedRejectsNilWriter(t *testing.T) {
+	client, _ := newAsyncSessionPair(t, 1, 1, []ul.AcceptedContext{{
+		ID: 1, AbstractSyntaxUID: "1.2.840.10008.5.1.4.1.1.2", TransferSyntaxUID: transfer.ImplicitVRLittleEndian.UID,
+	}})
+	_, err := client.StartCStoreEncoded(context.Background(), 1, CStoreRequest{
+		AffectedSOPClassUID:    "1.2.840.10008.5.1.4.1.1.2",
+		AffectedSOPInstanceUID: "1.2.3",
+	}, nil)
+	if err == nil {
+		t.Fatal("StartCStoreEncoded(nil writer) error = nil")
+	}
+}
+
+func TestAsyncSessionStartCStoreEncodedSendsPreencodedBytes(t *testing.T) {
+	storageUID := "1.2.840.10008.5.1.4.1.1.2"
+	client, server := newAsyncSessionPair(t, 2, 2, []ul.AcceptedContext{{
+		ID: 1, AbstractSyntaxUID: storageUID, TransferSyntaxUID: transfer.ImplicitVRLittleEndian.UID,
+	}})
+	received := make(chan string, 1)
+	server.Handle(CStoreRQ, func(ctx context.Context, session *AsyncSession, message AsyncMessage) error {
+		request, err := ParseCStoreRequest(message.Command)
+		if err != nil {
+			return err
+		}
+		patientID, ok := message.DataSet.GetString(core.NewTag(0x0010, 0x0020))
+		if !ok {
+			return errors.New("missing patient ID")
+		}
+		received <- patientID
+		return session.Respond(ctx, message, (CStoreResponse{
+			AffectedSOPClassUID:    request.AffectedSOPClassUID,
+			AffectedSOPInstanceUID: request.AffectedSOPInstanceUID,
+			Status:                 StatusSuccess,
+		}).CommandSet(), nil)
+	})
+
+	encoded := encodedStoreDataSet(t, "ENCODED")
+	operation, err := client.StartCStoreEncoded(context.Background(), 1, CStoreRequest{
+		AffectedSOPClassUID:    storageUID,
+		AffectedSOPInstanceUID: "1.2.3.4",
+		Priority:               PriorityMedium,
+	}, func(_ context.Context, destination io.Writer, _ transfer.Syntax) error {
+		_, err := destination.Write(encoded)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("StartCStoreEncoded() error = %v", err)
+	}
+	response, err := operation.Wait(testContext(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := ParseCStoreResponse(response.Command)
+	if err != nil || parsed.Status != StatusSuccess {
+		t.Fatalf("C-STORE response = %#v, %v", parsed, err)
+	}
+	select {
+	case patientID := <-received:
+		if patientID != "ENCODED" {
+			t.Fatalf("patient ID = %q, want ENCODED", patientID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("SCP did not receive encoded C-STORE")
+	}
+}
+
+func TestAsyncSessionStartCStoreEncodedKeepsTwoInvokedSlots(t *testing.T) {
+	storageUID := "1.2.840.10008.5.1.4.1.1.2"
+	client, server := newAsyncSessionPair(t, 2, 2, []ul.AcceptedContext{{
+		ID: 1, AbstractSyntaxUID: storageUID, TransferSyntaxUID: transfer.ImplicitVRLittleEndian.UID,
+	}})
+	var inFlight atomic.Int32
+	var peak atomic.Int32
+	unblock := make(chan struct{})
+	server.Handle(CStoreRQ, func(ctx context.Context, session *AsyncSession, message AsyncMessage) error {
+		current := inFlight.Add(1)
+		for {
+			observed := peak.Load()
+			if current <= observed || peak.CompareAndSwap(observed, current) {
+				break
+			}
+		}
+		<-unblock
+		inFlight.Add(-1)
+		request, err := ParseCStoreRequest(message.Command)
+		if err != nil {
+			return err
+		}
+		return session.Respond(ctx, message, (CStoreResponse{
+			AffectedSOPClassUID:    request.AffectedSOPClassUID,
+			AffectedSOPInstanceUID: request.AffectedSOPInstanceUID,
+			Status:                 StatusSuccess,
+		}).CommandSet(), nil)
+	})
+
+	startEncoded := func(uid string) *AsyncOperation {
+		t.Helper()
+		encoded := encodedStoreDataSet(t, uid)
+		operation, err := client.StartCStoreEncoded(context.Background(), 1, CStoreRequest{
+			AffectedSOPClassUID:    storageUID,
+			AffectedSOPInstanceUID: uid,
+		}, func(_ context.Context, destination io.Writer, _ transfer.Syntax) error {
+			_, err := destination.Write(encoded)
+			return err
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return operation
+	}
+
+	first := startEncoded("1.2.3.1")
+	second := startEncoded("1.2.3.2")
+	waitFor := func() {
+		t.Helper()
+		deadline := time.Now().Add(time.Second)
+		for time.Now().Before(deadline) {
+			if peak.Load() >= 2 {
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
+		t.Fatalf("peak in-flight = %d, want 2", peak.Load())
+	}
+	waitFor()
+	close(unblock)
+	if _, err := first.Wait(testContext(t)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := second.Wait(testContext(t)); err != nil {
+		t.Fatal(err)
+	}
+	if got := client.Snapshot().PeakInvoked; got < 2 {
+		t.Fatalf("PeakInvoked = %d, want at least 2", got)
+	}
+}
+
+func encodedStoreDataSet(t *testing.T, patientID string) []byte {
+	t.Helper()
+	dataset := object.FromElements([]core.Element{
+		{Header: core.ElementHeader{Tag: core.NewTag(0x0010, 0x0020), VR: core.VRLO}, Value: core.StringValue{patientID}},
+	}, nil)
+	var buf bytes.Buffer
+	if err := object.WriteDataSet(&buf, dataset, transfer.ImplicitVRLittleEndian); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
 }
 
 func newAsyncSessionPair(t *testing.T, invoked, performed uint16, contexts []ul.AcceptedContext) (*AsyncSession, *AsyncSession) {

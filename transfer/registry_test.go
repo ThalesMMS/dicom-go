@@ -2,9 +2,13 @@ package transfer
 
 import (
 	"encoding/binary"
+	"fmt"
 	"reflect"
+	"sync"
 	"testing"
 )
+
+var _ Registry = (*MemoryRegistry)(nil)
 
 func TestMemoryRegistryNormalizesUIDs(t *testing.T) {
 	r := NewRegistry(Syntax{
@@ -61,13 +65,19 @@ func TestMemoryRegistryRegisterIgnoresEmptyNormalizedUID(t *testing.T) {
 }
 
 func TestMemoryRegistryRegisterNilReceiver(t *testing.T) {
-	var r *MemoryRegistry
+	var r Registry = (*MemoryRegistry)(nil)
 	r.Register(Syntax{
 		UID:        "1.2.3",
 		Name:       "Test Syntax",
 		ExplicitVR: true,
 		ByteOrder:  binary.LittleEndian,
 	})
+	if got, ok := r.Get("1.2.3"); ok || got != (Syntax{}) {
+		t.Fatalf("nil registry Get() = (%#v, %t), want zero, false", got, ok)
+	}
+	if got := r.All(); got != nil {
+		t.Fatalf("nil registry All() = %#v, want nil", got)
+	}
 }
 
 func TestMemoryRegistryAllSortedByUIDAcrossCalls(t *testing.T) {
@@ -94,6 +104,151 @@ func TestMemoryRegistryAllSortedByUIDAcrossCalls(t *testing.T) {
 	if !reflect.DeepEqual(gotSecond, want) {
 		t.Fatalf("second All() call returned unexpected order: got %v want %v", gotSecond, want)
 	}
+	first[0].UID = "mutated"
+	if got := r.All()[0].UID; got != want[0] {
+		t.Fatalf("mutating All() snapshot changed registry: got %q want %q", got, want[0])
+	}
+	r.Register(Syntax{UID: want[0], Name: "replacement"})
+	r.Register(Syntax{UID: "1.2.840.10008.1.2.5", Name: "new"})
+	if len(second) != 3 || second[0].Name != "" {
+		t.Fatalf("registration changed prior snapshot: %#v", second)
+	}
+	if current := r.All(); len(current) != 4 || current[0].Name != "replacement" {
+		t.Fatalf("current snapshot did not reflect registrations: %#v", current)
+	}
+}
+
+func TestMemoryRegistryConcurrentAccess(t *testing.T) {
+	registry := NewRegistry()
+	const workers = 8
+	const registrationsPerWorker = 64
+	start := make(chan struct{})
+	var group sync.WaitGroup
+	for worker := 0; worker < workers; worker++ {
+		worker := worker
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			<-start
+			for index := 0; index < registrationsPerWorker; index++ {
+				uid := fmt.Sprintf("1.2.826.0.1.3680043.10.%d.%d", worker, index)
+				registry.Register(Syntax{UID: uid, Name: uid})
+				if syntax, ok := registry.Get(uid); !ok || syntax.UID != uid {
+					t.Errorf("Get(%q) = %#v, %v", uid, syntax, ok)
+					return
+				}
+				_ = registry.All()
+			}
+		}()
+	}
+	close(start)
+	group.Wait()
+	if got, want := len(registry.All()), workers*registrationsPerWorker; got != want {
+		t.Fatalf("registry entries = %d, want %d", got, want)
+	}
+}
+
+type benchmarkRegistry interface {
+	Get(string) (Syntax, bool)
+	Register(Syntax)
+}
+
+type benchmarkMutexRegistry struct {
+	mu    sync.Mutex
+	byUID map[string]Syntax
+}
+
+func (r *benchmarkMutexRegistry) Get(uid string) (Syntax, bool) {
+	uid = NormalizeUID(uid)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	syntax, ok := r.byUID[uid]
+	return syntax, ok
+}
+
+func (r *benchmarkMutexRegistry) Register(syntax Syntax) {
+	syntax.UID = NormalizeUID(syntax.UID)
+	r.mu.Lock()
+	r.byUID[syntax.UID] = syntax
+	r.mu.Unlock()
+}
+
+func benchmarkRegistries() []struct {
+	name     string
+	registry benchmarkRegistry
+} {
+	return []struct {
+		name     string
+		registry benchmarkRegistry
+	}{
+		{name: "rwmutex", registry: NewRegistry()},
+		{name: "mutex_baseline", registry: &benchmarkMutexRegistry{byUID: make(map[string]Syntax)}},
+	}
+}
+
+func seedBenchmarkRegistry(registry benchmarkRegistry) {
+	for index := 0; index < 128; index++ {
+		uid := fmt.Sprintf("1.2.826.0.1.3680043.10.863.%d", index)
+		registry.Register(Syntax{UID: uid, Name: uid})
+	}
+}
+
+func BenchmarkMemoryRegistryGetReadHeavy(b *testing.B) {
+	const uid = "1.2.826.0.1.3680043.10.863.64"
+	for _, benchmark := range benchmarkRegistries() {
+		b.Run(benchmark.name, func(b *testing.B) {
+			seedBenchmarkRegistry(benchmark.registry)
+			b.ReportAllocs()
+			b.ResetTimer()
+			b.RunParallel(func(pb *testing.PB) {
+				for pb.Next() {
+					if _, ok := benchmark.registry.Get(uid); !ok {
+						b.Fatal("registered syntax missing")
+					}
+				}
+			})
+		})
+	}
+}
+
+func BenchmarkMemoryRegistryMixedReadWrite(b *testing.B) {
+	const uid = "1.2.826.0.1.3680043.10.863.64"
+	for _, benchmark := range benchmarkRegistries() {
+		b.Run(benchmark.name, func(b *testing.B) {
+			seedBenchmarkRegistry(benchmark.registry)
+			b.ReportAllocs()
+			b.ResetTimer()
+			b.RunParallel(func(pb *testing.PB) {
+				iteration := 0
+				for pb.Next() {
+					iteration++
+					if iteration%100 == 0 {
+						benchmark.registry.Register(Syntax{UID: uid, Name: uid})
+						continue
+					}
+					if _, ok := benchmark.registry.Get(uid); !ok {
+						b.Fatal("registered syntax missing")
+					}
+				}
+			})
+		})
+	}
+}
+
+func BenchmarkMemoryRegistryAllSnapshot(b *testing.B) {
+	registry := NewRegistry()
+	for index := 0; index < 128; index++ {
+		uid := fmt.Sprintf("1.2.826.0.1.3680043.10.863.%d", index)
+		registry.Register(Syntax{UID: uid, Name: uid})
+	}
+	b.ReportAllocs()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			if got := registry.All(); len(got) != 128 {
+				b.Fatalf("All() entries = %d, want 128", len(got))
+			}
+		}
+	})
 }
 
 func TestDefaultRegistryGetReturnsExpectedSyntaxes(t *testing.T) {

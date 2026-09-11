@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/ThalesMMS/dicom-go/core"
 	uiddict "github.com/ThalesMMS/dicom-go/dictionary/uid"
@@ -15,7 +16,10 @@ type Registry interface {
 	All() []Syntax
 }
 
+// MemoryRegistry is an in-memory transfer syntax registry. Its methods are
+// safe for concurrent registration, lookup, and snapshot iteration.
 type MemoryRegistry struct {
+	mu    sync.RWMutex
 	byUID map[string]Syntax
 }
 
@@ -32,6 +36,8 @@ func (r *MemoryRegistry) Get(uid string) (Syntax, bool) {
 		return Syntax{}, false
 	}
 	uid = NormalizeUID(uid)
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	syntax, ok := r.byUID[uid]
 	return syntax, ok
 }
@@ -40,32 +46,43 @@ func (r *MemoryRegistry) Register(syntax Syntax) {
 	if r == nil {
 		return
 	}
-	if r.byUID == nil {
-		r.byUID = map[string]Syntax{}
-	}
 	normalizedUID := NormalizeUID(syntax.UID)
 	if normalizedUID == "" {
 		return
 	}
 	syntax.UID = normalizedUID
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.byUID == nil {
+		r.byUID = map[string]Syntax{}
+	}
 	r.byUID[normalizedUID] = syntax
 }
 
-// All returns a UID-sorted snapshot of the registered transfer syntaxes.
+// All returns an independent, UID-sorted snapshot of the registered transfer
+// syntaxes. Mutating the returned slice or its Syntax values does not change
+// the registry.
 func (r *MemoryRegistry) All() []Syntax {
 	if r == nil {
 		return nil
 	}
+	r.mu.RLock()
 	out := make([]Syntax, 0, len(r.byUID))
 	for _, syntax := range r.byUID {
 		out = append(out, syntax)
 	}
+	r.mu.RUnlock()
 	sort.Slice(out, func(i, j int) bool {
 		return out[i].UID < out[j].UID
 	})
 	return out
 }
 
+// DefaultRegistry is the process-wide transfer syntax registry. Its default
+// MemoryRegistry supports concurrent Get, Register, and All calls. Registering
+// changes process-wide state; use NewRegistry when a caller or test needs an
+// isolated registry. Replacing this variable while other goroutines use it is
+// not supported.
 var DefaultRegistry Registry = newDefaultRegistry()
 
 // NormalizeUID trims trailing spaces and NUL bytes from a transfer syntax UID.

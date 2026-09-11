@@ -18,6 +18,7 @@ import (
 
 	"github.com/ThalesMMS/dicom-go/core"
 	"github.com/ThalesMMS/dicom-go/dictionary/tags"
+	"github.com/ThalesMMS/dicom-go/internal/testutil"
 	"github.com/ThalesMMS/dicom-go/transfer"
 )
 
@@ -90,9 +91,7 @@ func TestScanSymlinkPoliciesNeverFollowDirectoriesOrEscapeRoot(t *testing.T) {
 		t.Fatal(err)
 	}
 	insideLink := filepath.Join(root, "inside-link.dcm")
-	if err := os.Symlink(inside, insideLink); err != nil {
-		t.Skipf("symbolic links unavailable: %v", err)
-	}
+	testutil.SymlinkOrSkip(t, inside, insideLink)
 
 	outside := t.TempDir()
 	escapeTarget := filepath.Join(outside, "OUTSIDE-PATIENT.dcm")
@@ -104,21 +103,13 @@ func TestScanSymlinkPoliciesNeverFollowDirectoriesOrEscapeRoot(t *testing.T) {
 		t.Fatal(err)
 	}
 	escapeLink := filepath.Join(root, "escape-link.dcm")
-	if err := os.Symlink(escapeTarget, escapeLink); err != nil {
-		t.Fatal(err)
-	}
+	testutil.SymlinkOrSkip(t, escapeTarget, escapeLink)
 	directoryLink := filepath.Join(root, "directory-link")
-	if err := os.Symlink(outside, directoryLink); err != nil {
-		t.Fatal(err)
-	}
+	testutil.SymlinkOrSkip(t, outside, directoryLink)
 	cycleOne := filepath.Join(root, "cycle-one")
 	cycleTwo := filepath.Join(root, "cycle-two")
-	if err := os.Symlink(cycleTwo, cycleOne); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink(cycleOne, cycleTwo); err != nil {
-		t.Fatal(err)
-	}
+	testutil.SymlinkOrSkip(t, cycleTwo, cycleOne)
+	testutil.SymlinkOrSkip(t, cycleOne, cycleTwo)
 
 	opts := DefaultScanOptions()
 	var ignored []ScanResult
@@ -168,9 +159,7 @@ func TestScanRootSymlinkPolicyIsExplicit(t *testing.T) {
 		textIndexElement(tags.SOPInstanceUID, core.VRUI, testSOPInstanceUID),
 	})
 	link := filepath.Join(t.TempDir(), "root-link.dcm")
-	if err := os.Symlink(target, link); err != nil {
-		t.Skipf("symbolic links unavailable: %v", err)
-	}
+	testutil.SymlinkOrSkip(t, target, link)
 
 	for _, tc := range []struct {
 		policy SymlinkPolicy
@@ -199,9 +188,7 @@ func TestScanRootSymlinkPolicyIsExplicit(t *testing.T) {
 	}
 
 	directoryLink := filepath.Join(t.TempDir(), "root-directory-link")
-	if err := os.Symlink(filepath.Dir(target), directoryLink); err != nil {
-		t.Fatal(err)
-	}
+	testutil.SymlinkOrSkip(t, filepath.Dir(target), directoryLink)
 	opts := DefaultScanOptions()
 	opts.SymlinkPolicy = SymlinkFollowFiles
 	var got ScanResult
@@ -229,9 +216,7 @@ func TestScanRejectsFileReplacedBySymlinkAfterFiltering(t *testing.T) {
 		textIndexElement(tags.SOPInstanceUID, core.VRUI, "1.2.826.0.1.3680043.10.543.626.100"),
 	})
 	probe := filepath.Join(root, "symlink-probe")
-	if err := os.Symlink(outside, probe); err != nil {
-		t.Skipf("symbolic links unavailable: %v", err)
-	}
+	testutil.SymlinkOrSkip(t, outside, probe)
 	if err := os.Remove(probe); err != nil {
 		t.Fatal(err)
 	}
@@ -360,12 +345,8 @@ func TestScanEnforcesFileAndDirectoryBudgetsAtExactBoundary(t *testing.T) {
 	assertScanLimit(t, err, "MaxDirectories")
 
 	symlinkRoot := t.TempDir()
-	if err := os.Symlink("missing-one", filepath.Join(symlinkRoot, "one")); err != nil {
-		t.Skipf("symbolic links unavailable: %v", err)
-	}
-	if err := os.Symlink("missing-two", filepath.Join(symlinkRoot, "two")); err != nil {
-		t.Fatal(err)
-	}
+	testutil.SymlinkOrSkip(t, "missing-one", filepath.Join(symlinkRoot, "one"))
+	testutil.SymlinkOrSkip(t, "missing-two", filepath.Join(symlinkRoot, "two"))
 	opts = DefaultScanOptions()
 	opts.MaxFiles = 2
 	if err := Scan(context.Background(), symlinkRoot, opts, func(ScanResult) error { return nil }); err != nil {

@@ -14,9 +14,8 @@ import (
 	"github.com/ThalesMMS/dicom-go/dicomjson"
 	"github.com/ThalesMMS/dicom-go/internal/clidiag"
 	"github.com/ThalesMMS/dicom-go/object"
+	"github.com/ThalesMMS/dicom-go/pixeldata/builtin"
 	pixelframe "github.com/ThalesMMS/dicom-go/pixeldata/frame"
-	"github.com/ThalesMMS/dicom-go/pixeldata/jpeg"
-	"github.com/ThalesMMS/dicom-go/pixeldata/rle"
 	"github.com/ThalesMMS/dicom-go/transfer"
 )
 
@@ -201,10 +200,7 @@ func extractImages(stdout io.Writer, path, outDir string) error {
 }
 
 func registerDefaultCodecs() error {
-	return errors.Join(
-		jpeg.RegisterDefault(),
-		rle.RegisterDefault(),
-	)
+	return builtin.RegisterDefault()
 }
 
 func writePNG(path string, img image.Image) error {

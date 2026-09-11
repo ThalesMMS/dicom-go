@@ -21,6 +21,7 @@ const (
 	ValueFloat32
 	ValueFloat64
 	ValueTag
+	ValueDiscarded
 )
 
 // Value is the common contract for element payloads held by the core model.

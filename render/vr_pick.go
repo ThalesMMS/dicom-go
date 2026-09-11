@@ -32,8 +32,13 @@ func PickVR(vol *Volume, cam VRCamera, preset VRPreset, window WindowLevel, clip
 	if !ok {
 		dataMin, dataMax = 0, 1
 	}
-	lut := preset.TF.BakeLUT(dataMin, dataMax, 1024)
 	window = normalizeWindow(window, vol.RecommendedWindow())
+	var lut VRLUT
+	if preset.TF.Domain() == VRTransferDomainHU {
+		lut = preset.TF.BakeLUT(dataMin, dataMax, preset.TF.PreferredLUTSize())
+	} else {
+		lut = preset.TF.BakeWindowLUT(window, preset.TF.PreferredLUTSize())
+	}
 	steps := 256
 	stepLen := size.Length() / float64(steps)
 
@@ -52,9 +57,14 @@ func PickVR(vol *Volume, cam VRCamera, preset VRPreset, window WindowLevel, clip
 		if !sok {
 			continue
 		}
-		densityWindow := windowedUnit(hu, window)
-		densityData := clampUnit((hu - dataMin) / (dataMax - dataMin))
-		alpha := lut.Lookup(densityData).A * densityWindow
+		alpha := 0.0
+		if preset.TF.Domain() == VRTransferDomainNormalized {
+			alpha = lut.Lookup(preset.TF.windowCoordinate(hu, window)).A
+		} else {
+			densityData := normalizedVRDataCoordinate(hu, dataMin, dataMax)
+			alpha = lut.Lookup(densityData).A * windowedUnit(hu, window)
+		}
+		alpha = CorrectVRAlpha(alpha, 1, stepLen, preset.TF.OpacityUnitDistanceMM())
 		accA += (1 - accA) * alpha
 		if accA >= vrPickAlphaThreshold {
 			patient := vol.VoxelToPatient(vol.TextureToVoxel(tex))

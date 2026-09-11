@@ -66,8 +66,12 @@ func (v *Volume) huRangeFromSampler(sampler *volumeSampler) (huMin, huMax float6
 			}
 		}
 	}
-	if !found || huMax <= huMin {
+	if !found {
 		return 0, 0, false
+	}
+	if huMax <= huMin {
+		huMin--
+		huMax++
 	}
 	v.huMin, v.huMax, v.huRangeOK = huMin, huMax, true
 	return huMin, huMax, true
@@ -186,6 +190,41 @@ func (v *Volume) shadeWithGradient(grad, viewDir Vec3) float64 {
 		out = 0
 	}
 	return out
+}
+
+// shadeVRWithGradient implements the shared CPU/WebGPU DVR convention. The
+// scalar central difference arrives in index space without the 0.5 divisor;
+// transforming the covector by transpose(PatientLPSToIndex) produces a
+// physical patient-LPS normal. A headlight makes light and view direction
+// identical, so Blinn-Phong's half vector is simply the eye vector.
+func (v *Volume) shadeVRWithGradient(indexGradient, viewDir Vec3, material VRLightingMaterial) float64 {
+	if v == nil || !material.valid() {
+		return 0
+	}
+	physical := Vec3{}
+	if v.ColSpacing > 0 {
+		physical = physical.Add(v.AxisX.Scale(0.5 * indexGradient.X / v.ColSpacing))
+	}
+	if v.RowSpacing > 0 {
+		physical = physical.Add(v.AxisY.Scale(0.5 * indexGradient.Y / v.RowSpacing))
+	}
+	if v.SliceSpacing > 0 {
+		physical = physical.Add(v.Normal.Scale(0.5 * indexGradient.Z / v.SliceSpacing))
+	}
+	magnitude := physical.Length()
+	if magnitude <= 1e-6 {
+		return material.Ambient
+	}
+	normal := physical.Scale(-1 / magnitude)
+	patientViewDirection := v.AxisX.Scale(viewDir.X).
+		Add(v.AxisY.Scale(viewDir.Y)).
+		Add(v.Normal.Scale(viewDir.Z))
+	eye := patientViewDirection.Scale(-1).Normalize()
+	incidence := math.Max(normal.Dot(eye), 0)
+	illumination := material.Ambient +
+		material.Diffuse*incidence +
+		material.Specular*math.Pow(incidence, material.SpecularPower)
+	return math.Max(illumination, 0)
 }
 
 func maxInt(a, b int) int {

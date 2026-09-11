@@ -215,7 +215,9 @@ func (v MaterializedVolume) Load(store *dicomrender.VolumeStore) (*dicomrender.V
 // Verify rejects descriptor or payload drift before a run is admitted.
 func (v MaterializedVolume) Verify() error {
 	if v.name != SyntheticCTName {
-		return fmt.Errorf("qualification: unknown fixture name %q", v.name)
+		if _, ok := ClinicalFixtureDefinitionByID(ClinicalFixtureID(v.name)); !ok {
+			return fmt.Errorf("qualification: unknown fixture name %q", v.name)
+		}
 	}
 	if err := dicomrender.ValidateVolumeDescriptor(v.descriptor); err != nil {
 		return err
@@ -229,6 +231,10 @@ func (v MaterializedVolume) Verify() error {
 	digest := sha256.Sum256(v.payload)
 	if digest != v.sha256 {
 		return fmt.Errorf("qualification: payload SHA-256 drift")
+	}
+	if expected, ok := ReferenceClinicalFixtureSHA256(ClinicalFixtureID(v.name)); ok &&
+		hex.EncodeToString(digest[:]) != expected {
+		return fmt.Errorf("qualification: frozen fixture SHA-256 drift")
 	}
 	return nil
 }

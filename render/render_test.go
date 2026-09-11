@@ -210,6 +210,49 @@ func TestRenderFrameAndCacheHonorVOILUT(t *testing.T) {
 	}
 }
 
+func TestRenderFrameAndCacheSupportNativeColorLayouts(t *testing.T) {
+	tests := []struct {
+		name        string
+		photometric string
+		planar      uint16
+		data        []byte
+		want        []color.RGBA
+	}{
+		{name: "planar RGB", photometric: "RGB", planar: 1, data: []byte{255, 0, 0, 0, 255, 0, 0, 0, 255}, want: []color.RGBA{{R: 255, A: 255}, {G: 255, A: 255}, {B: 255, A: 255}}},
+		{name: "YBR FULL", photometric: "YBR_FULL", data: []byte{128, 128, 128, 128, 128, 200}, want: []color.RGBA{{R: 128, G: 128, B: 128, A: 255}, {R: 229, G: 77, B: 128, A: 255}}},
+		{name: "YBR FULL 422", photometric: "YBR_FULL_422", data: []byte{128, 128, 128, 200}, want: []color.RGBA{{R: 229, G: 77, B: 128, A: 255}, {R: 229, G: 77, B: 128, A: 255}}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			frame := &Frame{
+				Metadata: pixeldata.Metadata{
+					Rows: 1, Columns: uint16(len(tc.want)), SamplesPerPixel: 3,
+					BitsAllocated: 8, BitsStored: 8, HighBit: 7,
+					PlanarConfiguration: tc.planar, PlanarConfigurationPresent: true,
+					PhotometricInterpretation: tc.photometric,
+				},
+				PixelBytes: tc.data,
+			}
+			for name, render := range map[string]func() (image.Image, error){
+				"direct": func() (image.Image, error) { return RenderFrame(frame, WindowLevel{}) },
+				"cache":  func() (image.Image, error) { return NewRenderCache(1<<20).RenderFrame(frame, WindowLevel{}) },
+			} {
+				t.Run(name, func(t *testing.T) {
+					img, err := render()
+					if err != nil {
+						t.Fatalf("render error = %v", err)
+					}
+					for x, want := range tc.want {
+						if got := color.RGBAModel.Convert(img.At(x, 0)).(color.RGBA); got != want {
+							t.Fatalf("pixel %d = %#v, want %#v", x, got, want)
+						}
+					}
+				})
+			}
+		})
+	}
+}
+
 func Test_RenderFramePNG_encodes_windowed_monochrome_frame(t *testing.T) {
 	// Given
 	frame := testRenderFrame([]byte{0, 64, 128, 255})

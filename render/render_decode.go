@@ -35,7 +35,7 @@ func decodeSliceFrame(slice *Frame) (*decodedFrame, error) {
 	case 1:
 		return decodeGrayscaleSlice(slice, metadata, photometric, rows, cols)
 	case 3:
-		return decodeRGBSlice(slice, metadata, photometric, rows, cols)
+		return decodeColorSlice(slice, metadata, photometric, rows, cols)
 	default:
 		return nil, fmt.Errorf("%w: SamplesPerPixel=%d", dicomframe.ErrUnsupportedSamplesPerPixel, metadata.SamplesPerPixel)
 	}
@@ -108,34 +108,12 @@ func grayscaleDisplayFrame(slice *Frame, metadata pixeldata.Metadata, photometri
 	}, nil
 }
 
-func decodeRGBSlice(slice *Frame, metadata pixeldata.Metadata, photometric string, rows, cols int) (*decodedFrame, error) {
-	if metadata.BitsAllocated != 8 {
-		return nil, fmt.Errorf("%w: BitsAllocated=%d for RGB", dicomframe.ErrUnsupportedBitsAllocated, metadata.BitsAllocated)
+func decodeColorSlice(slice *Frame, metadata pixeldata.Metadata, photometric string, rows, cols int) (*decodedFrame, error) {
+	img, err := dicomframe.RenderColor(slice.PixelBytes, metadata, slice.ByteOrder)
+	if err != nil {
+		return nil, err
 	}
-	if metadata.PixelRepresentation != 0 {
-		return nil, fmt.Errorf("%w: PixelRepresentation=%d for RGB", dicomframe.ErrInvalidFrameMetadata, metadata.PixelRepresentation)
-	}
-	if metadata.PlanarConfigurationPresent && metadata.PlanarConfiguration != 0 {
-		return nil, fmt.Errorf("%w: PlanarConfiguration=%d for RGB", dicomframe.ErrUnsupportedPlanarConfiguration, metadata.PlanarConfiguration)
-	}
-	if photometric != "RGB" {
-		return nil, fmt.Errorf("%w: %q for SamplesPerPixel=3", dicomframe.ErrUnsupportedPhotometricInterpretation, metadata.PhotometricInterpretation)
-	}
-	const samplesPerPixel = 3
-	expected := rows * cols * samplesPerPixel
-	if len(slice.PixelBytes) < expected {
-		return nil, fmt.Errorf("%w: got %d bytes, want %d", dicomframe.ErrPixelDataTooShort, len(slice.PixelBytes), expected)
-	}
-	rgba := make([]byte, rows*cols*4)
-	for pixelIndex := 0; pixelIndex < rows*cols; pixelIndex++ {
-		src := pixelIndex * samplesPerPixel
-		dst := pixelIndex * 4
-		rgba[dst] = slice.PixelBytes[src]
-		rgba[dst+1] = slice.PixelBytes[src+1]
-		rgba[dst+2] = slice.PixelBytes[src+2]
-		rgba[dst+3] = 255
-	}
-	return &decodedFrame{rows: rows, cols: cols, photometric: photometric, rgba: rgba}, nil
+	return &decodedFrame{rows: rows, cols: cols, photometric: photometric, rgba: img.Pix}, nil
 }
 
 func effectiveFrameMetadata(slice *Frame) pixeldata.Metadata {

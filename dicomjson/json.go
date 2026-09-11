@@ -2,9 +2,11 @@ package dicomjson
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -15,7 +17,10 @@ import (
 
 	"github.com/ThalesMMS/dicom-go/core"
 	"github.com/ThalesMMS/dicom-go/dictionary"
+	"github.com/ThalesMMS/dicom-go/internal/valueencode"
 	"github.com/ThalesMMS/dicom-go/object"
+	"github.com/ThalesMMS/dicom-go/parser"
+	"github.com/ThalesMMS/dicom-go/transfer"
 )
 
 var (
@@ -50,6 +55,9 @@ type Options struct {
 	// ByteOrder is used when interpreting raw bytes for numeric VRs and AT.
 	// When nil, the object's ValueByteOrder is used.
 	ByteOrder binary.ByteOrder
+	// Limits bounds traversal and output resources. Zero values preserve the
+	// historical unlimited behavior.
+	Limits Limits
 }
 
 // UnmarshalOptions configures DICOM JSON to object conversion.
@@ -58,6 +66,13 @@ type UnmarshalOptions struct {
 	// ByteOrder is used when encoding numeric VRs and AT from JSON Value arrays.
 	// It defaults to binary.LittleEndian.
 	ByteOrder binary.ByteOrder
+	// TransferSyntax identifies the source value encoding. When it is
+	// encapsulated, Pixel Data InlineBinary is reconstructed as a
+	// core.FragmentSequence instead of a defined-length raw value.
+	TransferSyntax transfer.Syntax
+	// Limits bounds traversal and decoded resources. Zero values preserve the
+	// historical unlimited behavior.
+	Limits Limits
 }
 
 func DefaultOptions() Options {
@@ -73,6 +88,16 @@ func DefaultUnmarshalOptions() UnmarshalOptions {
 }
 
 func Marshal(obj *object.Object, opts Options) ([]byte, error) {
+	return MarshalContext(context.Background(), obj, opts)
+}
+
+// MarshalContext converts an object to DICOM JSON while observing ctx and the
+// resource limits in opts.
+func MarshalContext(ctx context.Context, obj *object.Object, opts Options) ([]byte, error) {
+	budget, err := newConversionBudget(ctx, opts.Limits)
+	if err != nil {
+		return nil, err
+	}
 	if opts.ByteOrder == nil {
 		if obj == nil {
 			opts.ByteOrder = binary.LittleEndian
@@ -80,14 +105,53 @@ func Marshal(obj *object.Object, opts Options) ([]byte, error) {
 			opts.ByteOrder = obj.ValueByteOrder()
 		}
 	}
-	m, err := marshalElements(obj, opts)
+	m, err := marshalElementsContext(obj, opts, budget, 0)
 	if err != nil {
 		return nil, err
 	}
-	if opts.Pretty {
-		return json.MarshalIndent(m, "", "  ")
+	encoded, err := marshalJSONWithLimit(m, opts.Pretty, opts.Limits.MaxJSONBytes)
+	if err != nil {
+		return nil, err
 	}
-	return json.Marshal(m)
+	if err := budget.checkJSONBytes(len(encoded)); err != nil {
+		return nil, err
+	}
+	return encoded, nil
+}
+
+func marshalJSONWithLimit(value any, pretty bool, limit int64) ([]byte, error) {
+	if limit == 0 || limit == math.MaxInt64 {
+		if pretty {
+			return json.MarshalIndent(value, "", "  ")
+		}
+		return json.Marshal(value)
+	}
+
+	writer := &limitedJSONWriter{limit: limit + 1}
+	encoder := json.NewEncoder(writer)
+	if pretty {
+		encoder.SetIndent("", "  ")
+	}
+	if err := encoder.Encode(value); err != nil {
+		return nil, err
+	}
+	encoded := writer.buffer.Bytes()
+	if len(encoded) > 0 && encoded[len(encoded)-1] == '\n' {
+		encoded = encoded[:len(encoded)-1]
+	}
+	return encoded, nil
+}
+
+type limitedJSONWriter struct {
+	buffer bytes.Buffer
+	limit  int64
+}
+
+func (writer *limitedJSONWriter) Write(data []byte) (int, error) {
+	if int64(writer.buffer.Len()) > writer.limit-int64(len(data)) {
+		return 0, fmt.Errorf("%w: limit %d", ErrMaxJSONBytesExceeded, writer.limit-1)
+	}
+	return writer.buffer.Write(data)
 }
 
 func MarshalCompact(obj *object.Object) ([]byte, error) {
@@ -117,8 +181,24 @@ func UnmarshalWithTextOptions(data []byte, dict dictionary.DataDictionary, opts 
 // UnmarshalWithOptions converts DICOM JSON into an object using explicit
 // conversion options.
 func UnmarshalWithOptions(data []byte, dict dictionary.DataDictionary, opts UnmarshalOptions) (*object.Object, error) {
+	return UnmarshalContext(context.Background(), data, dict, opts)
+}
+
+// UnmarshalContext converts DICOM JSON into an object while observing ctx and
+// the resource limits in opts.
+func UnmarshalContext(ctx context.Context, data []byte, dict dictionary.DataDictionary, opts UnmarshalOptions) (*object.Object, error) {
+	budget, err := newConversionBudget(ctx, opts.Limits)
+	if err != nil {
+		return nil, err
+	}
+	if err := budget.checkJSONBytes(len(data)); err != nil {
+		return nil, err
+	}
+	if opts.ByteOrder == nil && opts.TransferSyntax.ByteOrder != nil {
+		opts.ByteOrder = opts.TransferSyntax.ByteOrder
+	}
 	opts.ByteOrder = byteOrderOrDefault(opts.ByteOrder)
-	ds, err := unmarshalDataSet(data, "", dict, opts.ByteOrder)
+	ds, err := unmarshalDataSetContext(data, "", dict, opts, budget, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -134,18 +214,111 @@ func byteOrderOrDefault(order binary.ByteOrder) binary.ByteOrder {
 	return order
 }
 
-func marshalElements(obj *object.Object, opts Options) (map[string]Element, error) {
+func base64DecodedLength(encoded string) int {
+	encodedLength := 0
+	padding := 0
+	for i := 0; i < len(encoded); i++ {
+		if encoded[i] == '\r' || encoded[i] == '\n' {
+			continue
+		}
+		encodedLength++
+	}
+	for i := len(encoded) - 1; i >= 0; i-- {
+		switch encoded[i] {
+		case '\r', '\n':
+			continue
+		case '=':
+			padding++
+			continue
+		}
+		break
+	}
+	decodedLength := base64.StdEncoding.DecodedLen(encodedLength) - padding
+	if decodedLength < 0 {
+		return 0
+	}
+	return decodedLength
+}
+
+func parseEncapsulatedPixelDataValue(data []byte, syntax transfer.Syntax, dict dictionary.DataDictionary, budget *conversionBudget) (core.FragmentSequence, error) {
+	if err := budget.checkContext(); err != nil {
+		return core.FragmentSequence{}, err
+	}
+	order := byteOrderOrDefault(syntax.ByteOrder)
+	syntax.ByteOrder = order
+
+	headerLength := 8
+	if syntax.ExplicitVR {
+		headerLength = 12
+	}
+	encoded := make([]byte, headerLength+len(data))
+	order.PutUint16(encoded[0:2], core.TagPixelData.Group)
+	order.PutUint16(encoded[2:4], core.TagPixelData.Element)
+	if syntax.ExplicitVR {
+		copy(encoded[4:6], core.VROB.String())
+		order.PutUint32(encoded[8:12], uint32(core.UndefinedLength))
+	} else {
+		order.PutUint32(encoded[4:8], uint32(core.UndefinedLength))
+	}
+	copy(encoded[headerLength:], data)
+
+	reader := parser.NewReader(bytes.NewReader(encoded), syntax, parser.ReaderOptions{
+		Dictionary:          dict,
+		MaxPixelDataBytes:   int64(len(data)),
+		MaxFragments:        budget.parserFragmentLimit(),
+		StrictReservedBytes: true,
+		OddLengthPolicy:     parser.RejectOddLength,
+	})
+	dataset, err := reader.ReadDataSet()
+	if err != nil {
+		if errors.Is(err, parser.ErrMaxFragmentsExceeded) {
+			return core.FragmentSequence{}, fmt.Errorf("%w: %v", ErrMaxSequenceItemsExceeded, err)
+		}
+		return core.FragmentSequence{}, fmt.Errorf("decode encapsulated Pixel Data Value Field: %w", err)
+	}
+	if err := budget.checkContext(); err != nil {
+		return core.FragmentSequence{}, err
+	}
+	if len(dataset.Elements) != 1 || dataset.Elements[0].Header.Tag != core.TagPixelData {
+		return core.FragmentSequence{}, fmt.Errorf("decode encapsulated Pixel Data Value Field: expected exactly one Pixel Data element")
+	}
+	fragments, ok := dataset.Elements[0].Value.(core.FragmentSequence)
+	if !ok {
+		return core.FragmentSequence{}, fmt.Errorf("decode encapsulated Pixel Data Value Field: got %T, want core.FragmentSequence", dataset.Elements[0].Value)
+	}
+	if err := budget.addSequenceItems(len(fragments.Fragments)); err != nil {
+		return core.FragmentSequence{}, err
+	}
+	return fragments, nil
+}
+
+func marshalElementsContext(obj *object.Object, opts Options, budget *conversionBudget, depth int) (map[string]Element, error) {
 	out := map[string]Element{}
 	if obj == nil {
 		return out, nil
 	}
+	elements := obj.SortedElements()
+	elementCount := len(elements)
+	if opts.OmitGroupLength {
+		for _, elem := range elements {
+			if elem.Tag().IsGroupLength() {
+				elementCount--
+			}
+		}
+	}
+	if err := budget.enterDataSet(depth, elementCount); err != nil {
+		return nil, err
+	}
 
-	for _, elem := range obj.SortedElements() {
+	for _, elem := range elements {
+		if err := budget.checkContext(); err != nil {
+			return nil, err
+		}
 		if opts.OmitGroupLength && elem.Tag().IsGroupLength() {
 			continue
 		}
 
-		entry, err := marshalElement(obj, elem, opts)
+		entry, err := marshalElementContext(obj, elem, opts, budget, depth)
 		if err != nil {
 			return nil, err
 		}
@@ -154,7 +327,10 @@ func marshalElements(obj *object.Object, opts Options) (map[string]Element, erro
 	return out, nil
 }
 
-func marshalElement(obj *object.Object, elem core.Element, opts Options) (Element, error) {
+func marshalElementContext(obj *object.Object, elem core.Element, opts Options, budget *conversionBudget, depth int) (Element, error) {
+	if err := budget.checkContext(); err != nil {
+		return Element{}, err
+	}
 	entry := Element{VR: elem.VR().String()}
 
 	switch value := elem.Value.(type) {
@@ -173,11 +349,17 @@ func marshalElement(obj *object.Object, elem core.Element, opts Options) (Elemen
 	case elem.VR() == core.VRSQ:
 		items, ok := obj.GetSequence(elem.Tag())
 		if !ok {
-			return entry, nil
+			return Element{}, fmt.Errorf("dicomjson: marshal %s VR SQ: expected SequenceValue, got %T", elem.Tag(), elem.Value)
+		}
+		if err := budget.addSequenceItems(len(items)); err != nil {
+			return Element{}, err
 		}
 		entry.Value = make([]any, 0, len(items))
 		for _, item := range items {
-			nested, err := marshalElements(item, opts)
+			if err := budget.checkContext(); err != nil {
+				return Element{}, err
+			}
+			nested, err := marshalElementsContext(item, opts, budget, depth+1)
 			if err != nil {
 				return Element{}, err
 			}
@@ -190,6 +372,11 @@ func marshalElement(obj *object.Object, elem core.Element, opts Options) (Elemen
 		}
 		entry.Value = stringsToAny(values)
 	default:
+		if fragments, ok := elem.Value.(core.FragmentSequence); ok {
+			if err := budget.addSequenceItems(len(fragments.Fragments)); err != nil {
+				return Element{}, err
+			}
+		}
 		if elem.Tag() == core.TagPixelData && opts.PixelDataBulkDataURIFunc != nil {
 			open, ok, err := pixelDataBulkReader(obj, elem, opts.ByteOrder)
 			if err != nil {
@@ -207,23 +394,37 @@ func marshalElement(obj *object.Object, elem core.Element, opts Options) (Elemen
 			}
 		}
 		raw, ok := elem.RawBytes()
+		inlineBudgeted := false
 		if !ok {
+			if opts.BulkDataURIFunc == nil && !marshalsRawAsJSONValue(elem.VR()) {
+				if size, known, err := inlineValueFieldLength(elem); err != nil {
+					return Element{}, err
+				} else if known {
+					if err := budget.addInlineBinary(size); err != nil {
+						return Element{}, err
+					}
+					inlineBudgeted = true
+				}
+			}
 			var err error
 			raw, err = materializeRawValue(obj, elem, opts.ByteOrder)
 			if err != nil {
 				return Element{}, err
 			}
+			if err := budget.checkContext(); err != nil {
+				return Element{}, err
+			}
 		}
 		switch elem.VR() {
 		case core.VRAT:
-			values, err := marshalAttributeTags(elem.Tag(), raw, opts.ByteOrder)
+			values, err := marshalAttributeTagsContext(elem.Tag(), raw, opts.ByteOrder, budget)
 			if err != nil {
 				return Element{}, err
 			}
 			entry.Value = values
 			return entry, nil
 		case core.VRFL, core.VRFD, core.VRSS, core.VRUS, core.VRSL, core.VRUL, core.VRSV, core.VRUV:
-			values, err := marshalNumericValues(elem.Tag(), elem.VR(), raw, opts.ByteOrder)
+			values, err := marshalNumericValuesContext(elem.Tag(), elem.VR(), raw, opts.ByteOrder, budget)
 			if err != nil {
 				return Element{}, err
 			}
@@ -239,10 +440,53 @@ func marshalElement(obj *object.Object, elem core.Element, opts Options) (Elemen
 				return entry, nil
 			}
 		}
+		if !inlineBudgeted {
+			if err := budget.addInlineBinary(int64(len(raw))); err != nil {
+				return Element{}, err
+			}
+		}
 		entry.InlineBinary = base64.StdEncoding.EncodeToString(raw)
 	}
 
 	return entry, nil
+}
+
+func marshalsRawAsJSONValue(vr core.VR) bool {
+	switch vr {
+	case core.VRAT, core.VRFL, core.VRFD, core.VRSS, core.VRUS, core.VRSL, core.VRUL, core.VRSV, core.VRUV:
+		return true
+	default:
+		return false
+	}
+}
+
+func inlineValueFieldLength(elem core.Element) (int64, bool, error) {
+	switch value := elem.Value.(type) {
+	case core.FragmentSequence:
+		if len(value.OffsetTable)%4 != 0 {
+			return 0, false, fmt.Errorf("dicomjson: Basic Offset Table length %d is not a multiple of 4", len(value.OffsetTable))
+		}
+		total := int64(16 + len(value.OffsetTable)) // Basic Offset Table item and sequence delimiter.
+		for _, fragment := range value.Fragments {
+			fragmentLength := int64(len(fragment))
+			if fragmentLength%2 != 0 {
+				fragmentLength++
+			}
+			if fragmentLength > math.MaxUint32 {
+				return 0, false, fmt.Errorf("dicomjson: fragment length %d exceeds uint32", fragmentLength)
+			}
+			if total > math.MaxInt64-8-fragmentLength {
+				return 0, false, fmt.Errorf("dicomjson: encapsulated Pixel Data Value Field length overflows int64")
+			}
+			total += 8 + fragmentLength
+		}
+		return total, true, nil
+	case nil:
+		if elem.Header.HasLength() && elem.EncodedLength() != core.UndefinedLength {
+			return int64(elem.EncodedLength()), true, nil
+		}
+	}
+	return 0, false, nil
 }
 
 func pixelDataBulkReader(obj *object.Object, elem core.Element, order binary.ByteOrder) (func() (io.ReadCloser, error), bool, error) {
@@ -283,9 +527,19 @@ func streamingValueReader(write func(io.Writer) error) io.ReadCloser {
 
 func materializeRawValue(obj *object.Object, elem core.Element, order binary.ByteOrder) ([]byte, error) {
 	switch value := elem.Value.(type) {
+	case core.Uint16Value, core.Int16Value, core.Uint32Value, core.Int32Value,
+		core.Uint64Value, core.Int64Value, core.Float32Value, core.Float64Value, core.TagValue:
+		if err := valueencode.ValidateNumeric(elem.VR(), value); err != nil {
+			return nil, fmt.Errorf("dicomjson: marshal %s: %w", elem.Tag(), err)
+		}
+		raw, _, err := valueencode.Numeric(value, order)
+		return raw, err
 	case core.FragmentSequence:
 		if elem.Tag() != core.TagPixelData {
 			return nil, fmt.Errorf("dicomjson: marshal %s: FragmentSequence is only valid for Pixel Data", elem.Tag())
+		}
+		if elem.VR() != core.VROB && elem.VR() != core.VROW {
+			return nil, fmt.Errorf("dicomjson: marshal %s: FragmentSequence requires OB or OW VR", elem.Tag())
 		}
 		return fragmentSequenceValueField(value, order)
 	case nil:
@@ -359,15 +613,21 @@ func writeItemHeader(out io.Writer, order binary.ByteOrder, tag core.Tag, length
 	return err
 }
 
-func unmarshalDataSet(data []byte, path string, dict dictionary.DataDictionary, order binary.ByteOrder) (core.DataSet, error) {
+func unmarshalDataSetContext(data []byte, path string, dict dictionary.DataDictionary, opts UnmarshalOptions, budget *conversionBudget, depth int) (core.DataSet, error) {
+	if err := budget.checkContext(); err != nil {
+		return core.DataSet{}, err
+	}
 	var raw map[string]json.RawMessage
 	if err := decodeJSON(data, &raw); err != nil {
 		return core.DataSet{}, fmt.Errorf("dicomjson: decode dataset JSON: %w", err)
 	}
-	return unmarshalDataSetMap(raw, path, dict, order)
+	return unmarshalDataSetMapContext(raw, path, dict, opts, budget, depth)
 }
 
-func unmarshalDataSetMap(raw map[string]json.RawMessage, path string, dict dictionary.DataDictionary, order binary.ByteOrder) (core.DataSet, error) {
+func unmarshalDataSetMapContext(raw map[string]json.RawMessage, path string, dict dictionary.DataDictionary, opts UnmarshalOptions, budget *conversionBudget, depth int) (core.DataSet, error) {
+	if err := budget.enterDataSet(depth, len(raw)); err != nil {
+		return core.DataSet{}, err
+	}
 	keys := make([]string, 0, len(raw))
 	for key := range raw {
 		keys = append(keys, key)
@@ -376,12 +636,15 @@ func unmarshalDataSetMap(raw map[string]json.RawMessage, path string, dict dicti
 
 	elements := make([]core.Element, 0, len(keys))
 	for _, tagStr := range keys {
+		if err := budget.checkContext(); err != nil {
+			return core.DataSet{}, err
+		}
 		tagPath := joinJSONPath(path, tagStr)
 		tag, err := parseJSONTag(tagStr, tagPath)
 		if err != nil {
 			return core.DataSet{}, err
 		}
-		elem, err := unmarshalElement(tag, raw[tagStr], tagPath, dict, order)
+		elem, err := unmarshalElementContext(tag, raw[tagStr], tagPath, dict, opts, budget, depth)
 		if err != nil {
 			return core.DataSet{}, err
 		}
@@ -390,7 +653,10 @@ func unmarshalDataSetMap(raw map[string]json.RawMessage, path string, dict dicti
 	return core.DataSet{Elements: elements}, nil
 }
 
-func unmarshalElement(tag core.Tag, raw json.RawMessage, path string, dict dictionary.DataDictionary, order binary.ByteOrder) (core.Element, error) {
+func unmarshalElementContext(tag core.Tag, raw json.RawMessage, path string, dict dictionary.DataDictionary, opts UnmarshalOptions, budget *conversionBudget, depth int) (core.Element, error) {
+	if err := budget.checkContext(); err != nil {
+		return core.Element{}, err
+	}
 	var fields map[string]json.RawMessage
 	if err := decodeJSON(raw, &fields); err != nil {
 		return core.Element{}, pathError(path, "decode element JSON: %v", err)
@@ -455,11 +721,28 @@ func unmarshalElement(tag core.Tag, raw json.RawMessage, path string, dict dicti
 		if err := decodeJSON(fields["InlineBinary"], &encoded); err != nil {
 			return core.Element{}, pathError(joinJSONPath(path, "InlineBinary"), "decode InlineBinary: %v", err)
 		}
+		decodedLength := base64DecodedLength(encoded)
+		if err := budget.addInlineBinary(int64(decodedLength)); err != nil {
+			return core.Element{}, fmt.Errorf("dicomjson: %w at %s", err, joinJSONPath(path, "InlineBinary"))
+		}
 		data, err := base64.StdEncoding.DecodeString(encoded)
 		if err != nil {
 			return core.Element{}, pathError(joinJSONPath(path, "InlineBinary"), "inline binary data is not valid base64")
 		}
-		elem.Value = core.RawValue(core.CloneBytes(data))
+		if len(data) != decodedLength {
+			return core.Element{}, pathError(joinJSONPath(path, "InlineBinary"), "inline binary decoded length %d differs from expected %d", len(data), decodedLength)
+		}
+		if tag == core.TagPixelData && opts.TransferSyntax.Encapsulated {
+			fragments, err := parseEncapsulatedPixelDataValue(data, opts.TransferSyntax, dict, budget)
+			if err != nil {
+				return core.Element{}, fmt.Errorf("dicomjson: decode encapsulated Pixel Data at %s: %w", joinJSONPath(path, "InlineBinary"), err)
+			}
+			elem.Header.Length = core.UndefinedLength
+			elem.Header.LengthSet = true
+			elem.Value = fragments
+		} else {
+			elem.Value = core.RawValue(core.CloneBytes(data))
+		}
 		return elem, nil
 	case !hasValue:
 		elem.Value = emptyValueForVR(vr)
@@ -469,25 +752,25 @@ func unmarshalElement(tag core.Tag, raw json.RawMessage, path string, dict dicti
 	valuePath := joinJSONPath(path, "Value")
 	switch vr {
 	case core.VRSQ:
-		value, err := unmarshalSequence(fields["Value"], path, valuePath, dict, order)
+		value, err := unmarshalSequenceContext(fields["Value"], path, valuePath, dict, opts, budget, depth)
 		if err != nil {
 			return core.Element{}, err
 		}
 		elem.Value = value
 	case core.VRPN:
-		value, err := unmarshalPersonNames(fields["Value"], valuePath, vr)
+		value, err := unmarshalPersonNamesContext(fields["Value"], valuePath, vr, budget)
 		if err != nil {
 			return core.Element{}, err
 		}
 		elem.Value = value
 	case core.VRDS, core.VRIS:
-		value, err := unmarshalNumberStrings(fields["Value"], valuePath, vr)
+		value, err := unmarshalNumberStringsContext(fields["Value"], valuePath, vr, budget)
 		if err != nil {
 			return core.Element{}, err
 		}
 		elem.Value = value
 	case core.VRAT:
-		value, err := unmarshalAttributeTags(fields["Value"], valuePath, vr, order)
+		value, err := unmarshalAttributeTagsContext(fields["Value"], valuePath, vr, opts.ByteOrder, budget)
 		if err != nil {
 			return core.Element{}, err
 		}
@@ -495,13 +778,13 @@ func unmarshalElement(tag core.Tag, raw json.RawMessage, path string, dict dicti
 	case core.VRUN:
 		return core.Element{}, valueTypePathError(valuePath, vr, fields["Value"], "can't parse JSON Value in UN; use InlineBinary or BulkDataURI")
 	case core.VRFL, core.VROF, core.VRFD, core.VROD, core.VRSS, core.VRUS, core.VROW, core.VRSL, core.VRUL, core.VROL, core.VRSV, core.VRUV, core.VROV, core.VROB:
-		value, err := encodeNumericValues(vr, fields["Value"], valuePath, order)
+		value, err := encodeNumericValuesContext(vr, fields["Value"], valuePath, opts.ByteOrder, budget)
 		if err != nil {
 			return core.Element{}, err
 		}
 		elem.Value = core.RawValue(value)
 	case core.VRAE, core.VRAS, core.VRCS, core.VRDA, core.VRDT, core.VRLO, core.VRLT, core.VRSH, core.VRST, core.VRUT, core.VRUR, core.VRTM, core.VRUC, core.VRUI:
-		value, err := unmarshalStringValues(fields["Value"], valuePath, vr)
+		value, err := unmarshalStringValuesContext(fields["Value"], valuePath, vr, budget)
 		if err != nil {
 			return core.Element{}, err
 		}
@@ -513,13 +796,16 @@ func unmarshalElement(tag core.Tag, raw json.RawMessage, path string, dict dicti
 	return elem, nil
 }
 
-func unmarshalStringValues(raw json.RawMessage, path string, vr core.VR) (core.StringValue, error) {
+func unmarshalStringValuesContext(raw json.RawMessage, path string, vr core.VR, budget *conversionBudget) (core.StringValue, error) {
 	items, err := decodeValueArray(raw, path, vr)
 	if err != nil {
 		return nil, err
 	}
 	values := make([]string, len(items))
 	for i := range items {
+		if err := budget.checkContext(); err != nil {
+			return nil, err
+		}
 		value, err := decodeNullableStringValue(items[i], indexJSONPath(path, i), vr)
 		if err != nil {
 			return nil, err
@@ -529,13 +815,16 @@ func unmarshalStringValues(raw json.RawMessage, path string, vr core.VR) (core.S
 	return core.StringValue(values), nil
 }
 
-func unmarshalNumberStrings(raw json.RawMessage, path string, vr core.VR) (core.StringValue, error) {
+func unmarshalNumberStringsContext(raw json.RawMessage, path string, vr core.VR, budget *conversionBudget) (core.StringValue, error) {
 	items, err := decodeValueArray(raw, path, vr)
 	if err != nil {
 		return nil, err
 	}
 	values := make([]string, len(items))
 	for i := range items {
+		if err := budget.checkContext(); err != nil {
+			return nil, err
+		}
 		itemPath := indexJSONPath(path, i)
 		token, err := decodeNullableNumberOrStringValue(items[i], itemPath, vr)
 		if err != nil {
@@ -573,13 +862,16 @@ func validateNumberString(value string, vr core.VR) error {
 	return nil
 }
 
-func unmarshalPersonNames(raw json.RawMessage, path string, vr core.VR) (core.StringValue, error) {
+func unmarshalPersonNamesContext(raw json.RawMessage, path string, vr core.VR, budget *conversionBudget) (core.StringValue, error) {
 	items, err := decodeValueArray(raw, path, vr)
 	if err != nil {
 		return nil, err
 	}
 	values := make([]string, len(items))
 	for i := range items {
+		if err := budget.checkContext(); err != nil {
+			return nil, err
+		}
 		itemPath := indexJSONPath(path, i)
 		if isJSONNull(items[i]) {
 			continue
@@ -596,19 +888,25 @@ func unmarshalPersonNames(raw json.RawMessage, path string, vr core.VR) (core.St
 	return core.StringValue(values), nil
 }
 
-func unmarshalSequence(raw json.RawMessage, path, valuePath string, dict dictionary.DataDictionary, order binary.ByteOrder) (core.SequenceValue, error) {
+func unmarshalSequenceContext(raw json.RawMessage, path, valuePath string, dict dictionary.DataDictionary, opts UnmarshalOptions, budget *conversionBudget, depth int) (core.SequenceValue, error) {
 	items, err := decodeValueArray(raw, valuePath, core.VRSQ)
 	if err != nil {
 		return core.SequenceValue{}, err
 	}
+	if err := budget.addSequenceItems(len(items)); err != nil {
+		return core.SequenceValue{}, err
+	}
 	seq := core.SequenceValue{Items: make([]core.DataSet, 0, len(items))}
 	for i := range items {
+		if err := budget.checkContext(); err != nil {
+			return core.SequenceValue{}, err
+		}
 		itemPath := indexJSONPath(path, i)
 		var dataset map[string]json.RawMessage
 		if err := decodeJSON(items[i], &dataset); err != nil {
 			return core.SequenceValue{}, pathError(itemPath, "decode sequence item: %v", err)
 		}
-		ds, err := unmarshalDataSetMap(dataset, itemPath, dict, order)
+		ds, err := unmarshalDataSetMapContext(dataset, itemPath, dict, opts, budget, depth+1)
 		if err != nil {
 			return core.SequenceValue{}, err
 		}
@@ -617,13 +915,16 @@ func unmarshalSequence(raw json.RawMessage, path, valuePath string, dict diction
 	return seq, nil
 }
 
-func unmarshalAttributeTags(raw json.RawMessage, path string, vr core.VR, order binary.ByteOrder) (core.RawValue, error) {
+func unmarshalAttributeTagsContext(raw json.RawMessage, path string, vr core.VR, order binary.ByteOrder, budget *conversionBudget) (core.RawValue, error) {
 	items, err := decodeValueArray(raw, path, vr)
 	if err != nil {
 		return nil, err
 	}
 	data := make([]byte, 0, len(items)*4)
 	for i := range items {
+		if err := budget.checkContext(); err != nil {
+			return nil, err
+		}
 		itemPath := indexJSONPath(path, i)
 		value, err := decodeRequiredStringValue(items[i], itemPath, vr)
 		if err != nil {
@@ -641,13 +942,16 @@ func unmarshalAttributeTags(raw json.RawMessage, path string, vr core.VR, order 
 	return core.RawValue(data), nil
 }
 
-func encodeNumericValues(vr core.VR, raw json.RawMessage, path string, order binary.ByteOrder) ([]byte, error) {
+func encodeNumericValuesContext(vr core.VR, raw json.RawMessage, path string, order binary.ByteOrder, budget *conversionBudget) ([]byte, error) {
 	items, err := decodeValueArray(raw, path, vr)
 	if err != nil {
 		return nil, err
 	}
 	data := make([]byte, 0, len(items)*8)
 	for i := range items {
+		if err := budget.checkContext(); err != nil {
+			return nil, err
+		}
 		itemPath := indexJSONPath(path, i)
 		switch vr {
 		case core.VRFL, core.VROF:
@@ -802,12 +1106,15 @@ func joinPersonName(pn PersonNameComponents) string {
 	}
 }
 
-func marshalAttributeTags(tag core.Tag, raw []byte, order binary.ByteOrder) ([]any, error) {
+func marshalAttributeTagsContext(tag core.Tag, raw []byte, order binary.ByteOrder, budget *conversionBudget) ([]any, error) {
 	if len(raw)%4 != 0 {
 		return nil, invalidRawValueLengthError(tag, core.VRAT, len(raw), 4)
 	}
 	values := make([]any, 0, len(raw)/4)
 	for len(raw) > 0 {
+		if err := budget.checkContext(); err != nil {
+			return nil, err
+		}
 		value := core.NewTag(
 			order.Uint16(raw[0:2]),
 			order.Uint16(raw[2:4]),
@@ -818,7 +1125,7 @@ func marshalAttributeTags(tag core.Tag, raw []byte, order binary.ByteOrder) ([]a
 	return values, nil
 }
 
-func marshalNumericValues(tag core.Tag, vr core.VR, raw []byte, order binary.ByteOrder) ([]any, error) {
+func marshalNumericValuesContext(tag core.Tag, vr core.VR, raw []byte, order binary.ByteOrder, budget *conversionBudget) ([]any, error) {
 	width := numericValueWidth(vr)
 	if width == 0 {
 		return nil, fmt.Errorf("dicomjson: cannot marshal tag %s VR %s as JSON Value", tag, vr)
@@ -829,11 +1136,14 @@ func marshalNumericValues(tag core.Tag, vr core.VR, raw []byte, order binary.Byt
 
 	values := make([]any, 0, len(raw)/width)
 	for len(raw) > 0 {
+		if err := budget.checkContext(); err != nil {
+			return nil, err
+		}
 		switch vr {
 		case core.VRFL:
-			values = append(values, float64(math.Float32frombits(order.Uint32(raw[:4]))))
+			values = append(values, jsonFloatValue(float64(math.Float32frombits(order.Uint32(raw[:4])))))
 		case core.VRFD:
-			values = append(values, math.Float64frombits(order.Uint64(raw[:8])))
+			values = append(values, jsonFloatValue(math.Float64frombits(order.Uint64(raw[:8]))))
 		case core.VRSS:
 			values = append(values, int64(int16(order.Uint16(raw[:2]))))
 		case core.VRUS:
@@ -850,6 +1160,19 @@ func marshalNumericValues(tag core.Tag, vr core.VR, raw []byte, order binary.Byt
 		raw = raw[width:]
 	}
 	return values, nil
+}
+
+func jsonFloatValue(value float64) any {
+	switch {
+	case math.IsNaN(value):
+		return "NaN"
+	case math.IsInf(value, 1):
+		return "Infinity"
+	case math.IsInf(value, -1):
+		return "-Infinity"
+	default:
+		return value
+	}
 }
 
 func numericValueWidth(vr core.VR) int {

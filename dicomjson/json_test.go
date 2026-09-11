@@ -718,7 +718,7 @@ func TestMarshalCompactAndPrettyFormatting(t *testing.T) {
 	}
 }
 
-func TestMarshalRetainsVRForMalformedSequenceElement(t *testing.T) {
+func TestMarshalRejectsMalformedSequenceRatherThanDroppingValue(t *testing.T) {
 	obj := object.FromDataSet(core.DataSet{
 		Elements: []core.Element{
 			{
@@ -729,13 +729,8 @@ func TestMarshalRetainsVRForMalformedSequenceElement(t *testing.T) {
 	}, std.Dictionary)
 
 	got, err := MarshalCompact(obj)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	const want = "{\"00081111\":{\"vr\":\"SQ\"}}"
-	if string(got) != want {
-		t.Fatalf("MarshalCompact() = %s, want %s", got, want)
+	if err == nil || len(got) != 0 || !strings.Contains(err.Error(), "(0008,1111)") {
+		t.Fatalf("MarshalCompact() = %s, %v; want a tag-specific error", got, err)
 	}
 }
 

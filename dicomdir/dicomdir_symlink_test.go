@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/ThalesMMS/dicom-go/internal/testutil"
 )
 
 func TestResolveRejectsSymlinkOutsideRoot(t *testing.T) {
@@ -14,9 +16,7 @@ func TestResolveRejectsSymlinkOutsideRoot(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(outside, "outside.dcm"), []byte("outside"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Symlink(outside, filepath.Join(root, "LINK")); err != nil {
-		t.Skipf("symlinks unavailable: %v", err)
-	}
+	testutil.SymlinkOrSkip(t, outside, filepath.Join(root, "LINK"))
 
 	ref := Reference{FileID: []string{"LINK", "outside.dcm"}}
 	if got := Resolve(root, ref); got != "" {
@@ -46,9 +46,7 @@ func TestOpenReferencedFileRejectsComponentReplacedAfterResolution(t *testing.T)
 	if err := os.WriteFile(filepath.Join(outside, "IM1"), []byte("outside"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Symlink(outside, images); err != nil {
-		t.Skipf("symlinks unavailable: %v", err)
-	}
+	testutil.SymlinkOrSkip(t, outside, images)
 
 	file, _, err := OpenReferencedFile(root, ref)
 	if err == nil {

@@ -7,12 +7,12 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"runtime"
 	"testing"
 
 	"github.com/ThalesMMS/dicom-go/core"
 	"github.com/ThalesMMS/dicom-go/dicomdir"
 	"github.com/ThalesMMS/dicom-go/index"
+	"github.com/ThalesMMS/dicom-go/internal/testutil"
 	"github.com/ThalesMMS/dicom-go/object"
 )
 
@@ -23,12 +23,7 @@ func TestOpenReferencedFileRejectsSymlinkRoot(t *testing.T) {
 	}
 	linkParent := t.TempDir()
 	linkRoot := filepath.Join(linkParent, "MEDIA")
-	if err := os.Symlink(outside, linkRoot); err != nil {
-		if runtime.GOOS == "windows" {
-			t.Skipf("symlink creation is unavailable: %v", err)
-		}
-		t.Fatal(err)
-	}
+	testutil.SymlinkOrSkip(t, outside, linkRoot)
 
 	file, _, err := dicomdir.OpenReferencedFile(linkRoot, dicomdir.Reference{FileID: []string{"IMAGE001"}})
 	if file != nil {
@@ -363,12 +358,7 @@ func TestParseFileSetRejectsSymlinkAndNonReservedName(t *testing.T) {
 		t.Fatalf("ParseFileSet(non-DICOMDIR) error = %v, want ErrInvalidRecord", err)
 	}
 	linkPath := filepath.Join(root, "DICOMDIR")
-	if err := os.Symlink(realPath, linkPath); err != nil {
-		if runtime.GOOS == "windows" {
-			t.Skipf("symlink creation is unavailable: %v", err)
-		}
-		t.Fatal(err)
-	}
+	testutil.SymlinkOrSkip(t, realPath, linkPath)
 	if _, err := dicomdir.ParseFileSet(linkPath); !errors.Is(err, dicomdir.ErrInvalidRecord) {
 		t.Fatalf("ParseFileSet(symlink) error = %v, want ErrInvalidRecord", err)
 	}

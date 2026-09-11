@@ -15,6 +15,7 @@ import (
 	"github.com/ThalesMMS/dicom-go/core"
 	"github.com/ThalesMMS/dicom-go/dicomdir"
 	"github.com/ThalesMMS/dicom-go/dictionary/std"
+	"github.com/ThalesMMS/dicom-go/internal/testutil"
 	"github.com/ThalesMMS/dicom-go/object"
 	"github.com/ThalesMMS/dicom-go/transfer"
 )
@@ -132,9 +133,7 @@ func TestFileSetRejectsRootAndSourceSymlinks(t *testing.T) {
 	t.Run("root", func(t *testing.T) {
 		realRoot := t.TempDir()
 		alias := filepath.Join(t.TempDir(), "MEDIA")
-		if err := os.Symlink(realRoot, alias); err != nil {
-			t.Skipf("symlinks unavailable: %v", err)
-		}
+		testutil.SymlinkOrSkip(t, realRoot, alias)
 		_, err := dicomdir.NewFileSet(alias, testOptions(dicomdir.Options{}))
 		if err == nil {
 			t.Fatal("NewFileSet(symlink root) error = nil")
@@ -147,9 +146,7 @@ func TestFileSetRejectsRootAndSourceSymlinks(t *testing.T) {
 		target := filepath.Join(root, "TARGET01")
 		writeTestDICOM(t, target, "1.2.826.0.1.3680043.10.543.625.103")
 		link := filepath.Join(root, "LINK0001")
-		if err := os.Symlink(target, link); err != nil {
-			t.Skipf("symlinks unavailable: %v", err)
-		}
+		testutil.SymlinkOrSkip(t, target, link)
 		fs := newTestFileSet(t, root, dicomdir.Options{})
 		err := fs.Add(context.Background(), mustFileID(t, "LINK0001"))
 		if err == nil {
@@ -173,9 +170,7 @@ func TestFileSetDoesNotFollowRootReplacedAfterConstruction(t *testing.T) {
 		}
 		outside := t.TempDir()
 		writeTestDICOM(t, filepath.Join(outside, "IMAGE001"), "1.2.826.0.1.3680043.10.543.625.105")
-		if err := os.Symlink(outside, root); err != nil {
-			t.Skipf("symlinks unavailable: %v", err)
-		}
+		testutil.SymlinkOrSkip(t, outside, root)
 
 		err := fs.Add(context.Background(), mustFileID(t, "IMAGE001"))
 		if err == nil {
@@ -200,9 +195,7 @@ func TestFileSetDoesNotFollowRootReplacedAfterConstruction(t *testing.T) {
 			t.Fatal(err)
 		}
 		outside := t.TempDir()
-		if err := os.Symlink(outside, root); err != nil {
-			t.Skipf("symlinks unavailable: %v", err)
-		}
+		testutil.SymlinkOrSkip(t, outside, root)
 
 		_, err := dicomdir.CommitDICOMDIR(context.Background(), fs, dicomdir.WriteOptions{})
 		if !errors.Is(err, dicomdir.ErrSourceChanged) {
@@ -414,9 +407,7 @@ func TestCommitDICOMDIRDoesNotFollowDestinationSymlink(t *testing.T) {
 		t.Fatal(err)
 	}
 	destination := filepath.Join(root, "DICOMDIR")
-	if err := os.Symlink(outside, destination); err != nil {
-		t.Skipf("symlinks unavailable: %v", err)
-	}
+	testutil.SymlinkOrSkip(t, outside, destination)
 
 	_, err := dicomdir.CommitDICOMDIR(context.Background(), fs, dicomdir.WriteOptions{})
 	if err == nil {
@@ -453,9 +444,7 @@ func TestCommitDICOMDIRNeverReopensReplacedSourceThroughSymlink(t *testing.T) {
 	if err := os.WriteFile(outside, wantOutside, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Symlink(outside, path); err != nil {
-		t.Skipf("symlinks unavailable: %v", err)
-	}
+	testutil.SymlinkOrSkip(t, outside, path)
 
 	_, err := dicomdir.CommitDICOMDIR(context.Background(), fs, dicomdir.WriteOptions{})
 	if !errors.Is(err, dicomdir.ErrSourceChanged) {

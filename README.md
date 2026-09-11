@@ -273,3 +273,13 @@ documented in [Fuzzing](./docs/FUZZING.md). Large parser and Part 10 benchmark
 comparisons use the informational, benchstat-based
 [large-dataset workflow](./docs/LARGE_DATASET_BENCHMARKS.md). Regenerate the
 standard dictionary with `go generate ./dictionary/std`.
+
+## License
+
+Copyright 2026 Thales Matheus Mendonça Santos.
+
+Unless a file states otherwise, this project is licensed under the
+[Apache License, Version 2.0](LICENSE). Third-party data and components retain
+their own licenses and attribution requirements; see
+[third-party notices](THIRD_PARTY_NOTICES.md) and the notices accompanying
+individual files.

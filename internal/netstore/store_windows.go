@@ -10,10 +10,10 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-func protectInstanceFile(path string) error {
+func protectInstanceFile(file *os.File) error {
 	// Windows os.Chmod only controls FILE_ATTRIBUTE_READONLY. Clear it before
 	// replacing the inherited DACL with the private policy.
-	if err := os.Chmod(path, 0o600); err != nil {
+	if err := file.Chmod(0o600); err != nil {
 		return err
 	}
 	userSID, systemSID, err := instanceFilePrivacySIDs()
@@ -45,8 +45,8 @@ func protectInstanceFile(path string) error {
 	if err != nil {
 		return err
 	}
-	if err := windows.SetNamedSecurityInfo(
-		path,
+	if err := windows.SetSecurityInfo(
+		windows.Handle(file.Fd()),
 		windows.SE_FILE_OBJECT,
 		windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION,
 		userSID,
@@ -56,7 +56,7 @@ func protectInstanceFile(path string) error {
 	); err != nil {
 		return err
 	}
-	private, err := isPrivateInstanceFile(path)
+	private, err := isPrivateInstanceHandle(file)
 	if err != nil {
 		return err
 	}
@@ -67,15 +67,23 @@ func protectInstanceFile(path string) error {
 }
 
 func isPrivateInstanceFile(path string) (bool, error) {
-	info, err := os.Stat(path)
+	file, err := os.Open(path)
+	if err != nil {
+		return false, err
+	}
+	defer file.Close()
+	return isPrivateInstanceHandle(file)
+}
+func isPrivateInstanceHandle(file *os.File) (bool, error) {
+	info, err := file.Stat()
 	if err != nil {
 		return false, err
 	}
 	if info.Mode().Perm()&0o200 == 0 {
 		return false, nil
 	}
-	descriptor, err := windows.GetNamedSecurityInfo(
-		path,
+	descriptor, err := windows.GetSecurityInfo(
+		windows.Handle(file.Fd()),
 		windows.SE_FILE_OBJECT,
 		windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION,
 	)

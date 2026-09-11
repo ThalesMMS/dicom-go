@@ -4,8 +4,8 @@ package netstore
 
 import "os"
 
-func protectInstanceFile(path string) error {
-	return os.Chmod(path, 0o600)
+func protectInstanceFile(file *os.File) error {
+	return file.Chmod(0o600)
 }
 
 func isPrivateInstanceFile(path string) (bool, error) {

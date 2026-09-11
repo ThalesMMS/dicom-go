@@ -1,8 +1,7 @@
 package netstore
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -12,110 +11,124 @@ import (
 	"github.com/ThalesMMS/dicom-go/core"
 	"github.com/ThalesMMS/dicom-go/dictionary/std"
 	"github.com/ThalesMMS/dicom-go/internal/dicomtags"
+	"github.com/ThalesMMS/dicom-go/internal/nofollow"
 	"github.com/ThalesMMS/dicom-go/net/ul"
 	"github.com/ThalesMMS/dicom-go/object"
 	"github.com/ThalesMMS/dicom-go/transfer"
 )
 
-func ValidateCStoreDataSet(affectedSOPClassUID, affectedSOPInstanceUID string, pc ul.AcceptedContext, dataset *object.Object) error {
+var ErrInvalidIdentity = errors.New("netstore: invalid SOP identity")
+var ErrUnsafeDirectory = errors.New("netstore: output directory changed or unsafe")
+var ErrCollisionLimit = errors.New("netstore: unique instance limit reached")
+
+// Error exposes an operation and publication state, never a UID, path or remote
+// value. Unwrap preserves the cause for errors.Is/As; do not log the cause raw.
+type Error struct {
+	Operation string
+	Published bool
+	cause     error
+}
+
+func (e *Error) Error() string {
+	if e.Published {
+		return "netstore: " + e.Operation + " failed after publication"
+	}
+	return "netstore: " + e.Operation + " failed"
+}
+func (e *Error) Unwrap() error                    { return e.cause }
+func failure(operation string, cause error) error { return &Error{Operation: operation, cause: cause} }
+
+// Dataset UIDs accept only the existing UI padding normalization. Multiplicity,
+// VR and canonical identity are validated separately from filename construction.
+func dataSetIdentity(dataset *object.Object) (string, string, error) {
 	if dataset == nil {
-		return errors.New("missing dataset")
+		return "", "", errors.New("missing dataset")
 	}
-	if affectedSOPClassUID == "" {
-		return errors.New("missing affected SOP Class UID")
+	class, ok := dataset.GetUIDs(dicomtags.SOPClassUID)
+	if !ok || len(class) == 0 {
+		return "", "", object.ErrMissingSOPClassUID
 	}
-	if affectedSOPInstanceUID == "" {
-		return errors.New("missing affected SOP Instance UID")
+	instance, ok := dataset.GetUIDs(dicomtags.SOPInstanceUID)
+	if !ok || len(instance) == 0 {
+		return "", "", object.ErrMissingSOPInstanceUID
 	}
-	if pc.AbstractSyntaxUID != affectedSOPClassUID {
-		return fmt.Errorf("presentation context SOP Class UID %q does not match request %q", pc.AbstractSyntaxUID, affectedSOPClassUID)
+	if len(class) != 1 || len(instance) != 1 || !core.IsValidUID(class[0]) || !core.IsValidUID(instance[0]) {
+		return "", "", ErrInvalidIdentity
 	}
-	if sopClassUID, ok := dataset.GetUID(dicomtags.SOPClassUID); !ok || sopClassUID != affectedSOPClassUID {
-		return errors.New("dataset SOP Class UID does not match request")
+	return class[0], instance[0], nil
+}
+
+func ValidateCStoreDataSet(affectedSOPClassUID, affectedSOPInstanceUID string, pc ul.AcceptedContext, dataset *object.Object) error {
+	class, instance, err := dataSetIdentity(dataset)
+	if err != nil {
+		return err
 	}
-	if sopInstanceUID, ok := dataset.GetUID(dicomtags.SOPInstanceUID); !ok || sopInstanceUID != affectedSOPInstanceUID {
-		return errors.New("dataset SOP Instance UID does not match request")
+	if !core.IsValidUID(affectedSOPClassUID) || !core.IsValidUID(affectedSOPInstanceUID) || !core.IsValidUID(pc.AbstractSyntaxUID) {
+		return ErrInvalidIdentity
+	}
+	if pc.AbstractSyntaxUID != affectedSOPClassUID || class != affectedSOPClassUID || instance != affectedSOPInstanceUID {
+		return ErrInvalidIdentity
 	}
 	return nil
 }
 
+// SavePart10 publishes only a complete file. Use SavePart10WithContext for a
+// cancelable transfer. Neither function silently repairs invalid SOP identities.
 func SavePart10(outDir string, dataset *object.Object, syntax transfer.Syntax) (string, error) {
-	if dataset == nil {
-		return "", errors.New("missing dataset")
-	}
-	sopClassUID, ok := dataset.GetUID(dicomtags.SOPClassUID)
-	if !ok || sopClassUID == "" {
-		return "", object.ErrMissingSOPClassUID
-	}
-	sopInstanceUID, ok := dataset.GetUID(dicomtags.SOPInstanceUID)
-	if !ok || sopInstanceUID == "" {
-		return "", object.ErrMissingSOPInstanceUID
-	}
-
-	path, f, err := CreateInstanceFile(outDir, sopInstanceUID)
-	if err != nil {
-		return "", err
-	}
-	committed := false
-	defer func() {
-		_ = f.Close()
-		if !committed {
-			_ = os.Remove(path)
-		}
-	}()
-
-	file := &object.File{
-		Meta: object.FromElements([]core.Element{
-			newUIElement(dicomtags.MediaStorageSOPClassUID, sopClassUID),
-			newUIElement(dicomtags.MediaStorageSOPInstanceUID, sopInstanceUID),
-			newUIElement(dicomtags.TransferSyntaxUID, syntax.UID),
-		}, std.Dictionary),
-		Dataset:        dataset,
-		TransferSyntax: syntax,
-	}
-	if err := object.WriteFile(f, file); err != nil {
-		return "", err
-	}
-	if err := f.Close(); err != nil {
-		return "", err
-	}
-	committed = true
-	return path, nil
+	return SavePart10WithContext(context.Background(), outDir, dataset, syntax)
+}
+func SavePart10WithContext(ctx context.Context, outDir string, dataset *object.Object, syntax transfer.Syntax) (string, error) {
+	return savePart10(ctx, outDir, dataset, syntax, defaultSaveOperations())
 }
 
+func part10File(dataset *object.Object, syntax transfer.Syntax, class, instance string) *object.File {
+	return &object.File{Meta: object.FromElements([]core.Element{
+		newUIElement(dicomtags.MediaStorageSOPClassUID, class),
+		newUIElement(dicomtags.MediaStorageSOPInstanceUID, instance),
+		newUIElement(dicomtags.TransferSyntaxUID, syntax.UID),
+	}, std.Dictionary), Dataset: dataset, TransferSyntax: syntax}
+}
+
+// CreateInstanceFile is a low-level exclusive reservation, not publication of a
+// complete instance. CLI persistence uses SavePart10WithContext instead.
 func CreateInstanceFile(outDir, sopInstanceUID string) (string, *os.File, error) {
 	return createInstanceFile(outDir, sopInstanceUID, protectInstanceFile)
 }
-
-func createInstanceFile(outDir, sopInstanceUID string, protect func(string) error) (string, *os.File, error) {
-	base := SafeFileBase(sopInstanceUID)
+func createInstanceFile(outDir, sopInstanceUID string, protect func(*os.File) error) (string, *os.File, error) {
+	if !core.IsValidUID(sopInstanceUID) {
+		return "", nil, ErrInvalidIdentity
+	}
+	parent, err := nofollow.OpenDirectory(outDir)
+	if err != nil {
+		return "", nil, failure("open output", err)
+	}
+	defer parent.Close()
 	for i := 0; i < 1000; i++ {
-		name := base + ".dcm"
-		if i > 0 {
-			name = fmt.Sprintf("%s.%d.dcm", base, i)
-		}
-		path := filepath.Join(outDir, name)
-		f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
-		if err == nil {
-			if err := protect(path); err != nil {
-				closeErr := f.Close()
-				removeErr := os.Remove(path)
-				return "", nil, errors.Join(
-					fmt.Errorf("protect DICOM instance file: %w", err),
-					closeErr,
-					removeErr,
-				)
-			}
-			return path, f, nil
-		}
+		name := instanceName(sopInstanceUID, i)
+		f, err := nofollow.CreateAt(parent, name)
 		if errors.Is(err, os.ErrExist) {
 			continue
 		}
-		return "", nil, err
+		if err != nil {
+			return "", nil, failure("create instance", err)
+		}
+		if err := protect(f); err != nil {
+			cause := errors.Join(err, f.Close(), nofollow.RemoveAt(parent, name))
+			return "", nil, failure("protect instance", cause)
+		}
+		return filepath.Join(outDir, name), f, nil
 	}
-	return "", nil, fmt.Errorf("could not create unique file for SOP Instance UID hash %s", safeID(sopInstanceUID))
+	return "", nil, ErrCollisionLimit
+}
+func instanceName(uid string, collision int) string {
+	if collision == 0 {
+		return uid + ".dcm"
+	}
+	return fmt.Sprintf("%s.%d.dcm", uid, collision)
 }
 
+// SafeFileBase is a legacy display/name transform, not UID validation. It is
+// never used to authorize identity or choose a received-instance filename.
 func SafeFileBase(uid string) string {
 	uid = core.NormalizeUID(uid)
 	if uid == "" {
@@ -137,11 +150,6 @@ func SafeFileBase(uid string) string {
 		name = "_" + name[1:]
 	}
 	return name
-}
-
-func safeID(value string) string {
-	sum := sha256.Sum256([]byte(value))
-	return hex.EncodeToString(sum[:])[:16]
 }
 
 func newUIElement(tag core.Tag, value string) core.Element {

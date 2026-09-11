@@ -97,7 +97,7 @@ func TestCreateInstanceFileRemovesFileWhenProtectionFails(t *testing.T) {
 	dir := t.TempDir()
 	protectionErr := errors.New("injected protection failure")
 
-	path, f, err := createInstanceFile(dir, "1.2.3", func(string) error {
+	path, f, err := createInstanceFile(dir, "1.2.3", func(*os.File) error {
 		return protectionErr
 	})
 	if !errors.Is(err, protectionErr) {

@@ -49,7 +49,7 @@ func ServeAssociation(ctx context.Context, assoc *ul.Association, opts Associati
 		if err != nil {
 			return err
 		}
-		started := time.Now()
+		timer := startElapsedTimer(time.Now)
 		assoc.RecordOperationObservation(telemetry.OperationObservation{
 			PresentationContextID: pcID,
 			CommandField:          field,
@@ -68,7 +68,7 @@ func ServeAssociation(ctx context.Context, assoc *ul.Association, opts Associati
 			Completed:             true,
 			PresentationContextID: pcID,
 			CommandField:          field,
-			Duration:              time.Since(started),
+			Duration:              timer.elapsed(),
 			ErrorClass:            associationOperationErrorClass(err),
 		})
 		if err == nil {
@@ -105,6 +105,13 @@ func serveAssociationCommand(ctx context.Context, assoc *ul.Association, pcID by
 			return fmt.Errorf("dicom dimse: missing C-GET handler")
 		}
 		return serveAssociationCGetCommand(ctx, assoc, pcID, command, opts.CGetHandler)
+	case CCancelRQ:
+		// Active operations consume their correlated C-CANCEL through the cancel
+		// monitor. A cancel can legitimately arrive just after an operation has
+		// completed; validate and ignore that stale request so the association
+		// remains reusable instead of treating it as an unknown DIMSE command.
+		_, err := ParseCCancelRequest(command)
+		return err
 	case NEventReportRQ, NGetRQ, NSetRQ, NActionRQ, NCreateRQ, NDeleteRQ:
 		options := NormalizedSCPOptions{}
 		if opts.NormalizedSCP != nil {
@@ -173,6 +180,9 @@ func serveAssociationCMoveCommand(ctx context.Context, assoc *ul.Association, pc
 	if sopClassUID == PatientRootMoveSOPClassUID {
 		return servePatientRootCMoveCommand(ctx, assoc, pcID, command, handler)
 	}
+	if model, ok := nonPatientRetrieveModel(sopClassUID); ok {
+		return serveNonPatientCMove(ctx, assoc, pcID, command, model, handler)
+	}
 	return serveStudyRootCMoveCommand(ctx, assoc, pcID, command, handler)
 }
 
@@ -183,6 +193,9 @@ func serveAssociationCGetCommand(ctx context.Context, assoc *ul.Association, pcI
 	}
 	if sopClassUID == PatientRootGetSOPClassUID {
 		return servePatientRootCGetCommand(ctx, assoc, pcID, command, handler)
+	}
+	if model, ok := nonPatientRetrieveModel(sopClassUID); ok {
+		return serveNonPatientCGet(ctx, assoc, pcID, command, model, handler)
 	}
 	return serveStudyRootCGetCommand(ctx, assoc, pcID, command, handler)
 }

@@ -117,6 +117,30 @@ func TestServeAssociationHandlesCEchoAndCFindOnSameAssociation(t *testing.T) {
 	}
 }
 
+func TestServeAssociationIgnoresLateCCancelAndRemainsReusable(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	peer, local := testPipeAssociations(t, []ul.AcceptedContext{{
+		ID: 1, AbstractSyntaxUID: VerificationSOPClassUID, TransferSyntaxUID: ul.ImplicitVRLittleEndian,
+	}})
+	serverDone := make(chan error, 1)
+	go func() { serverDone <- ServeAssociation(ctx, local, AssociationSCPOptions{}) }()
+
+	if err := SendCCancelRequest(peer, 1, CCancelRequest{MessageIDBeingRespondedTo: 41}); err != nil {
+		t.Fatal(err)
+	}
+	response, err := SendCEcho(peer, 1, 42)
+	if err != nil || response.Status != StatusSuccess {
+		t.Fatalf("C-ECHO after late C-CANCEL = %#v, %v", response, err)
+	}
+	if err := peer.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-serverDone; err != nil {
+		t.Fatalf("ServeAssociation() error = %v", err)
+	}
+}
+
 func TestServeAssociationKeepsOpenAfterCMoveSCPStatus(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()

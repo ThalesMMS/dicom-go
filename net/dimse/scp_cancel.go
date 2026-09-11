@@ -13,6 +13,7 @@ import (
 type scpInterleavedCommand struct {
 	pcID    byte
 	command *object.Object
+	err     error
 }
 
 // scpCancelMonitor owns association reads while one FIND/MOVE/GET operation is
@@ -109,6 +110,9 @@ func (m *scpCancelMonitor) receiveCStoreResponse(ctx context.Context, _ *ul.Asso
 			}
 			return nil, fmt.Errorf("dicom dimse: C-GET command monitor stopped before C-STORE response")
 		}
+		if event.err != nil {
+			return nil, event.err
+		}
 		if event.pcID != expectedPCID {
 			return nil, fmt.Errorf("%w: got %d, want %d", ErrPresentationContextMismatch, event.pcID, expectedPCID)
 		}
@@ -158,6 +162,13 @@ func (m *scpCancelMonitor) run(ctx context.Context, assoc *ul.Association) {
 			m.canceled = true
 			m.mu.Unlock()
 			m.operationCancel(m.cancelErr)
+			if m.allowStoreRSP {
+				select {
+				case m.commands <- scpInterleavedCommand{err: m.cancelErr}:
+				case <-ctx.Done():
+					return
+				}
+			}
 		case CStoreRSP:
 			if !m.allowStoreRSP {
 				m.fail(fmt.Errorf("dicom dimse: unexpected C-STORE-RSP during active operation"))

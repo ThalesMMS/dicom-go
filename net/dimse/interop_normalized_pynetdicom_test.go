@@ -220,8 +220,11 @@ func requirePynetdicomInterop(t *testing.T) string {
 	if python == "" {
 		python = "python3"
 	}
-	if err := exec.Command(python, "-c", "import pydicom, pynetdicom").Run(); err != nil {
-		t.Fatalf("%s is set but %q cannot import pydicom and pynetdicom: %v", pynetdicomInteropEnv, python, err)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	version, err := exec.CommandContext(ctx, python, "-c", "import pydicom, pynetdicom; print(pydicom.__version__ + '/' + pynetdicom.__version__)").Output()
+	if err != nil || strings.TrimSpace(string(version)) != "3.0.2/3.0.4" {
+		t.Fatalf("%s explicitly requires pydicom 3.0.2 and pynetdicom 3.0.4 in %q; install scripts/requirements-pynetdicom-interop.txt (probe error: %v)", pynetdicomInteropEnv, python, err)
 	}
 	return python
 }

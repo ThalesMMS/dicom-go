@@ -276,7 +276,7 @@ func TestServeStudyRootCGetHonorsCancelWhileWaitingForCStoreResponse(t *testing.
 	if err := SendDataSet(peer, 1, object.FromElements(identifier, std.Dictionary), transfer.ImplicitVRLittleEndian); err != nil {
 		t.Fatal(err)
 	}
-	storeReq, err := ReceiveCStoreRequest(peer, 3)
+	_, err = ReceiveCStoreRequest(peer, 3)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -284,14 +284,6 @@ func TestServeStudyRootCGetHonorsCancelWhileWaitingForCStoreResponse(t *testing.
 		t.Fatal(err)
 	}
 	if err := SendCCancelRequest(peer, 1, CCancelRequest{MessageIDBeingRespondedTo: 9}); err != nil {
-		t.Fatal(err)
-	}
-	if err := SendCStoreResponse(peer, 3, CStoreResponse{
-		AffectedSOPClassUID:       storeReq.AffectedSOPClassUID,
-		MessageIDBeingRespondedTo: storeReq.MessageID,
-		AffectedSOPInstanceUID:    storeReq.AffectedSOPInstanceUID,
-		Status:                    StatusSuccess,
-	}); err != nil {
 		t.Fatal(err)
 	}
 	command, err := receiveCommandSetWithContext(ctx, peer, 1)
@@ -305,8 +297,11 @@ func TestServeStudyRootCGetHonorsCancelWhileWaitingForCStoreResponse(t *testing.
 	if final.Status != StatusCGetCancel {
 		t.Fatalf("final C-GET status = 0x%04X, want cancel", final.Status)
 	}
-	if final.NumberOfCompletedSuboperationsOrNil == nil || *final.NumberOfCompletedSuboperationsOrNil != 1 {
-		t.Fatalf("completed sub-operations = %v, want 1", final.NumberOfCompletedSuboperationsOrNil)
+	if final.NumberOfRemainingSuboperationsOrNil == nil || *final.NumberOfRemainingSuboperationsOrNil != 2 {
+		t.Fatalf("remaining sub-operations = %v, want 2", final.NumberOfRemainingSuboperationsOrNil)
+	}
+	if final.NumberOfCompletedSuboperationsOrNil == nil || *final.NumberOfCompletedSuboperationsOrNil != 0 {
+		t.Fatalf("completed sub-operations = %v, want 0", final.NumberOfCompletedSuboperationsOrNil)
 	}
 	if err := <-serverDone; !errors.Is(err, ErrCGetCanceled) {
 		t.Fatalf("ServeStudyRootCGet() error = %v, want ErrCGetCanceled", err)

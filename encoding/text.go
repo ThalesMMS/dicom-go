@@ -9,11 +9,13 @@ import (
 
 	textencoding "golang.org/x/text/encoding"
 	"golang.org/x/text/encoding/htmlindex"
+	"golang.org/x/text/encoding/japanese"
 )
 
 var (
-	ErrUnsupportedCharset       = errors.New("dicom: unsupported specific character set")
-	ErrUnrepresentableCharacter = errors.New("dicom: character cannot be represented in the selected character set")
+	ErrUnsupportedCharset        = errors.New("dicom: unsupported specific character set")
+	ErrUnrepresentableCharacter  = errors.New("dicom: character cannot be represented in the selected character set")
+	ErrInvalidCharsetDeclaration = errors.New("dicom: invalid specific character set declaration")
 )
 
 // ErrUnsupportedCharacterSet is kept as a compatibility alias for older call sites.
@@ -151,6 +153,86 @@ type xTextCodec struct {
 	encoding  textencoding.Encoding
 }
 
+// jisX0201Codec implements the exact DICOM ISO_IR 13 repertoire. Unlike a
+// Shift-JIS codec, it cannot silently admit double-byte JIS X 0208 characters.
+// DICOM assigns JIS Roman to G0 and half-width Katakana to G1 for this term.
+type jisX0201Codec struct {
+	dicomName string
+}
+
+func (c jisX0201Codec) Name() string { return c.dicomName }
+
+func (c jisX0201Codec) Decode(raw []byte) (string, error) {
+	return c.decode(raw, true)
+}
+
+func (c jisX0201Codec) DecodeSingleValue(raw []byte) (string, error) {
+	return c.decode(raw, false)
+}
+
+func (c jisX0201Codec) decode(raw []byte, valueDelimiter bool) (string, error) {
+	var output strings.Builder
+	output.Grow(len(raw))
+	for offset, value := range raw {
+		switch {
+		case value >= 0x20 && value <= 0x7e:
+			switch value {
+			case 0x5c:
+				if valueDelimiter {
+					output.WriteByte(value)
+				} else {
+					output.WriteRune('¥')
+				}
+			case 0x7e:
+				output.WriteRune('‾')
+			default:
+				output.WriteByte(value)
+			}
+		case value >= 0xa1 && value <= 0xdf:
+			decoded, err := japanese.ShiftJIS.NewDecoder().Bytes([]byte{value})
+			if err != nil || strings.ContainsRune(string(decoded), utf8.RuneError) {
+				return "", &DecodeError{Charset: c.Name(), Offset: offset, Byte: value}
+			}
+			output.Write(decoded)
+		default:
+			return "", &DecodeError{Charset: c.Name(), Offset: offset, Byte: value}
+		}
+	}
+	return output.String(), nil
+}
+
+func (c jisX0201Codec) Encode(text string) ([]byte, error) {
+	return c.encode(text, true)
+}
+
+func (c jisX0201Codec) EncodeSingleValue(text string) ([]byte, error) {
+	return c.encode(text, false)
+}
+
+func (c jisX0201Codec) encode(text string, valueDelimiter bool) ([]byte, error) {
+	if !utf8.ValidString(text) {
+		return nil, fmt.Errorf("dicom: encode %s: invalid UTF-8 input", c.Name())
+	}
+	out := make([]byte, 0, len(text))
+	for offset, value := range text {
+		switch {
+		case value == '¥' && !valueDelimiter:
+			out = append(out, 0x5c)
+		case value == '‾':
+			out = append(out, 0x7e)
+		case value >= 0x20 && value <= 0x7d && value != '\\' && value != '¥':
+			out = append(out, byte(value))
+		default:
+			raw, err := japanese.ShiftJIS.NewEncoder().Bytes([]byte(string(value)))
+			if err != nil || len(raw) != 1 || raw[0] < 0xa1 || raw[0] > 0xdf {
+				return nil, fmt.Errorf("%w: encode %s rune %q at UTF-8 byte %d", ErrUnrepresentableCharacter, c.Name(), value, offset)
+			}
+			out = append(out, raw[0])
+		}
+	}
+	return out, nil
+}
+
 func (c xTextCodec) Name() string {
 	return c.dicomName
 }
@@ -182,7 +264,8 @@ func (c xTextCodec) Encode(text string) ([]byte, error) {
 // alphabetic, ideographic, and phonetic component groups using a deterministic
 // 1/2/3-code fallback rule.
 type SpecificCharacterSet struct {
-	codecs []TextCodec
+	codecs  []TextCodec
+	iso2022 *iso2022CharacterSet
 }
 
 func (s SpecificCharacterSet) Name() string {
@@ -199,18 +282,70 @@ func (s SpecificCharacterSet) Names() []string {
 }
 
 func (s SpecificCharacterSet) Decode(text []byte) (string, error) {
+	if s.iso2022 != nil {
+		return s.iso2022.decode(text, false, true)
+	}
 	return s.valueCodec().Decode(text)
 }
 
 func (s SpecificCharacterSet) Encode(text string) ([]byte, error) {
+	if s.iso2022 != nil {
+		return s.iso2022.encode(text, false, true)
+	}
+	return s.valueCodec().Encode(text)
+}
+
+// DecodeSingleValue decodes a VR whose backslash byte is text rather than a
+// value-multiplicity delimiter (ST, LT, UT, and UR).
+func (s SpecificCharacterSet) DecodeSingleValue(text []byte) (string, error) {
+	if s.iso2022 != nil {
+		return s.iso2022.decode(text, false, false)
+	}
+	if codec, ok := s.valueCodec().(interface{ DecodeSingleValue([]byte) (string, error) }); ok {
+		return codec.DecodeSingleValue(text)
+	}
+	return s.valueCodec().Decode(text)
+}
+
+// EncodeSingleValue encodes a VR whose backslash byte is text rather than a
+// value-multiplicity delimiter (ST, LT, UT, and UR).
+func (s SpecificCharacterSet) EncodeSingleValue(text string) ([]byte, error) {
+	if s.iso2022 != nil {
+		return s.iso2022.encode(text, false, false)
+	}
+	if codec, ok := s.valueCodec().(interface{ EncodeSingleValue(string) ([]byte, error) }); ok {
+		return codec.EncodeSingleValue(text)
+	}
 	return s.valueCodec().Encode(text)
 }
 
 func (s SpecificCharacterSet) Codec() TextCodec {
+	if s.iso2022 != nil {
+		return specificCharacterSetCodec{characterSet: s}
+	}
 	return s.valueCodec()
 }
 
+type specificCharacterSetCodec struct {
+	characterSet SpecificCharacterSet
+}
+
+func (c specificCharacterSetCodec) Name() string {
+	return c.characterSet.Name()
+}
+
+func (c specificCharacterSetCodec) Decode(text []byte) (string, error) {
+	return c.characterSet.Decode(text)
+}
+
+func (c specificCharacterSetCodec) Encode(text string) ([]byte, error) {
+	return c.characterSet.Encode(text)
+}
+
 func (s SpecificCharacterSet) DecodePersonName(text []byte) (string, error) {
+	if s.iso2022 != nil {
+		return s.iso2022.decode(text, true, true)
+	}
 	groups := bytes.Split(text, []byte{'='})
 	decoded := make([]string, len(groups))
 	for i := range groups {
@@ -226,6 +361,9 @@ func (s SpecificCharacterSet) DecodePersonName(text []byte) (string, error) {
 // EncodePersonName encodes alphabetic, ideographic, and phonetic component
 // groups with their configured Specific Character Set codecs.
 func (s SpecificCharacterSet) EncodePersonName(text string) ([]byte, error) {
+	if s.iso2022 != nil {
+		return s.iso2022.encode(text, true, true)
+	}
 	groups := strings.Split(text, "=")
 	encoded := make([][]byte, len(groups))
 	for i := range groups {
@@ -245,15 +383,10 @@ var (
 
 // ParseCharacterSet resolves a DICOM Specific Character Set code list to a supported codec.
 func ParseCharacterSet(codes ...string) (SpecificCharacterSet, error) {
-	normalized := make([]string, 0, len(codes))
-	for _, code := range codes {
-		norm := normalizeCharacterSetCode(code)
-		if norm == "" {
-			continue
-		}
-		normalized = append(normalized, norm)
+	normalized, err := normalizeCharacterSetDeclaration(codes)
+	if err != nil {
+		return SpecificCharacterSet{}, err
 	}
-
 	if len(normalized) == 0 {
 		return DefaultCharacterSet, nil
 	}
@@ -265,7 +398,57 @@ func ParseCharacterSet(codes ...string) (SpecificCharacterSet, error) {
 		}
 		codecs = append(codecs, codec)
 	}
-	return SpecificCharacterSet{codecs: codecs}, nil
+	iso2022, err := buildISO2022CharacterSet(normalized, codecs)
+	if err != nil {
+		return SpecificCharacterSet{}, err
+	}
+	return SpecificCharacterSet{codecs: codecs, iso2022: iso2022}, nil
+}
+
+func normalizeCharacterSetDeclaration(codes []string) ([]string, error) {
+	if len(codes) == 0 {
+		return nil, nil
+	}
+	normalized := make([]string, len(codes))
+	for index, code := range codes {
+		normalized[index] = normalizeCharacterSetCode(code)
+		if index > 0 && normalized[index] == "" {
+			return nil, fmt.Errorf("%w: value %d is empty; only Value 1 may be empty", ErrInvalidCharsetDeclaration, index+1)
+		}
+	}
+	if len(normalized) == 1 {
+		if normalized[0] == "" {
+			return nil, nil
+		}
+		if strings.HasPrefix(normalized[0], "ISO 2022 ") {
+			return nil, fmt.Errorf("%w: a Code Extension term requires a multi-valued declaration", ErrInvalidCharsetDeclaration)
+		}
+		return normalized, nil
+	}
+
+	if normalized[0] == "" {
+		normalized[0] = "ISO 2022 IR 6"
+	}
+	for index, code := range normalized {
+		if !strings.HasPrefix(code, "ISO 2022 ") {
+			return nil, fmt.Errorf("%w: value %d %q is not a Code Extension term", ErrInvalidCharsetDeclaration, index+1, displayCharacterSetCode(code))
+		}
+	}
+	if !isISO2022InitialCharacterSet(normalized[0]) {
+		return nil, fmt.Errorf("%w: value 1 %q is not an allowed initial repertoire", ErrInvalidCharsetDeclaration, displayCharacterSetCode(normalized[0]))
+	}
+	return normalized, nil
+}
+
+func isISO2022InitialCharacterSet(code string) bool {
+	switch code {
+	case "ISO 2022 IR 6", "ISO 2022 IR 13", "ISO 2022 IR 100", "ISO 2022 IR 101",
+		"ISO 2022 IR 109", "ISO 2022 IR 110", "ISO 2022 IR 126", "ISO 2022 IR 127",
+		"ISO 2022 IR 138", "ISO 2022 IR 144", "ISO 2022 IR 148", "ISO 2022 IR 166":
+		return true
+	default:
+		return false
+	}
 }
 
 // FromCode is kept as a compatibility helper for earlier call sites.
@@ -319,8 +502,6 @@ func (s SpecificCharacterSet) valueCodec() TextCodec {
 }
 
 var htmlEncodingNames = map[string]string{
-	"ISO IR 13":       "shift_jis",
-	"ISO 2022 IR 13":  "shift_jis",
 	"ISO IR 101":      "iso-8859-2",
 	"ISO 2022 IR 101": "iso-8859-2",
 	"ISO IR 109":      "iso-8859-3",
@@ -353,6 +534,8 @@ func codecForCharacterSet(code string) (TextCodec, error) {
 		return DefaultCodec{}, nil
 	case "ISO IR 100", "ISO 2022 IR 100":
 		return Latin1Codec{}, nil
+	case "ISO IR 13", "ISO 2022 IR 13":
+		return jisX0201Codec{dicomName: displayCharacterSetCode(code)}, nil
 	case "ISO IR 192":
 		return UTF8Codec{}, nil
 	}

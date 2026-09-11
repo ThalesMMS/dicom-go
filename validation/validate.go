@@ -24,7 +24,6 @@ var (
 	csPattern               = regexp.MustCompile(`^[A-Z0-9_ ]*$`)
 	dsPattern               = regexp.MustCompile(`^[+\-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[Ee][+\-]?[0-9]+)?$`)
 	isPattern               = regexp.MustCompile(`^[+\-]?[0-9]+$`)
-	uiPattern               = regexp.MustCompile(`^[0-9]+(?:\.[0-9]+)*$`)
 	tagSpecificCharacterSet = core.NewTag(0x0008, 0x0005)
 )
 
@@ -287,14 +286,14 @@ func invokeDataSetRule(ctx context.Context, rule DataSetRule, dataset DataSetCon
 }
 
 func (s *validationSession) validateElement(dataset core.DataSet, path Path, element core.Element, characterSet dicomenc.SpecificCharacterSet, characterSetValid bool) {
-	s.validateDictionary(dataset, path, element)
+	s.validateDictionary(dataset, path, element, characterSet, characterSetValid)
 	s.validateValue(path, element, characterSet, characterSetValid)
 	if element.Tag() == core.TagPixelData {
 		s.validatePixelData(path, element)
 	}
 }
 
-func (s *validationSession) validateDictionary(dataset core.DataSet, path Path, element core.Element) {
+func (s *validationSession) validateDictionary(dataset core.DataSet, path Path, element core.Element, characterSet dicomenc.SpecificCharacterSet, characterSetValid bool) {
 	if s.opts.Dictionary == nil {
 		return
 	}
@@ -325,7 +324,7 @@ func (s *validationSession) validateDictionary(dataset core.DataSet, path Path, 
 	if entry.VM == "" {
 		return
 	}
-	vm := valueMultiplicity(element)
+	vm := valueMultiplicity(element, characterSet, characterSetValid)
 	if vm == 0 {
 		return
 	}
@@ -364,6 +363,17 @@ func (s *validationSession) validateValue(path Path, element core.Element, chara
 			if len(raw) > 0 && len(raw)%2 == 0 && raw[len(raw)-1] != vr.PaddingByte() && (raw[len(raw)-1] == 0 || raw[len(raw)-1] == ' ') {
 				s.add(Finding{Path: path, Tag: element.Tag(), VR: vr, Code: CodeValuePadding, Message: "value uses the wrong trailing padding byte"})
 			}
+			if vr.UsesSpecificCharacterSet() {
+				decoded, err := decodeEncodedText(characterSet, characterSetValid, vr, core.TrimTextValueBytes(vr, raw))
+				if err != nil {
+					s.add(Finding{Path: path, Tag: element.Tag(), VR: vr, Code: CodeValueRepertoire, Message: "text component contains characters outside the VR repertoire"})
+					return
+				}
+				for _, component := range core.SplitTextMultiplicity(vr, decoded) {
+					s.validateTextComponent(path, element, component, false, characterSet, characterSetValid)
+				}
+				return
+			}
 			for _, component := range splitTextMultiplicity(vr, raw) {
 				s.validateTextComponent(path, element, component, true, characterSet, characterSetValid)
 			}
@@ -388,6 +398,19 @@ func (s *validationSession) validateValue(path Path, element core.Element, chara
 	default:
 		s.validateTypedValue(path, element)
 	}
+}
+
+func decodeEncodedText(characterSet dicomenc.SpecificCharacterSet, characterSetValid bool, vr core.VR, value []byte) (string, error) {
+	if !characterSetValid {
+		return "", errors.New("invalid Specific Character Set")
+	}
+	if vr == core.VRPN {
+		return characterSet.DecodePersonName(value)
+	}
+	if !vr.UsesTextValueDelimiter() {
+		return characterSet.DecodeSingleValue(value)
+	}
+	return characterSet.Decode(value)
 }
 
 func (s *validationSession) validateTextComponent(path Path, element core.Element, component string, encodedRaw bool, characterSet dicomenc.SpecificCharacterSet, characterSetValid bool) {
@@ -575,25 +598,55 @@ func ValidateFile(ctx context.Context, meta, dataset core.DataSet, syntax transf
 	if dataErr != nil && !errors.Is(dataErr, ErrValidationFailed) {
 		return report, dataErr
 	}
-	for _, pair := range []struct{ metaTag, dataTag core.Tag }{
-		{core.NewTag(0x0002, 0x0002), core.NewTag(0x0008, 0x0016)},
-		{core.NewTag(0x0002, 0x0003), core.NewTag(0x0008, 0x0018)},
-	} {
-		metaValue, metaOK := dataSetString(metaResult.DataSet, pair.metaTag)
-		dataValue, dataOK := dataSetString(dataResult.DataSet, pair.dataTag)
-		if !metaOK || !dataOK || core.NormalizeUID(metaValue) != core.NormalizeUID(dataValue) {
-			report = appendFindingBounded(report, opts, Finding{Path: Path{{Tag: pair.metaTag, ItemIndex: NoItem}}, Tag: pair.metaTag, VR: core.VRUI, Code: CodeFileMetaMismatch, Message: "File Meta UID does not match the data set"})
-		}
-	}
-	declared, ok := dataSetString(metaResult.DataSet, core.NewTag(0x0002, 0x0010))
-	if !ok || core.NormalizeUID(declared) != core.NormalizeUID(syntax.UID) {
-		tag := core.NewTag(0x0002, 0x0010)
-		report = appendFindingBounded(report, opts, Finding{Path: Path{{Tag: tag, ItemIndex: NoItem}}, Tag: tag, VR: core.VRUI, Code: CodeFileMetaMismatch, Message: "File Meta Transfer Syntax UID does not match the supplied syntax"})
+	for _, finding := range ValidateFileMetaConsistency(metaResult.DataSet, dataResult.DataSet, syntax).Findings {
+		report = appendFindingBounded(report, opts, finding)
 	}
 	if opts.Mode == ModeStrict && report.HasErrors() {
 		return report, &ValidationError{Report: report.Clone()}
 	}
 	return report, nil
+}
+
+// ValidateFileMetaConsistency performs only the three Part 10 identity
+// comparisons between File Meta Information, the data set, and the effective
+// transfer syntax. It does not run general data-set validation and its fixed,
+// value-free findings are safe to use as an ingestion policy gate.
+func ValidateFileMetaConsistency(meta, dataset core.DataSet, syntax transfer.Syntax) Report {
+	report := Report{}
+	for _, pair := range []struct{ metaTag, dataTag core.Tag }{
+		{core.NewTag(0x0002, 0x0002), core.NewTag(0x0008, 0x0016)},
+		{core.NewTag(0x0002, 0x0003), core.NewTag(0x0008, 0x0018)},
+	} {
+		metaValue, metaOK := dataSetString(meta, pair.metaTag)
+		dataValue, dataOK := dataSetString(dataset, pair.dataTag)
+		metaUID := core.NormalizeUID(metaValue)
+		dataUID := core.NormalizeUID(dataValue)
+		if !metaOK || !dataOK || metaUID == "" || dataUID == "" || metaUID != dataUID {
+			report.Findings = append(report.Findings, Finding{
+				Path:     Path{{Tag: pair.metaTag, ItemIndex: NoItem}},
+				Tag:      pair.metaTag,
+				VR:       core.VRUI,
+				Severity: SeverityError,
+				Code:     CodeFileMetaMismatch,
+				Message:  "File Meta UID does not match the data set",
+			})
+		}
+	}
+	declared, ok := dataSetString(meta, core.NewTag(0x0002, 0x0010))
+	declaredUID := core.NormalizeUID(declared)
+	effectiveUID := core.NormalizeUID(syntax.UID)
+	if !ok || declaredUID == "" || effectiveUID == "" || declaredUID != effectiveUID {
+		tag := core.NewTag(0x0002, 0x0010)
+		report.Findings = append(report.Findings, Finding{
+			Path:     Path{{Tag: tag, ItemIndex: NoItem}},
+			Tag:      tag,
+			VR:       core.VRUI,
+			Severity: SeverityError,
+			Code:     CodeFileMetaMismatch,
+			Message:  "File Meta Transfer Syntax UID does not match the supplied syntax",
+		})
+	}
+	return report
 }
 
 func mergeReports(opts Options, reports ...Report) Report {
@@ -659,15 +712,7 @@ func validateTextFormat(vr core.VR, value string) (valid bool, rangeError bool) 
 		_, err := strconv.ParseInt(value, 10, 32)
 		return err == nil, err != nil
 	case core.VRUI:
-		if !uiPattern.MatchString(value) {
-			return false, false
-		}
-		for _, component := range strings.Split(value, ".") {
-			if len(component) > 1 && component[0] == '0' {
-				return false, false
-			}
-		}
-		return true, false
+		return core.IsValidUID(core.NormalizeUID(value)), false
 	case core.VRPN:
 		groups := strings.Split(value, "=")
 		if len(groups) > 3 {
@@ -782,7 +827,7 @@ func binaryWidth(vr core.VR) int {
 	}
 }
 
-func valueMultiplicity(element core.Element) int {
+func valueMultiplicity(element core.Element, characterSet dicomenc.SpecificCharacterSet, characterSetValid bool) int {
 	switch value := element.Value.(type) {
 	case nil:
 		return 0
@@ -793,6 +838,13 @@ func valueMultiplicity(element core.Element) int {
 			return 0
 		}
 		if element.VR().IsStringLike() {
+			if element.VR().UsesSpecificCharacterSet() && characterSetValid {
+				decoded, err := decodeEncodedText(characterSet, true, element.VR(), core.TrimTextValueBytes(element.VR(), value))
+				if err != nil {
+					return 1
+				}
+				return len(core.SplitTextMultiplicity(element.VR(), decoded))
+			}
 			return len(splitTextMultiplicity(element.VR(), value))
 		}
 		if width := numericWidth(element.VR()); width > 0 {

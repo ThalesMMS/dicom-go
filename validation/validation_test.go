@@ -345,6 +345,30 @@ func TestValidateDataSetRequiredUIDsAndBinaryWidths(t *testing.T) {
 	assertFindingCode(t, result.Report, validation.CodeValueLength)
 }
 
+func TestValidateUIDUsesCanonicalDICOMSyntax(t *testing.T) {
+	tag := core.NewTag(0x0011, 0x1010)
+	for _, uid := range []string{"3.1", "1.40", "1.02"} {
+		t.Run(uid, func(t *testing.T) {
+			report, err := validation.ValidateElement(context.Background(), core.Element{
+				Header: core.ElementHeader{Tag: tag, VR: core.VRUI},
+				Value:  core.StringValue{uid},
+			}, validation.Options{Mode: validation.ModePreserve})
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertFindingCode(t, report, validation.CodeValueFormat)
+		})
+	}
+
+	report, err := validation.ValidateElement(context.Background(), core.Element{
+		Header: core.ElementHeader{Tag: tag, VR: core.VRUI},
+		Value:  core.StringValue{""},
+	}, validation.Options{Mode: validation.ModePreserve})
+	if err != nil || len(report.Findings) != 0 {
+		t.Fatalf("ValidateElement(empty UI) report=%#v err=%v, want optional empty UI accepted", report, err)
+	}
+}
+
 func TestValidateEverySupportedVRHasValidAndInvalidFixture(t *testing.T) {
 	fixtures := []struct {
 		vr      core.VR
@@ -494,6 +518,27 @@ func TestValueMultiplicityTreatsSequenceAndOtherVRPayloadAsOneValue(t *testing.T
 	}
 	if result.Report.Count(validation.CodeValueMultiplicity) != 0 {
 		t.Fatalf("sequence/Other VR produced false VM finding: %#v", result.Report.Findings)
+	}
+}
+
+func TestValueMultiplicityDecodesISO2022BeforeSplittingBackslash(t *testing.T) {
+	tag := core.NewTag(0x0011, 0x3102)
+	dict := fixedDictionary{entries: map[core.Tag]dictionary.Entry{
+		tagSpecificCharacterSet: {Tag: tagSpecificCharacterSet, VR: core.VRCS, VM: "1-n"},
+		tag:                     {Tag: tag, VR: core.VRLO, VM: "1"},
+	}}
+	dataset := core.DataSet{Elements: []core.Element{
+		{Header: core.ElementHeader{Tag: tagSpecificCharacterSet, VR: core.VRCS}, Value: core.StringValue{"", "ISO 2022 IR 87"}},
+		// JIS X 0208 0x275C is Cyrillic small ka. Its second byte is the
+		// ASCII backslash octet, but it is part of one two-byte character.
+		{Header: core.ElementHeader{Tag: tag, VR: core.VRLO}, Value: core.RawValue("\x1b$B\x27\x5c\x1b(B")},
+	}}
+	result, err := validation.ValidateDataSet(context.Background(), dataset, validation.Options{Dictionary: dict})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Report.Count(validation.CodeValueMultiplicity) != 0 {
+		t.Fatalf("encoded trail byte produced false VM finding: %#v", result.Report.Findings)
 	}
 }
 

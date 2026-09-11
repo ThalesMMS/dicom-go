@@ -160,13 +160,77 @@ func TestParseCharacterSetUnsupportedCharset(t *testing.T) {
 	}
 }
 
-func TestParseCharacterSetEmptyLeading(t *testing.T) {
-	charset, err := ParseCharacterSet("", "ISO_IR 192")
+func TestISOIR13UsesOnlyJISX0201(t *testing.T) {
+	charset, err := ParseCharacterSet("ISO_IR 13")
 	if err != nil {
-		t.Fatalf("ParseCharacterSet() error = %v", err)
+		t.Fatal(err)
 	}
-	if charset.Name() != "ISO_IR 192" {
-		t.Fatalf("ParseCharacterSet() = %q, want ISO_IR 192", charset.Name())
+	if _, err := charset.Encode("表"); !errors.Is(err, ErrUnrepresentableCharacter) {
+		t.Fatalf("Encode(Kanji) error = %v, want ErrUnrepresentableCharacter", err)
+	}
+
+	want := []byte{0x5c, 0x7e, 0xd4}
+	raw, err := charset.EncodeSingleValue("¥‾ﾔ")
+	if err != nil {
+		t.Fatalf("EncodeSingleValue() error = %v", err)
+	}
+	if !bytes.Equal(raw, want) {
+		t.Fatalf("EncodeSingleValue() = % X, want % X", raw, want)
+	}
+	decoded, err := charset.DecodeSingleValue(raw)
+	if err != nil || decoded != "¥‾ﾔ" {
+		t.Fatalf("DecodeSingleValue() = (%q, %v), want (%q, nil)", decoded, err, "¥‾ﾔ")
+	}
+	decoded, err = charset.Decode([]byte{0x5c})
+	if err != nil || decoded != "\\" {
+		t.Fatalf("Decode(delimiter) = (%q, %v), want (backslash, nil)", decoded, err)
+	}
+	if _, err := charset.EncodeSingleValue("\\"); !errors.Is(err, ErrUnrepresentableCharacter) {
+		t.Fatalf("EncodeSingleValue(backslash) error = %v, want ErrUnrepresentableCharacter", err)
+	}
+}
+
+func TestISO2022IR58RejectsGBKOnlyCharacters(t *testing.T) {
+	charset, err := ParseCharacterSet("", "ISO 2022 IR 58")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := charset.Encode("ⅰ"); !errors.Is(err, ErrUnrepresentableCharacter) {
+		t.Fatalf("Encode(GBK-only character) error = %v, want ErrUnrepresentableCharacter", err)
+	}
+	if _, err := charset.Decode([]byte("\x1b$)A\xa2\xa1\x1b(B")); !errors.Is(err, ErrInvalidCodeExtension) {
+		t.Fatalf("Decode(GBK-only cell) error = %v, want ErrInvalidCodeExtension", err)
+	}
+}
+
+func TestISO2022DeclarationRejectsDuplicateRepertoires(t *testing.T) {
+	_, err := ParseCharacterSet("", "ISO 2022 IR 87", "ISO 2022 IR 87")
+	if !errors.Is(err, ErrInvalidCharsetDeclaration) {
+		t.Fatalf("ParseCharacterSet() error = %v, want ErrInvalidCharsetDeclaration", err)
+	}
+}
+
+func TestParseCharacterSetRejectsNonConformantDeclarations(t *testing.T) {
+	tests := [][]string{
+		{"ISO 2022 IR 87"},
+		{"ISO 2022 IR 87", "ISO 2022 IR 6"},
+		{"", "ISO_IR 192"},
+		{"ISO_IR 100", "ISO 2022 IR 87"},
+		{"ISO 2022 IR 6", "GBK"},
+		{"ISO 2022 IR 6", ""},
+		{"ISO 2022 IR 6", "ISO 2022 IR 87", ""},
+	}
+	for _, declaration := range tests {
+		if _, err := ParseCharacterSet(declaration...); !errors.Is(err, ErrInvalidCharsetDeclaration) {
+			t.Errorf("ParseCharacterSet(%q) error = %v, want ErrInvalidCharsetDeclaration", declaration, err)
+		}
+	}
+}
+
+func TestParseCharacterSetEmptyLeading(t *testing.T) {
+	_, err := ParseCharacterSet("", "ISO_IR 192")
+	if !errors.Is(err, ErrInvalidCharsetDeclaration) {
+		t.Fatalf("ParseCharacterSet() error = %v, want ErrInvalidCharsetDeclaration", err)
 	}
 }
 
@@ -180,7 +244,6 @@ func TestParseCharacterSetNormalization(t *testing.T) {
 		{name: "empty means default", code: "", want: "ISO_IR 6"},
 		{name: "underscores", code: "ISO_IR_100", want: "ISO_IR 100"},
 		{name: "spaces", code: " ISO IR 100 ", want: "ISO_IR 100"},
-		{name: "iso2022 spaces", code: "ISO 2022 IR 87", want: "ISO 2022 IR 87"},
 		{name: "lowercase", code: "gbk", want: "GBK"},
 	}
 
@@ -258,7 +321,14 @@ func TestParseCharacterSetSupportsStandardMappings(t *testing.T) {
 
 	for _, code := range codes {
 		t.Run(code, func(t *testing.T) {
-			if _, err := ParseCharacterSet(code); err != nil {
+			declaration := []string{code}
+			if strings.HasPrefix(code, "ISO 2022 ") {
+				declaration = []string{"", code}
+				if code == "ISO 2022 IR 6" {
+					declaration = []string{code, "ISO 2022 IR 87"}
+				}
+			}
+			if _, err := ParseCharacterSet(declaration...); err != nil {
 				t.Fatalf("ParseCharacterSet(%q) error = %v", code, err)
 			}
 		})
@@ -276,8 +346,8 @@ func TestParseCharacterSetDecodesExpandedCharsets(t *testing.T) {
 		{code: "GB18030", label: "gb18030", text: "\U0002000B"},
 		{code: "GBK", label: "gbk", text: "中文"},
 		{code: "ISO 2022 IR 87", label: "iso-2022-jp", text: "日本"},
-		{code: "ISO 2022 IR 159", label: "iso-2022-jp", text: "日本"},
-		{code: "ISO 2022 IR 149", label: "euc-kr", text: "홍길동"},
+		{code: "ISO 2022 IR 159", text: "齩", raw: []byte("\x1b$(DmN\x1b(B")},
+		{code: "ISO 2022 IR 149", text: "홍길동", raw: append([]byte("\x1b$)C"), mustEncodeHTMLLabel(t, "euc-kr", "홍길동")...)},
 		{code: "ISO_IR 101", label: "iso-8859-2", text: "Łódź"},
 		{code: "ISO_IR 148", label: "iso-ir-148", text: "İstanbul"},
 	}
@@ -288,7 +358,11 @@ func TestParseCharacterSetDecodesExpandedCharsets(t *testing.T) {
 			if raw == nil {
 				raw = mustEncodeHTMLLabel(t, tt.label, tt.text)
 			}
-			charset, err := ParseCharacterSet(tt.code)
+			declaration := []string{tt.code}
+			if strings.HasPrefix(tt.code, "ISO 2022 ") {
+				declaration = []string{"", tt.code}
+			}
+			charset, err := ParseCharacterSet(declaration...)
 			if err != nil {
 				t.Fatalf("ParseCharacterSet(%q) error = %v", tt.code, err)
 			}
@@ -314,9 +388,9 @@ func TestParseCharacterSetEncodesExpandedCharsets(t *testing.T) {
 		{code: "GB18030", label: "gb18030", text: "\U0002000B"},
 		{code: "GBK", label: "gbk", text: "中文"},
 		{code: "ISO 2022 IR 87", label: "iso-2022-jp", text: "日本"},
-		{code: "ISO 2022 IR 159", label: "iso-2022-jp", text: "日本"},
-		{code: "ISO 2022 IR 149", label: "euc-kr", text: "홍길동"},
-		{code: "ISO 2022 IR 58", label: "iso-ir-58", text: "中文"},
+		{code: "ISO 2022 IR 159", text: "齩", want: []byte("\x1b$(DmN\x1b(B")},
+		{code: "ISO 2022 IR 149", text: "홍길동", want: append([]byte("\x1b$)C"), mustEncodeHTMLLabel(t, "euc-kr", "홍길동")...)},
+		{code: "ISO 2022 IR 58", text: "中文", want: append([]byte("\x1b$)A"), mustEncodeHTMLLabel(t, "iso-ir-58", "中文")...)},
 		{code: "ISO_IR 13", label: "shift_jis", text: "ｶﾀｶﾅ"},
 		{code: "ISO_IR 101", label: "iso-8859-2", text: "Łódź"},
 		{code: "ISO_IR 109", label: "iso-8859-3", text: "Ħello"},
@@ -335,7 +409,11 @@ func TestParseCharacterSetEncodesExpandedCharsets(t *testing.T) {
 			if want == nil {
 				want = mustEncodeHTMLLabel(t, tt.label, tt.text)
 			}
-			charset, err := ParseCharacterSet(tt.code)
+			declaration := []string{tt.code}
+			if strings.HasPrefix(tt.code, "ISO 2022 ") {
+				declaration = []string{"", tt.code}
+			}
+			charset, err := ParseCharacterSet(declaration...)
 			if err != nil {
 				t.Fatalf("ParseCharacterSet(%q) error = %v", tt.code, err)
 			}
@@ -357,44 +435,24 @@ func TestParseCharacterSetEncodesExpandedCharsets(t *testing.T) {
 	}
 }
 
-func TestSpecificCharacterSetDecodePersonNameUsesComponentGroupCodecs(t *testing.T) {
-	charset, err := ParseCharacterSet("ISO_IR 100", "ISO_IR 192", "GBK")
+func TestSpecificCharacterSetDecodePersonNameUsesISO2022StateMachine(t *testing.T) {
+	charset, err := ParseCharacterSet("ISO 2022 IR 6", "ISO 2022 IR 87", "ISO 2022 IR 149")
 	if err != nil {
 		t.Fatalf("ParseCharacterSet() error = %v", err)
 	}
-	raw := append([]byte("Jos\xe9^Silva="), []byte("山田^太郎")...)
-	raw = append(raw, '=')
-	raw = append(raw, 0xD6, 0xD0, 0xCE, 0xC4)
+	raw := []byte("Jose^Silva=\x1b$B;3ED\x1b(B^\x1b$BB@O:\x1b(B=\x1b$)C\xc8\xab^\x1b$)C\xb1\xe6\xb5\xbf")
 
 	got, err := charset.DecodePersonName(raw)
 	if err != nil {
 		t.Fatalf("DecodePersonName() error = %v", err)
 	}
-	if got != "José^Silva=山田^太郎=中文" {
-		t.Fatalf("DecodePersonName() = %q", got)
-	}
-}
-
-func TestSpecificCharacterSetDecodePersonNameUsesISO2022ComponentGroups(t *testing.T) {
-	charset, err := ParseCharacterSet("ISO_IR 100", "ISO 2022 IR 87", "ISO 2022 IR 149")
-	if err != nil {
-		t.Fatalf("ParseCharacterSet() error = %v", err)
-	}
-	raw := append([]byte("Jos\xe9^Silva="), mustEncodeHTMLLabel(t, "iso-2022-jp", "山田^太郎")...)
-	raw = append(raw, '=')
-	raw = append(raw, mustEncodeHTMLLabel(t, "euc-kr", "홍길동")...)
-
-	got, err := charset.DecodePersonName(raw)
-	if err != nil {
-		t.Fatalf("DecodePersonName() error = %v", err)
-	}
-	if got != "José^Silva=山田^太郎=홍길동" {
+	if got != "Jose^Silva=山田^太郎=홍^길동" {
 		t.Fatalf("DecodePersonName() = %q", got)
 	}
 }
 
 func TestSpecificCharacterSetDecodeValueUsesPrimaryCodec(t *testing.T) {
-	charset, err := ParseCharacterSet("ISO_IR 6", "ISO 2022 IR 149")
+	charset, err := ParseCharacterSet("", "ISO 2022 IR 149")
 	if err != nil {
 		t.Fatalf("ParseCharacterSet() error = %v", err)
 	}
@@ -421,9 +479,6 @@ func TestSpecificCharacterSetEncode(t *testing.T) {
 }
 
 func TestSpecificCharacterSetEncodePersonNameUsesComponentGroupCodecs(t *testing.T) {
-	threeGroups := append([]byte("Jos\xe9^Silva="), []byte("山田^太郎")...)
-	threeGroups = append(threeGroups, '=')
-	threeGroups = append(threeGroups, 0xD6, 0xD0, 0xCE, 0xC4)
 	tests := []struct {
 		name    string
 		codes   []string
@@ -432,8 +487,6 @@ func TestSpecificCharacterSetEncodePersonNameUsesComponentGroupCodecs(t *testing
 		wantErr bool
 	}{
 		{name: "one component group", codes: []string{"ISO_IR 100"}, input: "José^Silva", want: []byte("Jos\xe9^Silva")},
-		{name: "two component groups", codes: []string{"ISO_IR 100", "ISO_IR 192"}, input: "José^Silva=山田^太郎", want: append([]byte("Jos\xe9^Silva="), []byte("山田^太郎")...)},
-		{name: "three component groups", codes: []string{"ISO_IR 100", "ISO_IR 192", "GBK"}, input: "José^Silva=山田^太郎=中文", want: threeGroups},
 		{name: "encoding error", codes: []string{"ISO_IR 6"}, input: "José^Silva", wantErr: true},
 	}
 	for _, tt := range tests {
@@ -467,12 +520,7 @@ func TestSpecificCharacterSetEncodePersonNameUsesComponentGroupCodecs(t *testing
 }
 
 func TestSpecificCharacterSetEncodePersonNamePreservesDecodedComponentGroupBytes(t *testing.T) {
-	direct := append([]byte("Jos\xe9^Silva="), []byte("山田^太郎")...)
-	direct = append(direct, '=')
-	direct = append(direct, 0xD6, 0xD0, 0xCE, 0xC4)
-	iso2022 := append([]byte("Jos\xe9^Silva="), mustEncodeHTMLLabel(t, "iso-2022-jp", "山田^太郎")...)
-	iso2022 = append(iso2022, '=')
-	iso2022 = append(iso2022, mustEncodeHTMLLabel(t, "euc-kr", "홍길동")...)
+	iso2022 := []byte("Jose^Silva=\x1b$B;3ED\x1b(B^\x1b$BB@O:\x1b(B=\x1b$)C\xc8\xab^\x1b$)C\xb1\xe6\xb5\xbf")
 
 	tests := []struct {
 		name  string
@@ -480,8 +528,7 @@ func TestSpecificCharacterSetEncodePersonNamePreservesDecodedComponentGroupBytes
 		raw   []byte
 		want  string
 	}{
-		{name: "direct multibyte groups", codes: []string{"ISO_IR 100", "ISO_IR 192", "GBK"}, raw: direct, want: "José^Silva=山田^太郎=中文"},
-		{name: "ISO 2022 groups", codes: []string{"ISO_IR 100", "ISO 2022 IR 87", "ISO 2022 IR 149"}, raw: iso2022, want: "José^Silva=山田^太郎=홍길동"},
+		{name: "ISO 2022 state machine", codes: []string{"ISO 2022 IR 6", "ISO 2022 IR 87", "ISO 2022 IR 149"}, raw: iso2022, want: "Jose^Silva=山田^太郎=홍^길동"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
